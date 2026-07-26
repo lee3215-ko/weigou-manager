@@ -1,9 +1,12 @@
 ﻿{
   "version": "1.0.1",
-  "url": "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
+  "url": "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/490173762",
   "download_url": "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.1/WeigouManager.zip",
-  "notes": "Initial release: Windows exe, auto-update, shared catalog sync",
+  "api_download_url": "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/490173762",
+  "asset_id": 490173762,
+  "notes": "Initial release: Windows exe, auto-update on restart, multi-user catalog sync via GitHub token.",
   "download_urls": [
+    "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/490173762",
     "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.1/WeigouManager.zip",
     "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
   ]
