@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """App paths / version for Weigou Manager (exe + auto-update)."""
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import shutil
 import sys
 
 APP_NAME = "WeigouManager"
-APP_DISPLAY_NAME = "微购 상품관리"
-APP_VERSION = "1.0.0"
+APP_DISPLAY_NAME = "Weigou Product Manager"
+APP_VERSION = "1.0.1"
 UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/lee3215-ko/weigou-manager/main/version.json"
 )
@@ -31,7 +31,7 @@ def get_app_dir() -> str:
 
 
 def get_data_dir() -> str:
-    """User data next to exe (data/) — kept when auto-updating."""
+    """User data next to exe (data/) ??kept when auto-updating."""
     data_dir = os.path.join(get_app_dir(), "data")
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
@@ -89,3 +89,4 @@ def migrate_legacy_data() -> None:
 def init_runtime_paths() -> None:
     os.chdir(get_app_dir())
     migrate_legacy_data()
+
