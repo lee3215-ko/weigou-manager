@@ -1,0 +1,9 @@
+﻿{
+  "version": "1.0.0",
+  "url": "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
+  "download_url": "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
+  "notes": "초기 배포: exe, 자동 업데이트, 목록 동기화",
+  "download_urls": [
+    "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
+  ]
+}

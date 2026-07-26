@@ -1,0 +1,16 @@
+﻿---
+description: ?ъ슜?먭? 諛고룷/由대━???낅뜲?댄듃 ?щ젮以??쇨퀬 ?섎㈃ GitHub ?먮룞 諛고룷 ?ㅽ뻾
+globs:
+alwaysApply: true
+---
+
+# Weigou Manager 諛고룷
+
+?ъ슜?먭? **?뚮같?ы빐以섅?*, **?뚮┫由ъ뒪 ?щ젮以섅?*, **?뚯뾽?곗씠??諛고룷??* ?깆쓣 ?붿껌?섎㈃:
+
+1. ?꾨줈?앺듃 猷⑦듃?먯꽌 `deploy.bat` ?ㅽ뻾 (?먮뒗 `.\scripts\publish.ps1 -Notes "?붿빟"`).
+2. `gh auth` ?ㅽ뙣 ?? `scripts\setup-github.ps1` ?덈궡.
+3. 諛고룷 ?꾨즺 ??Release URL ?꾨떖.
+
+?ㅽ궗: `github-windows-deploy` (`~/.cursor/skills/github-windows-deploy/SKILL.md`)
+

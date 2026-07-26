@@ -1,0 +1,52 @@
+﻿{
+  "github_owner": "lee3215-ko",
+  "github_repo": "weigou-manager",
+  "release_asset": "WeigouManager.zip",
+  "default_bump": "patch",
+  "app_display_name": "Weigou Manager",
+  "version": {
+    "file": "paths.py",
+    "variable": "APP_VERSION"
+  },
+  "build": {
+    "script": "build.bat",
+    "dist_dir": "release/WeigouManager"
+  },
+  "git_add": [
+    ".gitignore",
+    "README.md",
+    "paths.py",
+    "run.py",
+    "app.py",
+    "manager_app.py",
+    "product_store.py",
+    "product_attrs.py",
+    "product_parse.py",
+    "product_name.py",
+    "multi_ai_parse.py",
+    "google_lens.py",
+    "mall_publish.py",
+    "style_publish.py",
+    "price_codec.py",
+    "ime_win.py",
+    "auto_collect.py",
+    "collector.py",
+    "launcher.py",
+    "image_enhance.py",
+    "downloader.py",
+    "enhance_uploads.py",
+    "catalog_sync.py",
+    "updater.py",
+    "update_ui.py",
+    "requirements.txt",
+    "build.bat",
+    "build.spec",
+    "version.json",
+    "deploy.json",
+    "deploy.bat",
+    "scripts",
+    "shared",
+    "data/sync_settings.example.json",
+    ".cursor/rules"
+  ]
+}

@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+dist/
+build/
+release/
+*.zip
+*.spec.bak
+.DS_Store
+data/catalog/
+data/sync_settings.json
+*.db
+.playwright/
+.pytest_cache/
