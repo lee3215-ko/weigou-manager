@@ -196,6 +196,7 @@ class ManagerApp(tk.Tk):
         self._form_loading = False
         self._ime_composing = False
         self._pending_soft_save = False
+        self._detail_loaded_at = ""  # updated_at when form was loaded (sync overwrite guard)
         self._ime_focus_widget: tk.Misc | None = None
         self._select_gen = 0
         self._thumb_after: str | None = None
@@ -270,10 +271,7 @@ class ManagerApp(tk.Tk):
         self._sync = CatalogSyncService(
             self.store,
             on_log=lambda m: self._put_log(m, channel=LOG_COLLECT),
-            on_pulled=lambda: self.after(
-                0,
-                lambda: self.refresh_list(reload_detail=False, quiet=True),
-            ),
+            on_pulled=lambda: self.after(0, self._on_catalog_pulled),
         )
 
         self._build()
@@ -1766,6 +1764,47 @@ class ManagerApp(tk.Tk):
         except Exception:
             pass
 
+    def _on_catalog_pulled(self) -> None:
+        """Refresh list after remote sync; reload open detail if DB is newer than the form."""
+        cur_id = self.current_id
+        cur_pub = self.current_published_id
+        mode = self.list_mode.get()
+        self.refresh_list(reload_detail=False, quiet=True)
+        if self._form_loading or self._ime_composing:
+            return
+        try:
+            if mode == "products" and cur_id is not None:
+                p = self.store.get(cur_id)
+                if p and (
+                    not self._detail_loaded_at
+                    or (
+                        (p.updated_at or "")
+                        and (p.updated_at or "") > self._detail_loaded_at
+                    )
+                ):
+                    self._show_product(p)
+            elif mode == "published" and cur_pub is not None:
+                item = self.store.get_published(cur_pub)
+                if item and (
+                    not self._detail_loaded_at
+                    or (
+                        (item.updated_at or "")
+                        and (item.updated_at or "") > self._detail_loaded_at
+                    )
+                ):
+                    self._show_published(item)
+        except Exception:
+            pass
+
+    def _remember_detail_loaded(self, updated_at: str | None) -> None:
+        self._detail_loaded_at = (updated_at or "").strip()
+
+    def _db_newer_than_form(self, updated_at: str | None) -> bool:
+        db_ts = (updated_at or "").strip()
+        if not db_ts or not self._detail_loaded_at:
+            return False
+        return db_ts > self._detail_loaded_at
+
     def _on_sync_settings(self) -> None:
         from mall_cloud import cloud_enabled, load_cloud_settings
 
@@ -2643,6 +2682,7 @@ class ManagerApp(tk.Tk):
             self.current_id = None
             self.current_excluded_id = None
             self.current_published_id = None
+            self._detail_loaded_at = ""
             self.title_var.set("")
             self.google_name_var.set("")
             self.name_en_var.set("")
@@ -2859,6 +2899,11 @@ class ManagerApp(tk.Tk):
             if not self.sku_var.get().strip():
                 self.sku_var.set(sku)
             if mode == "products" and self.current_id is not None:
+                db = self.store.get(self.current_id)
+                if db and self._db_newer_than_form(db.updated_at):
+                    # B(또는 원격)가 이미 저장함 — 낡은 폼으로 덮지 말고 화면만 맞춤
+                    self._show_product(db)
+                    return
                 self.store.update_description(
                     self.current_id,
                     title=self.title_var.get().strip(),
@@ -2872,9 +2917,15 @@ class ManagerApp(tk.Tk):
                     colors=self.color_var.get().strip(),
                     sizes=self.size_var.get().strip(),
                 )
+                fresh = self.store.get(self.current_id)
+                self._remember_detail_loaded(fresh.updated_at if fresh else None)
                 self._mark_catalog_dirty()
                 self._refresh_price_preview()
             elif mode == "published" and self.current_published_id is not None:
+                db = self.store.get_published(self.current_published_id)
+                if db and self._db_newer_than_form(db.updated_at):
+                    self._show_published(db)
+                    return
                 self.store.update_published(
                     self.current_published_id,
                     title=self.title_var.get().strip(),
@@ -2888,6 +2939,8 @@ class ManagerApp(tk.Tk):
                     colors=self.color_var.get().strip(),
                     sizes=self.size_var.get().strip(),
                 )
+                fresh = self.store.get_published(self.current_published_id)
+                self._remember_detail_loaded(fresh.updated_at if fresh else None)
                 self._mark_catalog_dirty()
                 self._refresh_price_preview()
         except Exception:
@@ -3064,6 +3117,10 @@ class ManagerApp(tk.Tk):
             )
         finally:
             self._end_form_load()
+        fresh = self.store.get_published(item.id)
+        self._remember_detail_loaded(
+            (fresh.updated_at if fresh else None) or item.updated_at
+        )
 
     def _schedule_url_thumbs(self, urls: list[str], gen: int) -> None:
         """Fallback preview from remote image_urls — used before images are downloaded locally.
@@ -3249,6 +3306,9 @@ class ManagerApp(tk.Tk):
             self._schedule_thumbs(paths, gen, urls=list(p.image_urls or []))
         finally:
             self._end_form_load()
+
+        fresh = self.store.get(p.id)
+        self._remember_detail_loaded((fresh.updated_at if fresh else None) or p.updated_at)
 
         # Heavy color/size fill only if missing — background, cancellable
         need_color = not p.colors.strip()

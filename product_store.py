@@ -22,6 +22,50 @@ ProgressCb = Callable[[str], None]
 CATEGORY_ORDER = ["가방", "신발", "여성옷", "남성옷", "선글라스", "벨트", "악세사리", "기타"]
 
 
+def search_code_sort_num(code: str) -> int:
+    """Numeric key for search_code — identical on every PC (does not use local id)."""
+    s = (code or "").strip()
+    if not s:
+        return 10**18
+    if s.isdigit():
+        return int(s)
+    m = re.match(r"(\d+)", s)
+    return int(m.group(1)) if m else 10**18
+
+
+# Shared across A/B: local SQLite id differs per machine, so never ORDER BY id for UI lists.
+_PRODUCT_ORDER_SQL = (
+    " ORDER BY "
+    "CASE WHEN trim(COALESCE(search_code,'')) = '' THEN 1 ELSE 0 END, "
+    "CASE WHEN search_code GLOB '[0-9]*' AND search_code NOT GLOB '*[^0-9]*' "
+    "THEN CAST(search_code AS INTEGER) ELSE 1000000000000000000 END, "
+    "lower(COALESCE(search_code,'')), "
+    "lower(COALESCE(goods_id,'')), "
+    "created_at DESC"
+)
+
+_EXCLUDED_ORDER_SQL = (
+    " ORDER BY "
+    "CASE WHEN trim(COALESCE(search_code,'')) = '' THEN 1 ELSE 0 END, "
+    "CASE WHEN search_code GLOB '[0-9]*' AND search_code NOT GLOB '*[^0-9]*' "
+    "THEN CAST(search_code AS INTEGER) ELSE 1000000000000000000 END, "
+    "lower(COALESCE(search_code,'')), "
+    "lower(COALESCE(goods_id,'')), "
+    "created_at DESC"
+)
+
+_PUBLISHED_ORDER_SQL = (
+    " ORDER BY "
+    "CASE WHEN trim(COALESCE(search_code,'')) = '' THEN 1 ELSE 0 END, "
+    "CASE WHEN search_code GLOB '[0-9]*' AND search_code NOT GLOB '*[^0-9]*' "
+    "THEN CAST(search_code AS INTEGER) ELSE 1000000000000000000 END, "
+    "lower(COALESCE(search_code,'')), "
+    "lower(COALESCE(goods_id,'')), "
+    "lower(COALESCE(mall_id,'')), "
+    "created_at DESC"
+)
+
+
 def _prefer_text(remote: str | None, local: str | None) -> str:
     """Prefer non-empty remote text; fall back to local so sync never blanks a field."""
     r = (remote or "").strip()
@@ -222,6 +266,12 @@ class ProductStore:
                     "CREATE INDEX IF NOT EXISTS idx_products_updated ON products(updated_at)"
                 )
                 con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_products_search_code ON products(search_code)"
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_products_goods_id ON products(goods_id)"
+                )
+                con.execute(
                     "CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku_no)"
                 )
                 con.execute(
@@ -314,16 +364,11 @@ class ProductStore:
     ) -> list[Product]:
         """List products matching query/category.
 
-        Pagination: when ``limit`` is provided, results are fetched with
-        ``ORDER BY id DESC`` + ``LIMIT``/``OFFSET`` directly in SQL (fast for
-        large catalogs) and returned in that order — no Python-side re-sort.
-        When ``limit`` is ``None`` (default, used for the full list / CSV
-        export views), all matching rows are fetched and then re-sorted in
-        Python by the numeric prefix of ``search_code`` so the manager UI
-        keeps its legacy ordering.
+        Order is stable across machines (A/B): search_code numeric, then
+        search_code/goods_id/created_at — never local ``id`` (those differ per PC).
         """
         where_sql, args = self._list_products_sql(query, category)
-        sql = "SELECT * FROM products" + where_sql + " ORDER BY id DESC"
+        sql = "SELECT * FROM products" + where_sql + _PRODUCT_ORDER_SQL
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             args = [*args, int(limit), int(offset)]
@@ -334,17 +379,14 @@ class ProductStore:
         if limit is not None:
             return products
 
-        def search_code_num(code: str) -> int:
-            s = (code or "").strip()
-            if not s:
-                return 10**18  # 搜索码 없는 항목은 맨 뒤
-            if s.isdigit():
-                return int(s)
-            m = re.match(r"(\d+)", s)
-            return int(m.group(1)) if m else 10**18
-
+        # Full export: same key as SQL (covers non-pure-digit codes like "12A")
         def sort_key(p: Product) -> tuple:
-            return (search_code_num(p.search_code), -p.id)
+            return (
+                search_code_sort_num(p.search_code),
+                (p.search_code or "").lower(),
+                (p.goods_id or "").lower(),
+                p.created_at or "",
+            )
 
         products.sort(key=sort_key)
         return products
@@ -492,7 +534,7 @@ class ProductStore:
     ) -> list[ExcludedItem]:
         """List excluded items. See ``list_products`` for the pagination contract."""
         where_sql, args = self._list_excluded_sql(query, category)
-        sql = "SELECT * FROM excluded" + where_sql + " ORDER BY id DESC"
+        sql = "SELECT * FROM excluded" + where_sql + _EXCLUDED_ORDER_SQL
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             args = [*args, int(limit), int(offset)]
@@ -696,7 +738,7 @@ class ProductStore:
     ) -> list[PublishedItem]:
         """List published items. See ``list_products`` for the pagination contract."""
         where_sql, args = self._list_published_sql(query, category, recommended_only)
-        sql = "SELECT * FROM published" + where_sql + " ORDER BY id DESC"
+        sql = "SELECT * FROM published" + where_sql + _PUBLISHED_ORDER_SQL
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             args = [*args, int(limit), int(offset)]

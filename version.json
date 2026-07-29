@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.5",
+    "version":  "1.0.6",
     "url":  "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
-    "notes":  "Faster B PC image preview: CDN thumbs, disk cache, parallel load"
+    "notes":  "A/B same list sort (search_code); fix product-name sync overwrite on A"
 }
