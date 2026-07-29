@@ -7,22 +7,29 @@ import pathlib
 import re
 import shutil
 import time
-import urllib.error
-import urllib.request
 from typing import Any
 
 from image_enhance import enhance_image_file
+from mall_cloud import (
+    cloud_enabled,
+    mall_styles_api,
+    post_json,
+    upload_file,
+)
 
 MALL_STYLES_API = "http://127.0.0.1:3000/api/styles"
+STYLE_BUCKET = "style-images"
 
 # + 버튼 기본 위치 (제품 옆, 카테고리별)
 PIN_BY_CATEGORY: dict[str, tuple[float, float, str]] = {
     "가방": (28.0, 56.0, "가방"),
     "신발": (70.0, 91.0, "신발"),
-    "상의": (58.0, 38.0, "상의"),
-    "하의": (55.0, 68.0, "하의"),
-    "자켓": (60.0, 30.0, "아우터"),
+    "여성옷": (58.0, 38.0, "여성옷"),
+    "남성옷": (55.0, 42.0, "남성옷"),
+    "선글라스": (72.0, 22.0, "선글라스"),
+    "벨트": (55.0, 58.0, "벨트"),
     "악세사리": (74.0, 26.0, "악세사리"),
+    "기타": (50.0, 50.0, "기타"),
 }
 
 
@@ -68,22 +75,35 @@ def _save_looks(looks: list[dict[str, Any]]) -> None:
     )
 
 
-def _post_api(look: dict[str, Any]) -> str:
-    body = json.dumps({"look": look}, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        MALL_STYLES_API,
-        data=body,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
+def _api_failed(msg: str) -> bool:
+    m = (msg or "").strip()
+    if not m:
+        return True
+    low = m.lower()
+    if low.startswith("api ok"):
+        return False
+    return (
+        low.startswith("api 오류")
+        or low.startswith("api 미연결")
+        or "unauthorized" in low
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return f"API OK ({resp.status}) {raw[:160]}"
-    except urllib.error.URLError as e:
-        return f"API 미연결 (파일로만 저장됨): {e}"
-    except Exception as e:  # noqa: BLE001
-        return f"API 오류: {e}"
+
+
+def _post_api(
+    look: dict[str, Any],
+    *,
+    replace_all: bool = False,
+    looks: list[dict[str, Any]] | None = None,
+) -> str:
+    api = mall_styles_api() if cloud_enabled() else MALL_STYLES_API
+    if replace_all:
+        payload: dict[str, Any] = {
+            "replaceAll": True,
+            "looks": looks if looks is not None else [look],
+        }
+    else:
+        payload = {"look": look}
+    return post_json(api, payload, timeout=120)
 
 
 def build_pins(items: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -111,8 +131,65 @@ def build_pins(items: list[dict[str, str]]) -> list[dict[str, Any]]:
     return pins
 
 
+def _has_batchim(word: str) -> bool:
+    """한글 마지막 글자에 받침이 있으면 True (와/과, 을/를 선택용)."""
+    if not word:
+        return False
+    ch = word.strip()[-1]
+    if "가" <= ch <= "힣":
+        return (ord(ch) - 0xAC00) % 28 != 0
+    return False
+
+
+def _particle_wa(name: str) -> str:
+    return f"{name}과" if _has_batchim(name) else f"{name}와"
+
+
+def _particle_eul(name: str) -> str:
+    return f"{name}을" if _has_batchim(name) else f"{name}를"
+
+
+def _particle_ro(name: str) -> str:
+    """로 / 으로 — 받침 ㄹ은 '로', 그 외 받침은 '으로'."""
+    if not name:
+        return "로"
+    ch = name.strip()[-1]
+    if "가" <= ch <= "힣":
+        jong = (ord(ch) - 0xAC00) % 28
+        if jong == 0 or jong == 8:  # 없음 or ㄹ
+            return f"{name}로"
+        return f"{name}으로"
+    return f"{name}로"
+
+
+def _compact_product_name(name: str, *, max_len: int = 28) -> str:
+    """제품명을 자연스럽게 짧게 — 중간 … 자르기 없이 브랜드+핵심 모델만."""
+    s = re.sub(r"\s+", " ", (name or "").strip())
+    s = re.sub(r"[…\.]+$", "", s).strip()
+    if not s:
+        return ""
+    if len(s) <= max_len:
+        return s
+    parts = s.split()
+    if len(parts) >= 4:
+        # 앞 브랜드 1~2어절 + 뒤 모델 1~2어절
+        head = parts[:2]
+        tail = parts[-2:]
+        cand = " ".join(head + [t for t in tail if t not in head])
+        if len(cand) <= max_len + 2:
+            return cand
+        cand = f"{parts[0]} {parts[-2]} {parts[-1]}"
+        if len(cand) <= max_len + 2:
+            return cand
+        return f"{parts[0]} {parts[-1]}"
+    if len(parts) == 3:
+        cand = f"{parts[0]} {parts[-1]}"
+        return cand if len(cand) <= max_len else parts[0]
+    return parts[0]
+
+
 def auto_look_copy(items: list[dict[str, str]]) -> tuple[str, str]:
-    """제목·설명 자동 생성 (입력 없이)."""
+    """제목·설명을 자연스러운 문장으로 자동 생성 (… 생략 없음)."""
     cats: list[str] = []
     names: list[str] = []
     for it in items:
@@ -124,24 +201,33 @@ def auto_look_copy(items: list[dict[str, str]]) -> tuple[str, str]:
             names.append(name)
 
     if len(cats) >= 2:
-        title = f"{cats[0]}·{cats[1]} 룩"
+        title = f"{_particle_wa(cats[0])} {cats[1]} 룩"
     elif len(cats) == 1:
         title = f"{cats[0]} 스타일 룩"
     else:
         title = "AI 모델 코디"
 
-    def short(s: str, n: int = 16) -> str:
-        s = re.sub(r"\s+", " ", s).strip()
-        return s if len(s) <= n else s[: n - 1] + "…"
+    short_names = [_compact_product_name(n) for n in names]
+    short_names = [n for n in short_names if n]
 
-    if len(names) >= 2:
-        subtitle = f"{short(names[0])}과 {short(names[1])}로 맞춘 코디"
-    elif len(names) == 1:
-        subtitle = f"{short(names[0], 22)} 기준으로 맞춘 코디"
+    if len(short_names) >= 3:
+        a, b = short_names[0], short_names[1]
+        subtitle = (
+            f"{_particle_wa(a)} {_particle_eul(b)} 중심으로 "
+            f"{len(short_names)}가지 아이템을 매치한 코디"
+        )
+    elif len(short_names) == 2:
+        a, b = short_names[0], short_names[1]
+        # 예: 생 로랑 가비 슬라이드 뮬에 셀린느 클래식 트리옹프 백을 더한 코디
+        subtitle = f"{a}에 {_particle_eul(b)} 더한 코디"
+    elif len(short_names) == 1:
+        subtitle = f"{_particle_ro(short_names[0])} 완성한 스타일링"
+    elif len(cats) >= 2:
+        subtitle = f"{_particle_wa(cats[0])} {cats[1]} 아이템으로 완성한 코디"
     elif cats:
-        subtitle = f"{'·'.join(cats[:3])} 등록 상품으로 구성"
+        subtitle = f"{cats[0]} 아이템으로 완성한 코디"
     else:
-        subtitle = "등록 상품으로 구성한 코디"
+        subtitle = "선택한 상품으로 완성한 코디"
     return title, subtitle
 
 
@@ -183,12 +269,17 @@ def publish_style_look(
     look_title = (title or "").strip() or auto_title
     look_sub = (subtitle or "").strip() or auto_sub
 
+    if cloud_enabled():
+        model_url = upload_file(STYLE_BUCKET, dest_name, dest)
+    else:
+        model_url = f"/styles/{dest_name}"
+
     look: dict[str, Any] = {
         "id": look_id,
         "title": look_title,
         "subtitle": look_sub,
         "mood": "AI MODEL",
-        "modelImage": f"/styles/{dest_name}",
+        "modelImage": model_url,
         "items": pins,
         "createdAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -198,5 +289,7 @@ def publish_style_look(
     looks = [look, *[x for x in looks if x.get("id") != look_id]]
     _save_looks(looks)
 
-    api_msg = _post_api(look)
+    api_msg = _post_api(look, replace_all=replace_all, looks=looks if replace_all else None)
+    if cloud_enabled() and _api_failed(api_msg):
+        raise RuntimeError(f"AI 코디 API 적용 실패: {api_msg}")
     return {"look": look, "count": len(looks), "api": api_msg, "path": str(dest)}

@@ -1,0 +1,7 @@
+{
+  "supabaseUrl": "https://YOUR_PROJECT.supabase.co",
+  "serviceRoleKey": "your_service_role_key",
+  "catalogWriteSecret": "same-as-CATALOG_WRITE_SECRET-on-vercel",
+  "mallCatalogApi": "https://shoot-repl.vercel.app/api/catalog",
+  "mallStylesApi": "https://shoot-repl.vercel.app/api/styles"
+}

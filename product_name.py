@@ -13,23 +13,30 @@ _RE_PRICE = re.compile(r"^[￥¥$]\s*[\d.,]+$")
 
 # (pattern, ko, en)
 _BRANDS = [
-    (r"路易威登|LOUIS\s*VUITTON|\bLV\b", "루이비통", "Louis Vuitton"),
-    (r"圣罗兰|SAINT\s*LAURENT|\bYSL\b", "생로랑", "Saint Laurent"),
-    (r"巴黎世家|BALENCIAGA", "발렌시아가", "Balenciaga"),
-    (r"葆蝶家|BOTTEGA", "보테가", "Bottega Veneta"),
-    (r"香奈儿|CHANEL", "샤넬", "Chanel"),
-    (r"普拉达|PRADA", "프라다", "Prada"),
-    (r"爱马仕|HERM[EÈ]S", "에르메스", "Hermès"),
-    (r"赛琳|思琳|CELINE", "셀린느", "Celine"),
-    (r"迪奥|DIOR", "디올", "Dior"),
-    (r"古驰|GUCCI", "구찌", "Gucci"),
-    (r"芬迪|FENDI", "펜디", "Fendi"),
+    (r"路易威登|LOUIS\s*VUITTON|\bLV\b|루이비통", "루이비통", "Louis Vuitton"),
+    (r"圣罗兰|SAINT\s*LAURENT|\bYSL\b|생로랑", "생로랑", "Saint Laurent"),
+    (r"巴黎世家|BALENCIAGA|발렌시아가", "발렌시아가", "Balenciaga"),
+    (r"葆蝶家|BOTTEGA|보테가", "보테가", "Bottega Veneta"),
+    (r"戈雅|GOYARD|고야드", "고야드", "Goyard"),
+    (r"缪缪|MIU\s*MIU|미우미우", "미우미우", "Miu Miu"),
+    (r"巴宝莉|博柏利|BURBERRY|버버리", "버버리", "Burberry"),
+    (r"THE\s*ROW|더\s*로우|더로우", "더로우", "The Row"),
+    (r"香奈儿|CHANEL|샤넬", "샤넬", "Chanel"),
+    (r"普拉达|PRADA|프라다", "프라다", "Prada"),
+    (r"爱马仕|HERM[EÈ]S|에르메스", "에르메스", "Hermès"),
+    (r"赛琳|思琳|CELINE|셀린느", "셀린느", "Celine"),
+    (r"迪奥|DIOR|디올", "디올", "Dior"),
+    (r"古驰|GUCCI|구찌", "구찌", "Gucci"),
+    (r"芬迪|FENDI|펜디", "펜디", "Fendi"),
+    (r"THOM\s*BROWNE|톰브라운", "톰브라운", "Thom Browne"),
+    (r"CHROME\s*HEARTS|크롬하츠", "크롬하츠", "Chrome Hearts"),
 ]
 
 _MODELS = [
     (r"Lady\s*D[-\s]?Joy|LadyDJoy|D-?Joy|Djoy|迪奥?D.?joy|레이디\s*D\s*조이", "레이디 D 조이", "Lady D Joy"),
     (r"My\s*Dior|我的迪奥|DiorMyDior|마이\s*디올", "마이 디올", "My Dior"),
     (r"Coco\s*Beach|코코\s*비치|可可海滩", "코코 비치", "Coco Beach"),
+    (r"Fantasy\s*Pearl|판타지\s*펄|판타지펄", "판타지 펄", "Fantasy Pearl"),
     (r"Book\s*Tote|북\s*토트", "북 토트", "Book Tote"),
     (r"Lady\s*Dior|戴妃|레이디\s*디올", "레이디 디올", "Lady Dior"),
     (r"Classic\s*Flap|经典翻盖|클래식\s*플랩|Timeless", "클래식 플랩", "Classic Flap"),
@@ -114,6 +121,13 @@ _TYPES = [
     (r"高跟鞋|heel|泵", "힐", "Heel"),
     (r"乐福|loafer", "로퍼", "Loafer"),
     (r"鞋|shoes?", "신발", "Shoes"),
+    (r"판타지\s*펄\s*캣아이\s*선글라스|Fantasy\s*Pearl\s*Cat[\s\-]?Eye", "판타지 펄 캣아이 선글라스", "Fantasy Pearl Cat-Eye Sunglasses"),
+    (r"로고\s*런웨이\s*무테\s*선글라스|Logo\s*Rimless\s*Sunglass", "로고 런웨이 무테 선글라스", "Logo Runway Rimless Sunglasses"),
+    (r"무테\s*선글라스|rimless\s*sunglass", "무테 선글라스", "Rimless Sunglasses"),
+    (r"캣아이\s*선글라스|cat[\s\-]?eye\s*sunglass", "캣아이 선글라스", "Cat-Eye Sunglasses"),
+    (r"선글라스|선글래스|sunglasses?|墨镜|太阳镜|太陽鏡", "선글라스", "Sunglasses"),
+    (r"眼镜|glasses|아이웨어|eyewear", "안경", "Glasses"),
+    (r"벨트|belts?|腰带|皮带|皮帶|ベルト", "벨트", "Belt"),
     (r"包|bags?", "백", "Bag"),
 ]
 
@@ -133,7 +147,8 @@ _COLORS = [
     (r"棕色|褐色|brown|브라운", "브라운", "Brown"),
     (r"粉色|粉|pink|핑크", "핑크", "Pink"),
     (r"红色|红|red|레드", "레드", "Red"),
-    (r"卡其|khaki|카키|军绿|橄榄绿|olive|올리브", "카키", "Khaki"),
+    (r"카키\s*그린|khaki\s*green|kaki\s*green", "카키 그린", "Khaki Green"),
+    (r"卡其|khaki|kaki|카키|军绿|橄榄绿|olive|올리브", "카키", "Khaki"),
     (r"绿色|绿|green|그린", "그린", "Green"),
     (r"黄色|黄|yellow|옐로우", "옐로우", "Yellow"),
     (r"橙色|橘|orange|오렌지", "오렌지", "Orange"),
@@ -144,14 +159,16 @@ _COLORS = [
     (r"camel|카멜", "카멜", "Camel"),
 ]
 
-# AI Mode labeled answers: **제품명:** … / 컬러: …
+# AI Mode labeled answers: **제품명:** … / **컬러:** … / **컬러/소재:** …
 # NOTE: never use bare "색" — it false-matches mid-sentence junk
+# Google often answers "컬러/소재:" — allow optional /소재·재료 suffix
+_RE_AI_COLOR_LABEL = r"(?:컬러|색상)(?:\s*/\s*[^\s:*：*]+)?"
 _RE_AI_NAME = re.compile(
     r"(?:^|[\n•·\-\*📌]\s*)(?:\*\*|__)?제품명(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
     re.I | re.M,
 )
 _RE_AI_COLOR = re.compile(
-    r"(?:^|[\n•·\-\*📌]\s*)(?:\*\*|__)?(?:컬러|색상)(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
+    rf"(?:^|[\n•·\-\*📌]\s*)(?:\*\*|__)?{_RE_AI_COLOR_LABEL}(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
     re.I | re.M,
 )
 _RE_AI_SENTENCE_JUNK = re.compile(
@@ -425,13 +442,24 @@ def _extract_parts(raw: str, hint: str = "") -> NameParts:
             "가방": ("백", "Bag"),
             "신발": ("신발", "Shoes"),
             "악세사리": ("액세서리", "Accessory"),
-            "상의": ("상의", "Top"),
-            "하의": ("하의", "Bottom"),
-            "자켓": ("자켓", "Jacket"),
+            "선글라스": ("선글라스", "Sunglasses"),
+            "벨트": ("벨트", "Belt"),
+            "여성옷": ("여성옷", "Womenswear"),
+            "남성옷": ("남성옷", "Menswear"),
+            "기타": ("아이템", "Item"),
         }
         type_ko, type_en = cat_map.get(attrs.category, ("백", "Bag"))
     elif models and not type_ko:
-        type_ko, type_en = "백", "Bag"
+        # 모델만 있고 타입이 없으면 가방으로 단정하지 않음 (선글라스·의류 등)
+        low = f"{text} {hint}".lower()
+        if re.search(r"선글라스|선글래스|sunglass|墨镜|太阳镜", low):
+            type_ko, type_en = "선글라스", "Sunglasses"
+        elif re.search(r"벨트|belt|腰带|皮带", low):
+            type_ko, type_en = "벨트", "Belt"
+        elif re.search(r"신발|shoe|sneaker|靴|鞋", low):
+            type_ko, type_en = "신발", "Shoes"
+        else:
+            type_ko, type_en = "백", "Bag"
 
     return NameParts(
         brand_ko=brand_ko,
@@ -468,24 +496,45 @@ def _clean_ai_name(raw: str) -> str:
     return text
 
 
+def _normalize_color_token(token: str) -> str:
+    """One color token from AI — keep compound names like '카키 그린'."""
+    p = re.sub(r"\s*투톤\s*$", "", (token or "").strip()).strip()
+    if not p:
+        return ""
+    # 복합 표기(카키 그린 등)는 팔레트로 축소하지 않고 유지
+    if re.search(r"[가-힣]", p) and (" " in p or len(p) >= 2):
+        ko, _ = _match_first(_COLORS, p)
+        # 전체(또는 거의 전체)가 팔레트 항목과 일치할 때만 정규화
+        if ko and (
+            ko == p
+            or p.replace(" ", "") == ko.replace(" ", "")
+            or p in (f"{ko} 컬러", f"{ko}색")
+        ):
+            return ko
+        return p
+    ko, _ = _match_first(_COLORS, p)
+    return ko or p
+
+
 def normalize_ai_color(raw: str) -> str:
-    """Keep AI color wording — multi-tone as '오렌지 / 블루' (one option, not two)."""
+    """Keep AI color wording — multi-tone as '카키 그린/카키' (slash, not comma)."""
     text = (raw or "").strip()
     if not text:
         return ""
     text = re.sub(r"[*\[\]`#_~]+", "", text)
+    # 괄호 안 부연(소재 설명) 제거
     text = re.split(r"\s*[\(（]", text, maxsplit=1)[0].strip()
     if _RE_AI_SENTENCE_JUNK.search(text) or re.search(
         r"문의|제품은|입니다|보입니다|알려", text
     ):
         return ""
-    if len(text) > 40:
+    if len(text) > 48:
         return ""
     if not re.search(r"[&/,]|및|하고|투톤|투\s*톤", text):
         text = re.split(r"\s*또는\s*|\s*or\s*", text, maxsplit=1, flags=re.I)[0].strip()
     text = re.sub(r"\s+", " ", text).strip(" -–—|/,")
     text = re.sub(
-        r"\s*(투톤\s*컬러|투\s*톤|컬러|색상)\s*$",
+        r"\s*(투톤\s*컬러|투\s*톤|컬러|색상|소재)\s*$",
         "",
         text,
         flags=re.I,
@@ -493,19 +542,16 @@ def normalize_ai_color(raw: str) -> str:
     if not text:
         return ""
 
+    # 쉼표도 슬래시 계열로 취급 (AI가 ',' 로 쓸 때)
     parts = re.split(r"\s*(?:&|/|,|및)\s*", text)
     parts = [p.strip() for p in parts if p.strip()]
     if len(parts) >= 2:
-        mapped: list[str] = []
-        for p in parts:
-            p = re.sub(r"\s*투톤\s*$", "", p).strip()
-            ko, _ = _match_first(_COLORS, p)
-            mapped.append(ko or p)
         out: list[str] = []
-        for m in mapped:
+        for p in parts:
+            m = _normalize_color_token(p)
             if m and m not in out and not _RE_AI_SENTENCE_JUNK.search(m):
                 out.append(m)
-        return " / ".join(out) if out else ""
+        return "/".join(out) if out else ""
 
     best_ko, best_len = "", 0
     for pat, ko, _en in _COLORS:
@@ -522,16 +568,124 @@ def normalize_ai_color(raw: str) -> str:
             rf"{re.escape(best_ko)}(\s*컬러)?", text, re.I
         ):
             return best_ko
-    if re.search(r"[가-힣]", text) and len(text) <= 24:
+        # "프레임은 시크한 블랙" 같이 설명형이면 팔레트 색만 사용
+        if re.search(r"프레임|렌즈|그라데이션|시크한|진한|밝은|어두운", text):
+            return best_ko
+    if re.search(r"[가-힣]", text) and len(text) <= 28:
         return text
     return best_ko or ""
 
 
+_AI_BRANDS_KO = (
+    "샤넬|디올|구찌|프라다|에르메스|루이비통|생로랑|셀린느|펜디|미우미우|"
+    "고야드|발렌시아가|보테가|톰브라운|크롬하츠"
+)
+_AI_TYPE_TAIL = (
+    r"(?:선글라스|선글래스|sunglasses?|"
+    r"백|가방|지갑|카드\s*홀더|스니커즈|샌들|힐|부츠|로퍼|"
+    r"코트|자켓|원피스|스카프|시계|목걸이|귀걸이|팔찌|벨트|모자|머플러|"
+    r"티셔츠|니트|후드|팬츠|스커트)"
+)
+_RE_AI_NARRATIVE_OF = re.compile(
+    rf"(?P<brand>{_AI_BRANDS_KO})"
+    rf"(?:\s*[\(（][^\)）]*[\)）])?"
+    rf"\s*의\s*"
+    rf"(?P<body>[^.\n]{{2,55}}?{_AI_TYPE_TAIL})",
+    re.I,
+)
+# 사진 속 제품은 미우미우 로고 런웨이 무테 선글라스(…)이며
+_RE_AI_PRODUCT_IS = re.compile(
+    rf"(?:사진\s*속\s*)?(?:이\s*)?제품은\s*"
+    rf"(?P<name>(?:{_AI_BRANDS_KO})[^.\n]{{0,60}}?{_AI_TYPE_TAIL})"
+    rf"(?:\s*[\(（][^\)）]*[\)）])?"
+    rf"(?:\s*이며|\s*이고|\s*로\b|\s*입니다|\s*이에요|\s*예요|,)",
+    re.I,
+)
+_RE_AI_BOLD_PRODUCT = re.compile(
+    rf"\*\*\s*((?:{_AI_BRANDS_KO})[^*.\n]{{2,55}}?{_AI_TYPE_TAIL})\s*"
+    rf"(?:\([^)]*\))?\s*\*\*",
+    re.I,
+)
+_RE_AI_INLINE_PRODUCT = re.compile(
+    rf"(?<![가-힣A-Za-z])"
+    rf"((?:{_AI_BRANDS_KO})(?:\s+[가-힣A-Za-z0-9\-]+){{0,8}}\s+{_AI_TYPE_TAIL})"
+    rf"(?=\s*[\(（]|\s*이며|\s*이고|\s*로\b|\s*입니다|,|\.|$)",
+    re.I,
+)
+_RE_AI_MODEL_CODE = re.compile(
+    r"(?:모델명|모델\s*번호|model(?:\s*name|\s*no\.?)?)\s*[:：은는]?\s*"
+    r"\*?\*?([A-Z]{1,6}\d{2,6}[A-Z0-9\-]*|\d{3,5}[A-Z0-9\-]*)\*?\*?",
+    re.I,
+)
+
+
+def _finalize_ai_product_name(name: str, blob: str = "") -> str:
+    name = re.sub(r"[*\[\]`#_~]+", "", (name or "").strip())
+    name = re.split(r"\s*[\(（]", name, maxsplit=1)[0].strip()
+    name = re.sub(r"\s+", " ", name).strip(" ,，·-–—")
+    if not name or len(name) < 4:
+        return ""
+    if _RE_AI_SENTENCE_JUNK.search(name) or re.search(
+        r"문의|알려|입니다|보입니다|확인됩니다", name
+    ):
+        return ""
+    mm = _RE_AI_MODEL_CODE.search(blob or "")
+    if mm:
+        code = mm.group(1).strip()
+        code = re.split(r"\s*또는\s*|\s*or\s*|[|/]", code, maxsplit=1, flags=re.I)[
+            0
+        ].strip()
+        if code and code.upper() not in name.upper() and len(code) <= 16:
+            name = f"{name} {code}"
+    cleaned = _clean_ai_name(name)
+    if cleaned and len(cleaned) >= 6:
+        return cleaned
+    if 6 <= len(name) <= 90:
+        return name
+    return cleaned or ""
+
+
+def _extract_narrative_ai_name(blob: str) -> str:
+    """Parse Google AI Mode narrative answers into a product name."""
+    text = blob or ""
+    m = _RE_AI_PRODUCT_IS.search(text)
+    if m:
+        got = _finalize_ai_product_name(m.group("name"), text)
+        if got:
+            return got
+    m = _RE_AI_BOLD_PRODUCT.search(text)
+    if m:
+        got = _finalize_ai_product_name(m.group(1), text)
+        if got:
+            return got
+    m = _RE_AI_NARRATIVE_OF.search(text)
+    if m:
+        brand = (m.group("brand") or "").strip()
+        body = (m.group("body") or "").strip()
+        got = _finalize_ai_product_name(f"{brand} {body}", text)
+        if got:
+            return got
+    m = _RE_AI_INLINE_PRODUCT.search(text)
+    if m:
+        got = _finalize_ai_product_name(m.group(1), text)
+        if got:
+            return got
+    return ""
+
+
 def extract_ai_labeled_fields(lines: list[str]) -> tuple[str, str]:
-    """Pull 제품명 / 컬러 from Google AI Mode labeled answers."""
+    """Pull 제품명 / 컬러 from Google AI Mode labeled (or narrative) answers."""
     blob = "\n".join(lines or [])
     section = blob
-    for marker in ("제품 정보", "제품정보", "Product info", "Product Info"):
+    for marker in (
+        "제품 상세 정보",
+        "제품상세정보",
+        "제품 정보",
+        "제품정보",
+        "정확한 정보",
+        "Product info",
+        "Product Info",
+    ):
         idx = blob.find(marker)
         if idx >= 0:
             section = blob[idx:]
@@ -539,8 +693,12 @@ def extract_ai_labeled_fields(lines: list[str]) -> tuple[str, str]:
 
     name = ""
     color = ""
+    color_re = re.compile(
+        rf"(?:\*\*|__)?{_RE_AI_COLOR_LABEL}(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
+        re.I,
+    )
     for ln in section.splitlines():
-        ln = ln.strip()
+        ln = ln.strip().lstrip("•·-*📌 ").strip()
         if not ln:
             continue
         if not name:
@@ -554,11 +712,7 @@ def extract_ai_labeled_fields(lines: list[str]) -> tuple[str, str]:
                 if cand:
                     name = cand
         if not color:
-            m = re.search(
-                r"(?:\*\*|__)?(?:컬러|색상)(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
-                ln,
-                re.I,
-            )
+            m = color_re.search(ln)
             if m:
                 cand = normalize_ai_color(m.group(1))
                 if cand:
@@ -570,10 +724,22 @@ def extract_ai_labeled_fields(lines: list[str]) -> tuple[str, str]:
         m = _RE_AI_NAME.search(section) or _RE_AI_NAME.search(blob)
         if m:
             name = _clean_ai_name(m.group(1))
+    # AI가 「제품명:」 없이 설명형으로 답할 때 — 검색 결과 문장 그대로 사용
+    if not name:
+        name = _extract_narrative_ai_name(blob) or _extract_narrative_ai_name(section)
     if not color:
         m = _RE_AI_COLOR.search(section) or _RE_AI_COLOR.search(blob)
         if m:
             color = normalize_ai_color(m.group(1))
+    if not color:
+        m = re.search(
+            r"그레이\s*그라디언트|그레이\s*그라데이션|Grey\s*Gradient|"
+            r"블랙\s*그라디언트|Black\s*Gradient",
+            blob,
+            re.I,
+        )
+        if m:
+            color = normalize_ai_color(m.group(0))
     return name, color
 
 
@@ -689,8 +855,18 @@ def build_product_name(lines: list[str], hint: str = "") -> NamedProduct:
             best_parts = parts
 
     if not best_parts:
-        parts = _extract_parts(hint or "bag", hint="")
-        best_parts = parts
+        # 절대 "bag" 기본값으로 가방명을 만들지 않음 — 힌트/본문에서만 복구
+        fallback_src = " ".join(
+            x for x in (hint, " ".join(lines[:8] if lines else [])) if x
+        ).strip()
+        if re.search(r"선글라스|선글래스|sunglass|墨镜|太阳镜", fallback_src, re.I):
+            fallback_src = (hint or "") + " 선글라스"
+        best_parts = _extract_parts(fallback_src or hint or "", hint="")
+        # 그래도 타입이 가방으로만 잡히면 선글라스 힌트가 있을 때 교정
+        if best_parts.type_ko in ("백", "가방") and re.search(
+            r"선글라스|선글래스|sunglass|墨镜", fallback_src, re.I
+        ):
+            best_parts.type_ko, best_parts.type_en = "선글라스", "Sunglasses"
 
     name_ko = best_parts.to_ko()
     name_en = best_parts.to_en()

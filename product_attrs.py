@@ -11,9 +11,16 @@ BRAND_MAP = [
     ("LOUIS VUITTON", "louisvuitton", "루이비통"),
     ("SAINT LAURENT", "ysl", "생로랑"),
     ("BALENCIAGA", "balenciaga", "발렌시아가"),
+    ("BOTTEGA VENETA", "bottega", "보테가"),
     ("BOTTEGA", "bottega", "보테가"),
     ("HERMES", "hermes", "에르메스"),
     ("HERMÈS", "hermes", "에르메스"),
+    ("GOYARD", "goyard", "고야드"),
+    ("MIU MIU", "miumiu", "미우미우"),
+    ("MIUMIU", "miumiu", "미우미우"),
+    ("BURBERRY", "burberry", "버버리"),
+    ("THE ROW", "therow", "더로우"),
+    ("THEROW", "therow", "더로우"),
     ("CHROME HEARTS", "chromehearts", "크롬하츠"),
     ("CHROMHEARTS", "chromehearts", "크롬하츠"),
     ("THOM BROWNE", "thombrowne", "톰브라운"),
@@ -21,6 +28,7 @@ BRAND_MAP = [
     ("CELINE", "celine", "셀린느"),
     ("GUCCI", "gucci", "구찌"),
     ("PRADA", "prada", "프라다"),
+    ("FENDI", "fendi", "펜디"),
     ("DIOR", "dior", "디올"),
     ("YSL", "ysl", "생로랑"),
     ("LV", "louisvuitton", "루이비통"),
@@ -29,14 +37,39 @@ BRAND_MAP = [
     ("발렌시아가", "balenciaga", "발렌시아가"),
     ("보테가", "bottega", "보테가"),
     ("에르메스", "hermes", "에르메스"),
+    ("고야드", "goyard", "고야드"),
+    ("미우미우", "miumiu", "미우미우"),
+    ("버버리", "burberry", "버버리"),
+    ("더로우", "therow", "더로우"),
+    ("더 로우", "therow", "더로우"),
     ("샤넬", "chanel", "샤넬"),
     ("셀린느", "celine", "셀린느"),
     ("구찌", "gucci", "구찌"),
     ("프라다", "prada", "프라다"),
     ("디올", "dior", "디올"),
-    ("迪奥", "dior", "디올"),
+    ("펜디", "fendi", "펜디"),
+    ("톰브라운", "thombrowne", "톰브라운"),
+    ("크롬하츠", "chromehearts", "크롬하츠"),
+    # Chinese Weigou labels
+    ("路易威登", "louisvuitton", "루이비통"),
+    ("圣罗兰", "ysl", "생로랑"),
+    ("巴黎世家", "balenciaga", "발렌시아가"),
+    ("葆蝶家", "bottega", "보테가"),
+    ("爱马仕", "hermes", "에르메스"),
+    ("戈雅", "goyard", "고야드"),  # Goyard — was missing → fell through to Chanel
+    ("缪缪", "miumiu", "미우미우"),
+    ("miu miu", "miumiu", "미우미우"),
+    ("巴宝莉", "burberry", "버버리"),
+    ("博柏利", "burberry", "버버리"),
+    ("burberry", "burberry", "버버리"),
+    ("the row", "therow", "더로우"),
     ("香奈儿", "chanel", "샤넬"),
+    ("赛琳", "celine", "셀린느"),
+    ("思琳", "celine", "셀린느"),
     ("古驰", "gucci", "구찌"),
+    ("普拉达", "prada", "프라다"),
+    ("迪奥", "dior", "디올"),
+    ("芬迪", "fendi", "펜디"),
 ]
 
 COLOR_WORDS = [
@@ -177,8 +210,8 @@ _BODY_COLORS = {
 @dataclass
 class ProductAttrs:
     category: str = "가방"
-    brand_id: str = "chanel"
-    brand_name: str = "샤넬"
+    brand_id: str = ""
+    brand_name: str = ""
     colors: list[str] = field(default_factory=list)
     sizes: list[str] = field(default_factory=list)
     is_shoes: bool = False
@@ -187,14 +220,22 @@ class ProductAttrs:
 
 
 def _detect_brand(text: str) -> tuple[str, str]:
-    upper = text.upper()
-    for key, bid, name in BRAND_MAP:
+    """Return (brandId, brandName). Empty when unknown — never invent Chanel."""
+    blob = (text or "").strip()
+    if not blob:
+        return "", ""
+    upper = blob.upper()
+    # Longer keys first (LOUIS VUITTON before LV, BOTTEGA VENETA before BOTTEGA)
+    for key, bid, name in sorted(BRAND_MAP, key=lambda x: -len(x[0])):
         if key.isascii():
-            if key in upper:
+            if len(key) <= 3:
+                if re.search(rf"\b{re.escape(key)}\b", upper):
+                    return bid, name
+            elif key in upper:
                 return bid, name
-        elif key in text:
+        elif key in blob:
             return bid, name
-    return "chanel", "샤넬"
+    return "", ""
 
 
 def _detect_colors(text: str) -> list[str]:
@@ -587,6 +628,32 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
         return "신발"
     lower = text.lower()
 
+    # 0) Hats/caps — before bag heuristics (태그「모자帽子」가 가방으로 오인되지 않게)
+    if _has_any(
+        text,
+        lower,
+        (
+            "모자",
+            "帽子",
+            "hat",
+            "cap",
+            "볼캡",
+            "야구모자",
+            "베이스볼캡",
+            "baseball cap",
+            "beanie",
+            "비니",
+            "베레",
+            "beret",
+            "sunhat",
+            "太阳帽",
+            "棒球帽",
+            "鸭舌帽",
+            "キャップ",
+        ),
+    ):
+        return "기타"
+
     has_bag = _has_any(
         text,
         lower,
@@ -635,30 +702,63 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
     ):
         return "악세사리"
 
-    # 2) Clothing — 옷-여 / 衣服女 / WOMEN
-    if _has_any(
+    # 2) Clothing — 여성옷 / 남성옷 (상의·하의·자켓 구분 없음)
+    is_mens = _has_any(
+        text,
+        lower,
+        (
+            "옷-남",
+            "옷남",
+            "男装",
+            "男款",
+            "男士",
+            "남성",
+            "남자",
+            "men's",
+            "mens",
+            " for men",
+            "homme",
+            "남성옷",
+        ),
+    )
+    is_womens = _has_any(
+        text,
+        lower,
+        (
+            "옷-여",
+            "옷여",
+            "女装",
+            "女款",
+            "女士",
+            "여성",
+            "여자",
+            "women",
+            "woman",
+            "ladies",
+            "femme",
+            "여성옷",
+            "원피스",
+            "dress",
+            "블라우스",
+            "blouse",
+            "스커트",
+            "skirt",
+            "半裙",
+            "裙子",
+        ),
+    )
+    is_clothing = _has_any(
         text,
         lower,
         (
             "하의",
             "팬츠",
             "pants",
-            "skirt",
-            "스커트",
             "데님",
             "슬랙스",
             "진",
             "短裤",
             "裤子",
-            "半裙",
-            "裙子",
-        ),
-    ):
-        return "하의"
-    if _has_any(
-        text,
-        lower,
-        (
             "자켓",
             "jacket",
             "코트",
@@ -668,13 +768,6 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
             "outer",
             "外套",
             "大衣",
-        ),
-    ):
-        return "자켓"
-    if _has_any(
-        text,
-        lower,
-        (
             "상의",
             "shirt",
             "tee",
@@ -684,40 +777,73 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
             "맨투맨",
             "가디건",
             "cardigan",
-            "블라우스",
-            "blouse",
             "sweater",
             "스웨터",
             "knit",
             "hoodie",
-            "옷-여",
-            "옷-남",
-            "옷여",
-            "옷남",
             "衣服",
-            "女装",
-            "男装",
-            "women",
-            "men's",
-            "mens",
-            "woman",
-            "ladies",
             "의류",
             "의상",
             "티셔츠",
-            "원피스",
-            "dress",
             "조끼",
             "vest",
+            "여성옷",
+            "남성옷",
         ),
-    ):
-        return "상의"
+    )
+    if is_clothing or is_mens or is_womens:
+        if is_mens and not is_womens:
+            return "남성옷"
+        if is_womens and not is_mens:
+            return "여성옷"
+        # 의류인데 성별 키워드가 겹치거나 없을 때 — 태그 한 글자 男/女
+        if is_clothing:
+            if "男" in text and "女" not in text:
+                return "남성옷"
+            if "女" in text:
+                return "여성옷"
+        if is_mens:
+            return "남성옷"
+        return "여성옷"
 
     # 3) Bags — shop tags like 가방지갑 / 包包 win over bare 지갑
     if has_bag:
         return "가방"
 
-    # 4) Other accessories
+    # 4) Sunglasses
+    if _has_any(
+        text,
+        lower,
+        (
+            "선글라스",
+            "선글래스",
+            "sunglasses",
+            "sunglass",
+            "墨镜",
+            "太阳镜",
+            "太陽鏡",
+            "サングラス",
+            "eyewear",
+        ),
+    ):
+        return "선글라스"
+
+    # 5) Belts
+    if _has_any(
+        text,
+        lower,
+        (
+            "벨트",
+            "belt",
+            "腰带",
+            "皮带",
+            "皮帶",
+            "ベルト",
+        ),
+    ):
+        return "벨트"
+
+    # 6) Other accessories
     if _has_any(
         text,
         lower,
@@ -726,17 +852,12 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
             "钱包",
             "wallet",
             "卡包",
-            "belt",
-            "벨트",
-            "腰带",
             "watch",
             "시계",
             "목걸이",
             "귀걸이",
             "팔찌",
             "브로치",
-            "선글라스",
-            "모자",
             "악세사리",
             "액세서리",
             "配饰",
@@ -804,9 +925,19 @@ def extract_attrs(
     image_paths: list[str] | None = None,
     default_color: bool = False,
     default_size: bool = False,
+    *,
+    google_name: str = "",
+    name_en: str = "",
 ) -> ProductAttrs:
-    blob = "\n".join(x for x in (title, tags, description) if x)
-    brand_id, brand_name = _detect_brand(blob)
+    # Product name (AI/google) first — Weigou title often lacks Latin brand words
+    brand_id, brand_name = "", ""
+    for chunk in (google_name, name_en, title, tags, description):
+        brand_id, brand_name = _detect_brand(chunk or "")
+        if brand_id:
+            break
+    blob = "\n".join(
+        x for x in (google_name, name_en, title, tags, description) if x
+    )
     colors = _detect_colors(blob)
     sizes, is_shoes, dimension = _parse_sizes(blob)
     category = _detect_category(blob, is_shoes, dimension)

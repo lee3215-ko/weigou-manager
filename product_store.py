@@ -19,17 +19,23 @@ from product_parse import ParsedProduct
 
 ProgressCb = Callable[[str], None]
 
-CATEGORY_ORDER = ["가방", "신발", "상의", "하의", "자켓", "악세사리", "기타"]
-
-# 갤러리 2번째 장은 배송사(중국우정/EMS 등) 안내인 경우가 많아 수집에서 제외
-SKIP_GALLERY_INDEX = 1  # 0-based
+CATEGORY_ORDER = ["가방", "신발", "여성옷", "남성옷", "선글라스", "벨트", "악세사리", "기타"]
 
 
-def drop_second_gallery_image(urls: list[str]) -> list[str]:
-    """Keep cover + remaining shots; drop the 2nd slide (logistics poster)."""
-    if len(urls) <= SKIP_GALLERY_INDEX:
-        return list(urls)
-    return [u for i, u in enumerate(urls) if i != SKIP_GALLERY_INDEX]
+def _prefer_text(remote: str | None, local: str | None) -> str:
+    """Prefer non-empty remote text; fall back to local so sync never blanks a field."""
+    r = (remote or "").strip()
+    l = (local or "").strip()
+    return r if r else l
+
+
+def _prefer_urls(remote: list[str] | None, local: list[str] | None) -> list[str]:
+    """Prefer the longer non-empty image-url list between remote and local."""
+    r = [u for u in (remote or []) if isinstance(u, str) and u]
+    l = [u for u in (local or []) if isinstance(u, str) and u]
+    if r and l:
+        return r if len(r) >= len(l) else l
+    return r or l
 
 
 def default_root() -> pathlib.Path:
@@ -92,11 +98,13 @@ class PublishedItem:
     note: str
     mall_id: str
     created_at: str
+    updated_at: str = ""
     google_name: str = ""
     name_en: str = ""
     colors: str = ""
     sizes: str = ""
     description: str = ""
+    recommended: bool = False
     image_paths: list[str] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)
 
@@ -166,6 +174,7 @@ class ProductStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_excluded_goods ON excluded(goods_id);
                 CREATE INDEX IF NOT EXISTS idx_excluded_search ON excluded(search_code);
+                CREATE INDEX IF NOT EXISTS idx_excluded_category ON excluded(category);
                 CREATE TABLE IF NOT EXISTS published (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     goods_id TEXT NOT NULL DEFAULT '',
@@ -186,6 +195,12 @@ class ProductStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS sync_tombstones (
+                    kind TEXT NOT NULL,
+                    sync_key TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL,
+                    PRIMARY KEY (kind, sync_key)
+                );
                 """
                 )
                 cols = {r[1] for r in con.execute("PRAGMA table_info(products)").fetchall()}
@@ -203,6 +218,15 @@ class ProductStore:
                 con.execute(
                     "CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)"
                 )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_products_updated ON products(updated_at)"
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku_no)"
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_products_tags ON products(tags)"
+                )
                 pub_cols = {
                     r[1] for r in con.execute("PRAGMA table_info(published)").fetchall()
                 }
@@ -214,10 +238,21 @@ class ProductStore:
                     ("description", "TEXT NOT NULL DEFAULT ''"),
                     ("image_paths", "TEXT NOT NULL DEFAULT '[]'"),
                     ("image_urls", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("recommended", "INTEGER NOT NULL DEFAULT 0"),
+                    ("updated_at", "TEXT NOT NULL DEFAULT ''"),
                 ]
                 for name, decl in pub_migrations:
                     if name not in pub_cols:
                         con.execute(f"ALTER TABLE published ADD COLUMN {name} {decl}")
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_published_updated ON published(updated_at)"
+                )
+                # 상의/하의/자켓 → 여성옷 (성별 미상 기존 의류)
+                for table in ("products", "excluded", "published"):
+                    con.execute(
+                        f"UPDATE {table} SET category='여성옷' "
+                        "WHERE category IN ('상의','하의','자켓')"
+                    )
 
     def _row_to_product(self, row: sqlite3.Row) -> Product:
         def jlist(key: str) -> list[str]:
@@ -251,26 +286,53 @@ class ProductStore:
             sizes=(row["sizes"] if "sizes" in keys else "") or "",
         )
 
-    def list_products(self, query: str = "", category: str = "") -> list[Product]:
+    def _list_products_sql(self, query: str, category: str) -> tuple[str, list[str]]:
         q = (query or "").strip()
         cat = (category or "").strip()
+        sql = " WHERE 1=1"
+        args: list[str] = []
+        if q:
+            like = f"%{q}%"
+            sql += (
+                " AND (title LIKE ? OR search_code LIKE ? OR sku_no LIKE ?"
+                " OR description LIKE ? OR tags LIKE ? OR google_name LIKE ?"
+                " OR name_en LIKE ? OR category LIKE ?)"
+            )
+            args.extend([like, like, like, like, like, like, like, like])
+        if cat and cat != "전체":
+            sql += " AND category = ?"
+            args.append(cat)
+        return sql, args
+
+    def list_products(
+        self,
+        query: str = "",
+        category: str = "",
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Product]:
+        """List products matching query/category.
+
+        Pagination: when ``limit`` is provided, results are fetched with
+        ``ORDER BY id DESC`` + ``LIMIT``/``OFFSET`` directly in SQL (fast for
+        large catalogs) and returned in that order — no Python-side re-sort.
+        When ``limit`` is ``None`` (default, used for the full list / CSV
+        export views), all matching rows are fetched and then re-sorted in
+        Python by the numeric prefix of ``search_code`` so the manager UI
+        keeps its legacy ordering.
+        """
+        where_sql, args = self._list_products_sql(query, category)
+        sql = "SELECT * FROM products" + where_sql + " ORDER BY id DESC"
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args = [*args, int(limit), int(offset)]
         with self._connect() as con:
-            sql = "SELECT * FROM products WHERE 1=1"
-            args: list[str] = []
-            if q:
-                like = f"%{q}%"
-                sql += (
-                    " AND (title LIKE ? OR search_code LIKE ? OR sku_no LIKE ?"
-                    " OR description LIKE ? OR tags LIKE ? OR google_name LIKE ?"
-                    " OR name_en LIKE ? OR category LIKE ?)"
-                )
-                args.extend([like, like, like, like, like, like, like, like])
-            if cat and cat != "전체":
-                sql += " AND category = ?"
-                args.append(cat)
-            sql += " ORDER BY id DESC"
             rows = con.execute(sql, args).fetchall()
         products = [self._row_to_product(r) for r in rows]
+
+        if limit is not None:
+            return products
 
         def search_code_num(code: str) -> int:
             s = (code or "").strip()
@@ -286,6 +348,14 @@ class ProductStore:
 
         products.sort(key=sort_key)
         return products
+
+    def count_products(self, query: str = "", category: str = "") -> int:
+        where_sql, args = self._list_products_sql(query, category)
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM products" + where_sql, args
+            ).fetchone()
+        return int(row["c"] if row else 0)
 
     def get(self, product_id: int) -> Product | None:
         with self._connect() as con:
@@ -324,6 +394,50 @@ class ProductStore:
         if index > prev:
             self.set_setting(f"list_cursor:{sid}", str(int(index)))
 
+    def record_tombstone(self, kind: str, sync_key: str) -> None:
+        """Remember a deletion so other synced devices can remove it too."""
+        key = (sync_key or "").strip()
+        k = (kind or "").strip()
+        if not key or not k:
+            return
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO sync_tombstones(kind, sync_key, deleted_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(kind, sync_key) DO UPDATE SET deleted_at=excluded.deleted_at
+                """,
+                (k, key, now),
+            )
+
+    def list_tombstones_since(self, iso_ts: str) -> list[dict]:
+        """Tombstones with deleted_at >= iso_ts (all tombstones if iso_ts is empty)."""
+        since = (iso_ts or "").strip()
+        with self._connect() as con:
+            if since:
+                rows = con.execute(
+                    "SELECT kind, sync_key, deleted_at FROM sync_tombstones "
+                    "WHERE deleted_at >= ? ORDER BY deleted_at",
+                    (since,),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT kind, sync_key, deleted_at FROM sync_tombstones "
+                    "ORDER BY deleted_at"
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_tombstone(self, kind: str, sync_key: str) -> None:
+        key = (sync_key or "").strip()
+        k = (kind or "").strip()
+        if not key or not k:
+            return
+        with self._connect() as con:
+            con.execute(
+                "DELETE FROM sync_tombstones WHERE kind=? AND sync_key=?", (k, key)
+            )
+
     def delete(self, product_id: int) -> None:
         p = self.get(product_id)
         if not p:
@@ -333,6 +447,8 @@ class ProductStore:
             shutil.rmtree(folder, ignore_errors=True)
         with self._connect() as con:
             con.execute("DELETE FROM products WHERE id=?", (product_id,))
+        key = p.goods_id or p.search_code or f"id:{product_id}"
+        self.record_tombstone("product", key)
 
     def _row_to_excluded(self, row: sqlite3.Row) -> ExcludedItem:
         return ExcludedItem(
@@ -349,21 +465,48 @@ class ProductStore:
             created_at=row["created_at"] or "",
         )
 
-    def list_excluded(self, query: str = "") -> list[ExcludedItem]:
+    def _list_excluded_sql(self, query: str, category: str) -> tuple[str, list[str]]:
         q = (query or "").strip()
+        cat = (category or "").strip()
+        sql = " WHERE 1=1"
+        args: list[str] = []
+        if q:
+            like = f"%{q}%"
+            sql += (
+                " AND (title LIKE ? OR search_code LIKE ? OR sku_no LIKE ?"
+                " OR tags LIKE ? OR goods_id LIKE ? OR category LIKE ?)"
+            )
+            args.extend([like, like, like, like, like, like])
+        if cat and cat != "전체":
+            sql += " AND category = ?"
+            args.append(cat)
+        return sql, args
+
+    def list_excluded(
+        self,
+        query: str = "",
+        category: str = "",
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[ExcludedItem]:
+        """List excluded items. See ``list_products`` for the pagination contract."""
+        where_sql, args = self._list_excluded_sql(query, category)
+        sql = "SELECT * FROM excluded" + where_sql + " ORDER BY id DESC"
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args = [*args, int(limit), int(offset)]
         with self._connect() as con:
-            sql = "SELECT * FROM excluded WHERE 1=1"
-            args: list[str] = []
-            if q:
-                like = f"%{q}%"
-                sql += (
-                    " AND (title LIKE ? OR search_code LIKE ? OR sku_no LIKE ?"
-                    " OR tags LIKE ? OR goods_id LIKE ? OR category LIKE ?)"
-                )
-                args.extend([like, like, like, like, like, like])
-            sql += " ORDER BY id DESC"
             rows = con.execute(sql, args).fetchall()
         return [self._row_to_excluded(r) for r in rows]
+
+    def count_excluded(self, query: str = "", category: str = "") -> int:
+        where_sql, args = self._list_excluded_sql(query, category)
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM excluded" + where_sql, args
+            ).fetchone()
+        return int(row["c"] if row else 0)
 
     def get_excluded(self, excluded_id: int) -> ExcludedItem | None:
         with self._connect() as con:
@@ -478,6 +621,8 @@ class ProductStore:
                 pass
         with self._connect() as con:
             con.execute("DELETE FROM excluded WHERE id=?", (excluded_id,))
+        key = item.goods_id or item.search_code or f"id:{excluded_id}"
+        self.record_tombstone("excluded", key)
         return True
 
     def _row_to_published(self, row: sqlite3.Row) -> PublishedItem:
@@ -504,32 +649,70 @@ class ProductStore:
             note=row["note"] or "",
             mall_id=(row["mall_id"] if "mall_id" in keys else "") or "",
             created_at=row["created_at"] or "",
+            updated_at=(row["updated_at"] if "updated_at" in keys else "") or "",
             google_name=(row["google_name"] if "google_name" in keys else "") or "",
             name_en=(row["name_en"] if "name_en" in keys else "") or "",
             colors=(row["colors"] if "colors" in keys else "") or "",
             sizes=(row["sizes"] if "sizes" in keys else "") or "",
             description=(row["description"] if "description" in keys else "") or "",
+            recommended=bool(int(row["recommended"]))
+            if "recommended" in keys and row["recommended"] is not None
+            else False,
             image_paths=jlist("image_paths"),
             image_urls=jlist("image_urls"),
         )
 
-    def list_published(self, query: str = "") -> list[PublishedItem]:
+    def _list_published_sql(
+        self, query: str, category: str, recommended_only: bool
+    ) -> tuple[str, list[object]]:
         q = (query or "").strip()
+        cat = (category or "").strip()
+        sql = " WHERE 1=1"
+        args: list[object] = []
+        if q:
+            like = f"%{q}%"
+            sql += (
+                " AND (title LIKE ? OR search_code LIKE ? OR sku_no LIKE ?"
+                " OR tags LIKE ? OR goods_id LIKE ? OR category LIKE ?"
+                " OR mall_id LIKE ? OR note LIKE ? OR google_name LIKE ?"
+                " OR name_en LIKE ? OR colors LIKE ?)"
+            )
+            args.extend([like, like, like, like, like, like, like, like, like, like, like])
+        if cat and cat != "전체":
+            sql += " AND category = ?"
+            args.append(cat)
+        if recommended_only:
+            sql += " AND recommended = 1"
+        return sql, args
+
+    def list_published(
+        self,
+        query: str = "",
+        category: str = "",
+        *,
+        recommended_only: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[PublishedItem]:
+        """List published items. See ``list_products`` for the pagination contract."""
+        where_sql, args = self._list_published_sql(query, category, recommended_only)
+        sql = "SELECT * FROM published" + where_sql + " ORDER BY id DESC"
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args = [*args, int(limit), int(offset)]
         with self._connect() as con:
-            sql = "SELECT * FROM published WHERE 1=1"
-            args: list[str] = []
-            if q:
-                like = f"%{q}%"
-                sql += (
-                    " AND (title LIKE ? OR search_code LIKE ? OR sku_no LIKE ?"
-                    " OR tags LIKE ? OR goods_id LIKE ? OR category LIKE ?"
-                    " OR mall_id LIKE ? OR note LIKE ? OR google_name LIKE ?"
-                    " OR name_en LIKE ? OR colors LIKE ?)"
-                )
-                args.extend([like, like, like, like, like, like, like, like, like, like, like])
-            sql += " ORDER BY id DESC"
             rows = con.execute(sql, args).fetchall()
         return [self._row_to_published(r) for r in rows]
+
+    def count_published(
+        self, query: str = "", category: str = "", *, recommended_only: bool = False
+    ) -> int:
+        where_sql, args = self._list_published_sql(query, category, recommended_only)
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM published" + where_sql, args
+            ).fetchone()
+        return int(row["c"] if row else 0)
 
     def get_published(self, published_id: int) -> PublishedItem | None:
         with self._connect() as con:
@@ -537,6 +720,130 @@ class ProductStore:
                 "SELECT * FROM published WHERE id=?", (published_id,)
             ).fetchone()
         return self._row_to_published(row) if row else None
+
+    def find_published_by_search_code(self, search_code: str) -> PublishedItem | None:
+        code = (search_code or "").strip()
+        if not code:
+            return None
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM published WHERE search_code=? ORDER BY id DESC LIMIT 1",
+                (code,),
+            ).fetchone()
+            if not row:
+                # 숫자만 저장된 경우 / 앞뒤 공백
+                row = con.execute(
+                    "SELECT * FROM published WHERE trim(search_code)=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (code,),
+                ).fetchone()
+            if not row and code.isdigit():
+                like = f"%{code}%"
+                row = con.execute(
+                    "SELECT * FROM published WHERE search_code LIKE ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (like,),
+                ).fetchone()
+        return self._row_to_published(row) if row else None
+
+    def find_product_by_search_code(self, search_code: str) -> Product | None:
+        code = (search_code or "").strip()
+        if not code:
+            return None
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM products WHERE search_code=? ORDER BY id DESC LIMIT 1",
+                (code,),
+            ).fetchone()
+        return self._row_to_product(row) if row else None
+
+    def update_published(
+        self,
+        published_id: int,
+        *,
+        title: str | None = None,
+        search_code: str | None = None,
+        sku_no: str | None = None,
+        tags: str | None = None,
+        description: str | None = None,
+        category: str | None = None,
+        google_name: str | None = None,
+        name_en: str | None = None,
+        colors: str | None = None,
+        sizes: str | None = None,
+        note: str | None = None,
+        mall_id: str | None = None,
+        recommended: bool | None = None,
+    ) -> None:
+        """Update fields on a published row (for edit → 재등록)."""
+        item = self.get_published(published_id)
+        if not item:
+            return
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE published SET
+                    title=?, search_code=?, sku_no=?, tags=?, description=?,
+                    category=?, google_name=?, name_en=?, colors=?, sizes=?,
+                    note=?, mall_id=?, recommended=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    title if title is not None else item.title,
+                    search_code if search_code is not None else item.search_code,
+                    sku_no if sku_no is not None else item.sku_no,
+                    tags if tags is not None else item.tags,
+                    description if description is not None else item.description,
+                    category if category is not None else item.category,
+                    google_name if google_name is not None else item.google_name,
+                    name_en if name_en is not None else item.name_en,
+                    colors if colors is not None else item.colors,
+                    sizes if sizes is not None else item.sizes,
+                    note if note is not None else item.note,
+                    mall_id if mall_id is not None else item.mall_id,
+                    int(
+                        item.recommended
+                        if recommended is None
+                        else bool(recommended)
+                    ),
+                    now,
+                    published_id,
+                ),
+            )
+
+    def published_to_product(self, item: PublishedItem) -> Product:
+        """Build a Product snapshot from published row for homepage re-publish."""
+        mall = (item.mall_id or "").strip()
+        pid = item.id
+        if mall.startswith("wg-"):
+            try:
+                pid = int(mall[3:])
+            except ValueError:
+                pid = item.id
+        paths = list(item.image_paths or [])
+        if not paths and item.cover_path:
+            paths = [item.cover_path]
+        return Product(
+            id=pid,
+            goods_id=item.goods_id,
+            shop_id=item.shop_id,
+            title=item.title,
+            search_code=item.search_code,
+            sku_no=item.sku_no,
+            tags=item.tags,
+            description=item.description,
+            cover_path=item.cover_path,
+            image_paths=paths,
+            image_urls=list(item.image_urls or []),
+            category=item.category,
+            google_name=item.google_name,
+            name_en=item.name_en,
+            colors=item.colors,
+            sizes=item.sizes,
+            created_at=item.created_at,
+            updated_at=item.created_at,
+        )
 
     def published_goods_ids(self) -> set[str]:
         with self._connect() as con:
@@ -587,10 +894,10 @@ class ProductStore:
                 """
                 INSERT INTO published
                 (goods_id, shop_id, search_code, sku_no, title, tags, category,
-                 cover_path, note, mall_id, created_at,
+                 cover_path, note, mall_id, created_at, updated_at,
                  google_name, name_en, colors, sizes, description,
                  image_paths, image_urls)
-                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     p.goods_id,
@@ -602,6 +909,7 @@ class ProductStore:
                     p.category,
                     note or "",
                     mall_id or "",
+                    now,
                     now,
                     p.google_name,
                     p.name_en,
@@ -767,6 +1075,8 @@ class ProductStore:
                 ),
             )
             con.execute("DELETE FROM published WHERE id=?", (published_id,))
+        key = item.goods_id or item.search_code or f"id:{published_id}"
+        self.record_tombstone("published", key)
 
         # leftover single cover file (legacy archives)
         if item.cover_path:
@@ -820,6 +1130,82 @@ class ProductStore:
                     product_id,
                 ),
             )
+
+    def count_by_exact_tag(self, tags: str) -> int:
+        """Count products whose tags field matches exactly (trimmed)."""
+        tag = (tags or "").strip()
+        if not tag:
+            return 0
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM products WHERE trim(tags) = ?",
+                (tag,),
+            ).fetchone()
+        return int(row["c"] if row else 0)
+
+    def count_published_by_exact_tag(self, tags: str) -> int:
+        """Count published rows whose tags field matches exactly (trimmed)."""
+        tag = (tags or "").strip()
+        if not tag:
+            return 0
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM published WHERE trim(tags) = ?",
+                (tag,),
+            ).fetchone()
+        return int(row["c"] if row else 0)
+
+    def list_published_ids_by_exact_tag(self, tags: str) -> list[int]:
+        """Published ids with the same exact tags (trimmed)."""
+        tag = (tags or "").strip()
+        if not tag:
+            return []
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT id FROM published WHERE trim(tags) = ? ORDER BY id",
+                (tag,),
+            ).fetchall()
+        return [int(r["id"]) for r in rows]
+
+    def bulk_update_category_by_tag(self, tags: str, category: str) -> int:
+        """Set category for all products with the same exact tags. Returns updated count."""
+        tag = (tags or "").strip()
+        cat = (category or "").strip()
+        if not tag or not cat:
+            return 0
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                UPDATE products
+                SET category=?, updated_at=?
+                WHERE trim(tags) = ?
+                """,
+                (cat, now, tag),
+            )
+            return int(cur.rowcount or 0)
+
+    def bulk_update_published_category_by_tag(
+        self, tags: str, category: str
+    ) -> list[int]:
+        """Set category for published rows with the same exact tags. Returns updated ids."""
+        tag = (tags or "").strip()
+        cat = (category or "").strip()
+        if not tag or not cat:
+            return []
+        ids = self.list_published_ids_by_exact_tag(tag)
+        if not ids:
+            return []
+        with self._connect() as con:
+            con.execute(
+                f"""
+                UPDATE published
+                SET category=?
+                WHERE id IN ({",".join("?" * len(ids))})
+                """,
+                (cat, *ids),
+            )
+        return ids
 
     def apply_google_result(
         self,
@@ -904,12 +1290,6 @@ class ProductStore:
                 f"등록 목록 — 건너뜀: {parsed.title or parsed.goods_id or parsed.search_code}"
             )
             return -1
-
-        # 2번째 이미지(배송 안내 등)는 저장하지 않음
-        before = len(parsed.image_urls)
-        parsed.image_urls = drop_second_gallery_image(parsed.image_urls)
-        if before >= 2 and len(parsed.image_urls) < before:
-            log(f"2번째 이미지 제외 ({before} → {len(parsed.image_urls)}장)")
 
         existing_id = self._find_existing(parsed) if merge else None
 
@@ -1101,72 +1481,131 @@ class ProductStore:
             on_progress(f"제외 목록으로 건너뜀 {skipped}건")
         return ok, fail
 
+    @staticmethod
+    def _prod_row(p: Product) -> dict:
+        return {
+            "goods_id": p.goods_id,
+            "shop_id": p.shop_id,
+            "title": p.title,
+            "search_code": p.search_code,
+            "sku_no": p.sku_no,
+            "tags": p.tags,
+            "description": p.description,
+            "category": p.category,
+            "google_name": p.google_name,
+            "name_en": p.name_en,
+            "colors": p.colors,
+            "sizes": p.sizes,
+            "image_urls": list(p.image_urls or []),
+            "created_at": p.created_at,
+            "updated_at": p.updated_at,
+        }
+
+    @staticmethod
+    def _excl_row(e: ExcludedItem) -> dict:
+        return {
+            "goods_id": e.goods_id,
+            "shop_id": e.shop_id,
+            "search_code": e.search_code,
+            "sku_no": e.sku_no,
+            "title": e.title,
+            "tags": e.tags,
+            "category": e.category,
+            "note": e.note,
+            "created_at": e.created_at,
+        }
+
+    @staticmethod
+    def _pub_row(p: PublishedItem) -> dict:
+        return {
+            "goods_id": p.goods_id,
+            "shop_id": p.shop_id,
+            "search_code": p.search_code,
+            "sku_no": p.sku_no,
+            "title": p.title,
+            "tags": p.tags,
+            "category": p.category,
+            "note": p.note,
+            "mall_id": p.mall_id,
+            "google_name": p.google_name,
+            "name_en": p.name_en,
+            "colors": p.colors,
+            "sizes": p.sizes,
+            "description": p.description,
+            "recommended": bool(p.recommended),
+            "image_urls": list(p.image_urls or []),
+            "created_at": p.created_at,
+            "updated_at": p.updated_at,
+        }
+
+    def _tombstones_to_deleted(self, tombstones: list[dict]) -> dict[str, list[str]]:
+        deleted: dict[str, list[str]] = {"products": [], "excluded": [], "published": []}
+        kind_to_key = {"product": "products", "excluded": "excluded", "published": "published"}
+        for t in tombstones:
+            key = kind_to_key.get(str(t.get("kind") or ""))
+            sync_key = t.get("sync_key")
+            if key and sync_key:
+                deleted[key].append(str(sync_key))
+        return deleted
+
     def export_sync_bundle(self) -> dict:
-        """Serialize catalog for multi-user GitHub sync (metadata + image URLs)."""
+        """Serialize catalog for multi-user GitHub sync (metadata + image URLs).
 
-        def prod_row(p: Product) -> dict:
-            return {
-                "goods_id": p.goods_id,
-                "shop_id": p.shop_id,
-                "title": p.title,
-                "search_code": p.search_code,
-                "sku_no": p.sku_no,
-                "tags": p.tags,
-                "description": p.description,
-                "category": p.category,
-                "google_name": p.google_name,
-                "name_en": p.name_en,
-                "colors": p.colors,
-                "sizes": p.sizes,
-                "image_urls": list(p.image_urls or []),
-                "created_at": p.created_at,
-                "updated_at": p.updated_at,
-            }
-
-        def excl_row(e: ExcludedItem) -> dict:
-            return {
-                "goods_id": e.goods_id,
-                "shop_id": e.shop_id,
-                "search_code": e.search_code,
-                "sku_no": e.sku_no,
-                "title": e.title,
-                "tags": e.tags,
-                "category": e.category,
-                "note": e.note,
-                "created_at": e.created_at,
-            }
-
-        def pub_row(p: PublishedItem) -> dict:
-            return {
-                "goods_id": p.goods_id,
-                "shop_id": p.shop_id,
-                "search_code": p.search_code,
-                "sku_no": p.sku_no,
-                "title": p.title,
-                "tags": p.tags,
-                "category": p.category,
-                "note": p.note,
-                "mall_id": p.mall_id,
-                "google_name": p.google_name,
-                "name_en": p.name_en,
-                "colors": p.colors,
-                "sizes": p.sizes,
-                "description": p.description,
-                "image_urls": list(p.image_urls or []),
-                "created_at": p.created_at,
-            }
-
-        products = [prod_row(p) for p in self.list_products("", "전체")]
-        excluded = [excl_row(e) for e in self.list_excluded("")]
-        published = [pub_row(p) for p in self.list_published("")]
+        schema 2: adds a "deleted" section (all current tombstone keys) so
+        other devices can remove rows that were deleted locally.
+        """
+        products = [self._prod_row(p) for p in self.list_products("", "전체")]
+        excluded = [self._excl_row(e) for e in self.list_excluded("")]
+        published = [self._pub_row(p) for p in self.list_published("")]
+        deleted = self._tombstones_to_deleted(self.list_tombstones_since(""))
         rev = int(self.get_setting("sync_rev", "0") or "0")
         return {
-            "schema": 1,
+            "schema": 2,
+            "type": "full",
             "rev": rev,
             "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
             "products": products,
             "excluded": excluded,
             "published": published,
+            "deleted": deleted,
+        }
+
+    def export_sync_delta(self, since_iso: str) -> dict:
+        """Serialize only rows changed since ``since_iso`` plus tombstones since then.
+
+        Lighter-weight alternative to :meth:`export_sync_bundle` for frequent
+        syncs — schema 2, ``type: "delta"``.
+        """
+        since = (since_iso or "").strip()
+        with self._connect() as con:
+            prod_rows = con.execute(
+                "SELECT * FROM products WHERE updated_at >= ? ORDER BY id DESC",
+                (since,),
+            ).fetchall()
+            excl_rows = con.execute(
+                "SELECT * FROM excluded WHERE created_at >= ? ORDER BY id DESC",
+                (since,),
+            ).fetchall()
+            pub_rows = con.execute(
+                "SELECT * FROM published WHERE created_at >= ? OR updated_at >= ? "
+                "ORDER BY id DESC",
+                (since, since),
+            ).fetchall()
+        products = [self._prod_row(self._row_to_product(r)) for r in prod_rows]
+        excluded = [self._excl_row(self._row_to_excluded(r)) for r in excl_rows]
+        published = [self._pub_row(self._row_to_published(r)) for r in pub_rows]
+        deleted = self._tombstones_to_deleted(self.list_tombstones_since(since))
+        rev = int(self.get_setting("sync_rev", "0") or "0")
+        return {
+            "schema": 2,
+            "type": "delta",
+            "since": since,
+            "rev": rev,
+            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "products": products,
+            "excluded": excluded,
+            "published": published,
+            "deleted": deleted,
         }
 
     def _lookup_product_id(self, goods_id: str, search_code: str) -> int | None:
@@ -1190,12 +1629,83 @@ class ProductStore:
     def _ts(self, value: str) -> str:
         return (value or "").strip()
 
+    def _apply_deleted_products(self, keys: list[str]) -> int:
+        removed = 0
+        with self._connect() as con:
+            for key in keys:
+                k = (key or "").strip()
+                if not k or k.startswith("id:"):
+                    continue
+                rows = con.execute(
+                    "SELECT id FROM products WHERE goods_id=? OR search_code=?",
+                    (k, k),
+                ).fetchall()
+                for r in rows:
+                    self.delete(int(r["id"]))
+                    removed += 1
+        return removed
+
+    def _apply_deleted_excluded(self, keys: list[str]) -> int:
+        removed = 0
+        with self._connect() as con:
+            for key in keys:
+                k = (key or "").strip()
+                if not k or k.startswith("id:"):
+                    continue
+                rows = con.execute(
+                    "SELECT id FROM excluded WHERE goods_id=? OR search_code=?",
+                    (k, k),
+                ).fetchall()
+                for r in rows:
+                    self.unexclude(int(r["id"]))
+                    removed += 1
+        return removed
+
+    def _apply_deleted_published(self, keys: list[str]) -> int:
+        removed = 0
+        for key in keys:
+            k = (key or "").strip()
+            if not k or k.startswith("id:"):
+                continue
+            with self._connect() as con:
+                rows = con.execute(
+                    "SELECT id FROM published WHERE mall_id=? OR goods_id=? OR search_code=?",
+                    (k, k, k),
+                ).fetchall()
+            for r in rows:
+                pubid = int(r["id"])
+                item = self.get_published(pubid)
+                with self._connect() as con:
+                    con.execute("DELETE FROM published WHERE id=?", (pubid,))
+                pack = self.published_img_root / f"p{pubid}"
+                if pack.exists():
+                    shutil.rmtree(pack, ignore_errors=True)
+                if item and item.cover_path:
+                    try:
+                        pathlib.Path(item.cover_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                self.record_tombstone("published", k)
+                removed += 1
+        return removed
+
     def apply_sync_bundle(self, bundle: dict) -> dict[str, int]:
-        """Merge remote catalog into local DB. Returns change counts."""
+        """Merge remote catalog into local DB. Returns change counts.
+
+        Only metadata/URLs are merged here — actual image bytes are fetched
+        lazily via :meth:`ensure_product_images` / :meth:`ensure_published_images`
+        so a sync pull stays fast and cheap.
+        """
         if not isinstance(bundle, dict):
             return {"products": 0, "excluded": 0, "published": 0}
         now = dt.datetime.now().isoformat(timespec="seconds")
         stats = {"products": 0, "excluded": 0, "published": 0}
+
+        deleted = bundle.get("deleted") or {}
+        if isinstance(deleted, dict):
+            self._apply_deleted_products(list(deleted.get("products") or []))
+            self._apply_deleted_excluded(list(deleted.get("excluded") or []))
+            self._apply_deleted_published(list(deleted.get("published") or []))
 
         for row in bundle.get("products") or []:
             if not isinstance(row, dict):
@@ -1211,7 +1721,7 @@ class ProductStore:
                 urls = []
             if pid is None:
                 with self._connect() as con:
-                    cur = con.execute(
+                    con.execute(
                         """
                         INSERT INTO products
                         (goods_id, shop_id, title, search_code, sku_no, tags, description,
@@ -1237,71 +1747,81 @@ class ProductStore:
                             remote_u or now,
                         ),
                     )
-                    new_id = int(cur.lastrowid)
-                self._ensure_images_for_product(new_id, urls)
                 stats["products"] += 1
-                continue
-            local = self.get(pid)
-            if local and remote_u and local.updated_at and remote_u < local.updated_at:
-                continue
-            with self._connect() as con:
-                con.execute(
-                    """
-                    UPDATE products SET
-                        goods_id=?, shop_id=?, title=?, search_code=?, sku_no=?, tags=?,
-                        description=?, image_urls=?, category=?, google_name=?, name_en=?,
-                        colors=?, sizes=?, updated_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        gid or (local.goods_id if local else ""),
-                        row.get("shop_id") or "",
-                        row.get("title") or "",
-                        code,
-                        row.get("sku_no") or "",
-                        row.get("tags") or "",
-                        row.get("description") or "",
-                        json.dumps(urls, ensure_ascii=False),
-                        row.get("category") or "",
-                        row.get("google_name") or "",
-                        row.get("name_en") or "",
-                        row.get("colors") or "",
-                        row.get("sizes") or "",
-                        remote_u or now,
-                        pid,
-                    ),
-                )
-            self._ensure_images_for_product(pid, urls)
-            stats["products"] += 1
+            else:
+                local = self.get(pid)
+                if local and remote_u and local.updated_at and remote_u < local.updated_at:
+                    continue
+                local_urls = list(local.image_urls or []) if local else []
+                merged_urls = _prefer_urls(urls, local_urls)
+                with self._connect() as con:
+                    con.execute(
+                        """
+                        UPDATE products SET
+                            goods_id=?, shop_id=?, title=?, search_code=?, sku_no=?, tags=?,
+                            description=?, image_urls=?, category=?, google_name=?, name_en=?,
+                            colors=?, sizes=?, updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            gid or (local.goods_id if local else ""),
+                            row.get("shop_id") or (local.shop_id if local else ""),
+                            _prefer_text(row.get("title"), local.title if local else ""),
+                            _prefer_text(code, local.search_code if local else ""),
+                            _prefer_text(row.get("sku_no"), local.sku_no if local else ""),
+                            _prefer_text(row.get("tags"), local.tags if local else ""),
+                            _prefer_text(
+                                row.get("description"), local.description if local else ""
+                            ),
+                            json.dumps(merged_urls, ensure_ascii=False),
+                            _prefer_text(row.get("category"), local.category if local else ""),
+                            _prefer_text(
+                                row.get("google_name"), local.google_name if local else ""
+                            ),
+                            _prefer_text(row.get("name_en"), local.name_en if local else ""),
+                            _prefer_text(row.get("colors"), local.colors if local else ""),
+                            _prefer_text(row.get("sizes"), local.sizes if local else ""),
+                            remote_u or now,
+                            pid,
+                        ),
+                    )
+                stats["products"] += 1
+            if gid:
+                self.clear_tombstone("product", gid)
+            if code:
+                self.clear_tombstone("product", code)
 
         for row in bundle.get("excluded") or []:
             if not isinstance(row, dict):
                 continue
             gid = (row.get("goods_id") or "").strip()
             code = (row.get("search_code") or "").strip()
-            if self.is_excluded(goods_id=gid, search_code=code):
-                continue
-            with self._connect() as con:
-                con.execute(
-                    """
-                    INSERT INTO excluded
-                    (goods_id, shop_id, search_code, sku_no, title, tags, category,
-                     cover_path, note, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
-                    """,
-                    (
-                        gid,
-                        row.get("shop_id") or "",
-                        code,
-                        row.get("sku_no") or "",
-                        row.get("title") or "",
-                        row.get("tags") or "",
-                        row.get("category") or "",
-                        row.get("note") or "",
-                        row.get("created_at") or now,
-                    ),
-                )
-            stats["excluded"] += 1
+            if not self.is_excluded(goods_id=gid, search_code=code):
+                with self._connect() as con:
+                    con.execute(
+                        """
+                        INSERT INTO excluded
+                        (goods_id, shop_id, search_code, sku_no, title, tags, category,
+                         cover_path, note, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                        """,
+                        (
+                            gid,
+                            row.get("shop_id") or "",
+                            code,
+                            row.get("sku_no") or "",
+                            row.get("title") or "",
+                            row.get("tags") or "",
+                            row.get("category") or "",
+                            row.get("note") or "",
+                            row.get("created_at") or now,
+                        ),
+                    )
+                stats["excluded"] += 1
+            if gid:
+                self.clear_tombstone("excluded", gid)
+            if code:
+                self.clear_tombstone("excluded", code)
 
         for row in bundle.get("published") or []:
             if not isinstance(row, dict):
@@ -1326,37 +1846,45 @@ class ProductStore:
                 urls = row.get("image_urls") or []
                 if not isinstance(urls, list):
                     urls = []
-                if exists:
-                    continue
-                con.execute(
-                    """
-                    INSERT INTO published
-                    (goods_id, shop_id, search_code, sku_no, title, tags, category,
-                     cover_path, note, mall_id, created_at,
-                     google_name, name_en, colors, sizes, description,
-                     image_paths, image_urls)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)
-                    """,
-                    (
-                        gid,
-                        row.get("shop_id") or "",
-                        code,
-                        row.get("sku_no") or "",
-                        row.get("title") or "",
-                        row.get("tags") or "",
-                        row.get("category") or "",
-                        row.get("note") or "",
-                        mall,
-                        row.get("created_at") or now,
-                        row.get("google_name") or "",
-                        row.get("name_en") or "",
-                        row.get("colors") or "",
-                        row.get("sizes") or "",
-                        row.get("description") or "",
-                        json.dumps(urls, ensure_ascii=False),
-                    ),
-                )
-            stats["published"] += 1
+                if exists is None:
+                    remote_updated = row.get("updated_at") or row.get("created_at") or now
+                    con.execute(
+                        """
+                        INSERT INTO published
+                        (goods_id, shop_id, search_code, sku_no, title, tags, category,
+                         cover_path, note, mall_id, created_at, updated_at,
+                         google_name, name_en, colors, sizes, description,
+                         recommended, image_paths, image_urls)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)
+                        """,
+                        (
+                            gid,
+                            row.get("shop_id") or "",
+                            code,
+                            row.get("sku_no") or "",
+                            row.get("title") or "",
+                            row.get("tags") or "",
+                            row.get("category") or "",
+                            row.get("note") or "",
+                            mall,
+                            row.get("created_at") or now,
+                            remote_updated,
+                            row.get("google_name") or "",
+                            row.get("name_en") or "",
+                            row.get("colors") or "",
+                            row.get("sizes") or "",
+                            row.get("description") or "",
+                            int(bool(row.get("recommended"))),
+                            json.dumps(urls, ensure_ascii=False),
+                        ),
+                    )
+                    stats["published"] += 1
+            if mall:
+                self.clear_tombstone("published", mall)
+            if gid:
+                self.clear_tombstone("published", gid)
+            if code:
+                self.clear_tombstone("published", code)
 
         remote_rev = int(bundle.get("rev") or 0)
         local_rev = int(self.get_setting("sync_rev", "0") or "0")
@@ -1369,21 +1897,17 @@ class ProductStore:
         self.set_setting("sync_rev", str(rev))
         return rev
 
-    def _ensure_images_for_product(self, product_id: int, urls: list[str]) -> None:
-        """Download missing gallery images from synced URLs."""
-        p = self.get(product_id)
-        if not p:
-            return
-        existing = [x for x in (p.image_paths or []) if pathlib.Path(x).exists()]
-        if existing:
-            return
-        urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
-        if not urls:
-            return
-        folder = self.img_root / str(product_id)
+    @staticmethod
+    def _download_gallery(
+        urls: list[str], folder: pathlib.Path, max_images: int
+    ) -> list[str]:
+        """Shared gallery downloader for products and published items."""
+        clean = [u for u in urls if isinstance(u, str) and u.startswith("http")]
+        if not clean:
+            return []
         folder.mkdir(parents=True, exist_ok=True)
         saved: list[str] = []
-        for i, url in enumerate(urls[:20]):
+        for i, url in enumerate(clean[:max_images]):
             ext = ".jpg"
             low = url.lower().split("?")[0]
             for e in (".png", ".webp", ".jpeg", ".jpg"):
@@ -1404,16 +1928,116 @@ class ProductStore:
                 saved.append(str(dest))
             except Exception:
                 continue
+        return saved
+
+    def ensure_product_images(
+        self,
+        product_id: int,
+        *,
+        max_images: int = 20,
+        urls: list[str] | None = None,
+    ) -> list[str]:
+        """Download product gallery images on demand and return local paths.
+
+        Skips download and returns the existing paths if any already exist
+        on disk. Pass ``urls`` to override the product's stored ``image_urls``
+        (e.g. right after a sync merge, before the DB write is committed).
+        """
+        p = self.get(product_id)
+        if not p:
+            return []
+        existing = [x for x in (p.image_paths or []) if pathlib.Path(x).exists()]
+        if existing:
+            return existing
+        src_urls = urls if urls is not None else list(p.image_urls or [])
+        folder = self.img_root / str(product_id)
+        saved = self._download_gallery(src_urls, folder, max_images)
         if not saved:
-            return
-        cover = saved[0]
+            return []
         with self._connect() as con:
             con.execute(
                 "UPDATE products SET cover_path=?, image_paths=?, updated_at=? WHERE id=?",
                 (
-                    cover,
+                    saved[0],
                     json.dumps(saved, ensure_ascii=False),
                     dt.datetime.now().isoformat(timespec="seconds"),
                     product_id,
                 ),
             )
+        return saved
+
+    def ensure_published_images(
+        self, published_id: int, max_images: int = 20
+    ) -> list[str]:
+        """Download published-item gallery images on demand and return local paths."""
+        item = self.get_published(published_id)
+        if not item:
+            return []
+        existing = [x for x in (item.image_paths or []) if pathlib.Path(x).exists()]
+        if existing:
+            return existing
+        folder = self.published_img_root / f"p{published_id}"
+        saved = self._download_gallery(list(item.image_urls or []), folder, max_images)
+        if not saved:
+            return []
+        with self._connect() as con:
+            con.execute(
+                "UPDATE published SET cover_path=?, image_paths=? WHERE id=?",
+                (saved[0], json.dumps(saved, ensure_ascii=False), published_id),
+            )
+        return saved
+
+    def _ensure_images_for_product(self, product_id: int, urls: list[str]) -> None:
+        """Legacy wrapper kept for backward compatibility; see ``ensure_product_images``."""
+        self.ensure_product_images(product_id, urls=urls)
+
+    def prune_image_cache(
+        self, *, max_bytes: int = 8_000_000_000, keep_ids: set[int] | None = None
+    ) -> int:
+        """Delete oldest product image folders under img_root until under max_bytes.
+
+        Folders are ranked by their most-recent file mtime (oldest first) and
+        removed until the running total drops below ``max_bytes``. Folders
+        whose numeric product id is in ``keep_ids`` are never removed.
+        Returns the number of bytes freed.
+        """
+        keep = keep_ids or set()
+        if not self.img_root.exists():
+            return 0
+        entries: list[tuple[float, int, pathlib.Path, int | None]] = []
+        total = 0
+        for folder in self.img_root.iterdir():
+            if not folder.is_dir():
+                continue
+            try:
+                pid: int | None = int(folder.name)
+            except ValueError:
+                pid = None
+            size = 0
+            mtime = 0.0
+            for f in folder.rglob("*"):
+                if not f.is_file():
+                    continue
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                size += st.st_size
+                mtime = max(mtime, st.st_mtime)
+            total += size
+            entries.append((mtime, size, folder, pid))
+        if total <= max_bytes:
+            return 0
+        entries.sort(key=lambda e: e[0])
+        freed = 0
+        for mtime, size, folder, pid in entries:
+            if total - freed <= max_bytes:
+                break
+            if pid is not None and pid in keep:
+                continue
+            try:
+                shutil.rmtree(folder, ignore_errors=True)
+                freed += size
+            except OSError:
+                continue
+        return freed

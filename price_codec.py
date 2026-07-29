@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Decode supplier NO codes into cost / sell price.
 
-Rule (example):
+Rule (examples):
   NO 8888010
   → digits after 88880 → 10
   → cost = 10 * 10,000원 = 100,000원
@@ -10,6 +10,10 @@ Rule (example):
   NO 8888033.5
   → 33.5만원 = 335,000원 (소수점 = 천원 단위)
   → sell = 502,500원
+
+  NO 00008
+  → digits after the last 0 → 8
+  → cost = 8만원 = 80,000원
 """
 from __future__ import annotations
 
@@ -81,6 +85,16 @@ def normalize_sku(raw: str) -> str:
     return "".join(out)
 
 
+# Empty 가격코드 → homepage shows this Korean label instead of failing
+DEFAULT_PRICE_TEXT = "반수제품 가격문의"
+
+
+def effective_price_code(raw: str | None) -> str:
+    """Return price code, or DEFAULT_PRICE_TEXT when blank."""
+    s = (raw or "").strip()
+    return s if s else DEFAULT_PRICE_TEXT
+
+
 def is_text_price_label(raw: str) -> bool:
     """True when price code is a Korean display label (e.g. 반수제품 가격문의)."""
     s = (raw or "").strip()
@@ -98,7 +112,9 @@ def decode_price_code(raw: str, margin_rate: float = MARGIN_RATE) -> PriceInfo |
       8888033    → 33만원
       8888033.5  → 33.5만원 (335,000원)
       88880100   → 100만원
-    Prefers `88880` + manwon (optional .fraction). Falls back to last `0` + trailing digits.
+      00008      → 8만원  (leading zeros; digits after last 0)
+      000033.5   → 33.5만원
+    Prefers `88880` + manwon. Then `0…0` + manwon. Else last `0` + trailing digits.
     """
     code = normalize_sku(raw)
     if not code:
@@ -113,12 +129,20 @@ def decode_price_code(raw: str, margin_rate: float = MARGIN_RATE) -> PriceInfo |
         except ValueError:
             manwon = None
     else:
-        m2 = re.search(r"0(\d+(?:\.\d+)?)$", code)
-        if m2 and m2.start(0) > 0:
+        # 00008 → 8 / 000010 → 10  (zeros then amount after last 0)
+        m_pad = re.match(r"^0+(\d+(?:\.\d+)?)$", code)
+        if m_pad:
             try:
-                manwon = float(m2.group(1))
+                manwon = float(m_pad.group(1))
             except ValueError:
                 manwon = None
+        else:
+            m2 = re.search(r"0(\d+(?:\.\d+)?)$", code)
+            if m2 and m2.start(0) > 0:
+                try:
+                    manwon = float(m2.group(1))
+                except ValueError:
+                    manwon = None
 
     if manwon is None or manwon <= 0:
         return None
@@ -142,6 +166,9 @@ if __name__ == "__main__":
         "8888033",
         "8888033.5",
         "88880100",
+        "00008",
+        "000010",
+        "000033.5",
         "NO：8888033.5",
         "CHANEL size 14*21*6 NO：8888033.5",
     ):

@@ -17,6 +17,20 @@ from product_parse import ParsedProduct, parse_detail_product, parse_list_produc
 
 ProgressCb = Callable[[str], None]
 
+# 수집 속도 (서버 과부하·「服务器偷懒了」 완화)
+AFTER_COLLECT_SEC = 1.8  # 상세 저장 후 다음 상품까지
+AFTER_FAIL_SEC = 2.5  # 상세 실패·타임아웃 후
+PAGE_DOWN_SETTLE_SEC = 1.2  # PageDown 후 최소 대기(스피너 없을 때)
+PAGE_DOWN_KEY_SEC = 0.75
+REST_EVERY_N = 8  # N건 신규 수집마다
+REST_SEC = 7.0
+SERVER_BUSY_WAIT_SEC = 12.0
+# 하단 로딩(wgoo-loading-icon) 대기·회복
+LOADING_WAIT_SEC = 20.0  # 스피너가 사라질 때까지 최대 대기
+LOADING_POLL_SEC = 0.45
+LOADING_STUCK_RECOVER_SEC = 22.0  # 이보다 길면 스크롤 넛지·새로고침
+SESSION_MAX_NEW = 100  # UI 미지정 시 기본 상한 (manager에서 max_items로 덮음)
+
 
 class CdpSession:
     """Persistent CDP websocket for repeated Runtime.evaluate calls."""
@@ -102,6 +116,78 @@ PAGE_STATE_JS = r"""
     title: document.title || ''
   };
 })()
+"""
+
+SERVER_BUSY_JS = r"""
+(() => {
+  const t = document.body ? (document.body.innerText || '') : '';
+  return (
+    t.indexOf('服务器偷懒') >= 0 ||
+    t.indexOf('服务器开小差') >= 0 ||
+    t.indexOf('网络异常') >= 0 ||
+    t.indexOf('请求失败') >= 0 ||
+    t.indexOf('稍后再试') >= 0 ||
+    t.indexOf('加载失败') >= 0
+  );
+})()
+"""
+
+# 무한스크롤 하단 로딩 / 진짜 목록 끝
+LIST_LOAD_STATE_JS = r"""
+(() => {
+  const visible = (el) => {
+    if (!el) return false;
+    try {
+      const st = window.getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 2 && r.height > 2;
+    } catch (e) { return false; }
+  };
+  const icon = document.querySelector('.wgoo-loading-icon');
+  const footer = document.querySelector('.wgoo-footer');
+  const circles = document.querySelectorAll('.loading-icon-circle, [class*="loading-icon"]');
+  let loading = visible(icon);
+  if (!loading && footer && visible(footer)) {
+    loading = !!footer.querySelector('.wgoo-loading-icon, .loading-icon-circle');
+  }
+  if (!loading) {
+    for (const c of circles) {
+      if (visible(c)) { loading = true; break; }
+    }
+  }
+  const t = document.body ? (document.body.innerText || '') : '';
+  const endHint = (
+    t.indexOf('没有更多了') >= 0 ||
+    t.indexOf('没有更多') >= 0 ||
+    t.indexOf('暂无更多') >= 0 ||
+    t.indexOf('已經到底') >= 0 ||
+    t.indexOf('已经到底') >= 0
+  );
+  return { loading: !!loading, endHint: !!endHint };
+})()
+"""
+
+SCROLL_NUDGE_JS = r"""
+((upPx) => {
+  const candidates = [
+    document.querySelector('.content'),
+    document.querySelector('[class*="scroll"]'),
+    document.scrollingElement,
+    document.documentElement,
+    document.body
+  ].filter(Boolean);
+  let best = candidates[0];
+  let max = -1;
+  for (const el of candidates) {
+    const h = el.scrollHeight || 0;
+    if (h > max) { max = h; best = el; }
+  }
+  if (!best) return { ok: false };
+  const before = best.scrollTop || 0;
+  best.scrollTop = Math.max(0, before - Math.abs(upPx || 240));
+  return { ok: true, before, after: best.scrollTop || 0 };
+})(%s)
 """
 
 LIST_IDS_JS = r"""
@@ -223,7 +309,7 @@ GO_BACK_JS = r"""
 })()
 """
 
-# 한 화면만 내려감 — 맨 끝까지 끝없이 밀지 않음
+# PageDown 한 번 분량 스크롤 (키 이벤트 실패 시 폴백)
 SCROLL_PAGE_JS = r"""
 (() => {
   const candidates = [
@@ -240,11 +326,42 @@ SCROLL_PAGE_JS = r"""
     if (h > max) { max = h; best = el; }
   }
   if (!best) return { moved: false, before: 0, after: 0 };
+  try { best.focus({ preventScroll: true }); } catch (e) {}
   const before = best.scrollTop || 0;
-  const step = Math.max(Math.floor((best.clientHeight || 640) * 0.9), 500);
+  const step = Math.max(Math.floor((best.clientHeight || 640) * 0.92), 480);
   best.scrollTop = before + step;
   const after = best.scrollTop || 0;
-  return { moved: after > before + 10, before, after, step };
+  return {
+    moved: after > before + 8,
+    before,
+    after,
+    step,
+    atEnd: after + (best.clientHeight || 0) >= (best.scrollHeight || 0) - 4,
+  };
+})()
+"""
+
+FOCUS_LIST_JS = r"""
+(() => {
+  const candidates = [
+    document.querySelector('.content'),
+    document.querySelector('[class*="scroll"]'),
+    document.scrollingElement,
+    document.documentElement,
+    document.body
+  ].filter(Boolean);
+  let best = candidates[0];
+  let max = -1;
+  for (const el of candidates) {
+    const h = el.scrollHeight || 0;
+    if (h > max) { max = h; best = el; }
+  }
+  if (!best) return false;
+  try {
+    if (best.tabIndex < 0) best.tabIndex = -1;
+    best.focus({ preventScroll: true });
+  } catch (e) {}
+  return true;
 })()
 """
 
@@ -287,6 +404,341 @@ def _log(cb: ProgressCb | None, msg: str) -> None:
 
 def _cancelled(cancel: threading.Event | None) -> bool:
     return bool(cancel and cancel.is_set())
+
+
+def _wait_pause(
+    pause: threading.Event | None,
+    cancel: threading.Event | None,
+    on_progress: ProgressCb | None = None,
+) -> bool:
+    """Block while paused. Returns False if cancelled during pause."""
+    if not pause or not pause.is_set():
+        return True
+    _log(on_progress, "일시정지 — [수집 계속] 또는 [중지]를 누르세요")
+    while pause.is_set():
+        if _cancelled(cancel):
+            return False
+        time.sleep(0.25)
+    _log(on_progress, "수집 재개")
+    return not _cancelled(cancel)
+
+
+def _sleep_interruptible(
+    seconds: float,
+    *,
+    cancel: threading.Event | None = None,
+    pause: threading.Event | None = None,
+    on_progress: ProgressCb | None = None,
+) -> bool:
+    """Sleep in small slices; respect pause/cancel. False if cancelled."""
+    end = time.time() + max(0.0, seconds)
+    while time.time() < end:
+        if not _wait_pause(pause, cancel, on_progress):
+            return False
+        if _cancelled(cancel):
+            return False
+        time.sleep(min(0.25, end - time.time()))
+    return True
+
+
+def _server_busy(session: CdpSession) -> bool:
+    try:
+        return bool(session.evaluate(SERVER_BUSY_JS))
+    except Exception:
+        return False
+
+
+def _recover_server_busy(
+    session: CdpSession,
+    *,
+    cancel: threading.Event | None = None,
+    pause: threading.Event | None = None,
+    on_progress: ProgressCb | None = None,
+) -> bool:
+    """
+    Wait out Weigou overload screens. Returns False if cancelled.
+    Reloads once if the error persists.
+    """
+    if not _server_busy(session):
+        return True
+    _log(
+        on_progress,
+        f"서버 응답 실패/과부하 감지 — {SERVER_BUSY_WAIT_SEC:.0f}초 대기 후 재시도",
+    )
+    if not _sleep_interruptible(
+        SERVER_BUSY_WAIT_SEC, cancel=cancel, pause=pause, on_progress=on_progress
+    ):
+        return False
+    if not _server_busy(session):
+        _log(on_progress, "서버 복구됨 — 수집 계속")
+        return True
+    _log(on_progress, "여전히 오류 — 페이지 새로고침 후 목록 대기")
+    try:
+        session.evaluate("location.reload()")
+    except Exception:
+        pass
+    if not _sleep_interruptible(4.0, cancel=cancel, pause=pause, on_progress=on_progress):
+        return False
+    _wait(
+        session,
+        "(() => document.querySelectorAll('[data-search-bury-info]').length > 2)()",
+        timeout=20.0,
+        cancel=cancel,
+    )
+    if _server_busy(session):
+        _log(on_progress, "서버 오류 지속 — 수집을 일시적으로 더 느리게 진행")
+        return _sleep_interruptible(
+            SERVER_BUSY_WAIT_SEC, cancel=cancel, pause=pause, on_progress=on_progress
+        )
+    _log(on_progress, "새로고침 후 목록 복구 — 수집 계속")
+    return True
+
+
+def _list_load_state(session: CdpSession) -> dict:
+    try:
+        st = session.evaluate(LIST_LOAD_STATE_JS) or {}
+        if isinstance(st, dict):
+            return {
+                "loading": bool(st.get("loading")),
+                "endHint": bool(st.get("endHint")),
+            }
+    except Exception:
+        pass
+    return {"loading": False, "endHint": False}
+
+
+def _nudge_scroll_up(session: CdpSession, px: int = 280) -> None:
+    try:
+        session.evaluate(SCROLL_NUDGE_JS % int(px))
+    except Exception:
+        pass
+
+
+def _recover_list_loading(
+    session: CdpSession,
+    *,
+    cancel: threading.Event | None = None,
+    pause: threading.Event | None = None,
+    on_progress: ProgressCb | None = None,
+) -> bool:
+    """
+    Footer spinner stuck too long: nudge scroll, then reload once.
+    Returns False if cancelled.
+    """
+    _log(on_progress, "목록 로딩이 오래 걸림 — 스크롤 재시도")
+    _nudge_scroll_up(session, 320)
+    if not _sleep_interruptible(0.8, cancel=cancel, pause=pause, on_progress=on_progress):
+        return False
+    _page_down(session)
+    if not _sleep_interruptible(2.0, cancel=cancel, pause=pause, on_progress=on_progress):
+        return False
+    st = _list_load_state(session)
+    if not st.get("loading"):
+        _log(on_progress, "로딩 회복 — 수집 계속")
+        return True
+    _log(on_progress, "로딩 지속 — 목록 새로고침 후 대기")
+    try:
+        session.evaluate("location.reload()")
+    except Exception:
+        pass
+    if not _sleep_interruptible(4.0, cancel=cancel, pause=pause, on_progress=on_progress):
+        return False
+    _wait(
+        session,
+        "(() => document.querySelectorAll('[data-search-bury-info]').length > 2)()",
+        timeout=22.0,
+        cancel=cancel,
+    )
+    # 새로고침 후 이전 위치로 다시 내려가도록 PageDown 몇 회 (ID 스킵으로 안전)
+    for _ in range(3):
+        if _cancelled(cancel):
+            return False
+        if not _wait_pause(pause, cancel, on_progress):
+            return False
+        _page_down(session)
+        if not _sleep_interruptible(1.2, cancel=cancel, pause=pause, on_progress=on_progress):
+            return False
+        if not _list_load_state(session).get("loading"):
+            break
+    _log(on_progress, "새로고침 후 목록 복구 — 수집 계속")
+    return True
+
+
+def _wait_list_settle(
+    session: CdpSession,
+    *,
+    seen_gids: set[str],
+    cancel: threading.Event | None = None,
+    pause: threading.Event | None = None,
+    on_progress: ProgressCb | None = None,
+) -> dict:
+    """
+    After PageDown: wait out footer loading spinner; do not treat as feed end.
+    Returns keys: loading_seen, end_hint, timed_out, recovered.
+    """
+    start = time.time()
+    loading_seen = False
+    loading_since: float | None = None
+    recovered = False
+
+    # 최소 settle
+    if not _sleep_interruptible(
+        PAGE_DOWN_SETTLE_SEC, cancel=cancel, pause=pause, on_progress=on_progress
+    ):
+        return {
+            "loading_seen": False,
+            "end_hint": False,
+            "timed_out": False,
+            "recovered": False,
+            "cancelled": True,
+        }
+
+    while True:
+        if not _wait_pause(pause, cancel, on_progress):
+            return {
+                "loading_seen": loading_seen,
+                "end_hint": False,
+                "timed_out": False,
+                "recovered": recovered,
+                "cancelled": True,
+            }
+        if _cancelled(cancel):
+            return {
+                "loading_seen": loading_seen,
+                "end_hint": False,
+                "timed_out": False,
+                "recovered": recovered,
+                "cancelled": True,
+            }
+
+        st = _list_load_state(session)
+        if st.get("endHint") and not st.get("loading"):
+            return {
+                "loading_seen": loading_seen,
+                "end_hint": True,
+                "timed_out": False,
+                "recovered": recovered,
+                "cancelled": False,
+            }
+
+        loading = bool(st.get("loading"))
+        if loading:
+            loading_seen = True
+            if loading_since is None:
+                loading_since = time.time()
+                _log(on_progress, "목록 추가 로딩 중 — 스피너 사라질 때까지 대기")
+            stuck_for = time.time() - loading_since
+            if stuck_for >= LOADING_STUCK_RECOVER_SEC:
+                if not _recover_list_loading(
+                    session, cancel=cancel, pause=pause, on_progress=on_progress
+                ):
+                    return {
+                        "loading_seen": True,
+                        "end_hint": False,
+                        "timed_out": True,
+                        "recovered": False,
+                        "cancelled": True,
+                    }
+                recovered = True
+                loading_since = time.time()
+            if not _sleep_interruptible(
+                LOADING_POLL_SEC, cancel=cancel, pause=pause, on_progress=on_progress
+            ):
+                return {
+                    "loading_seen": True,
+                    "end_hint": False,
+                    "timed_out": False,
+                    "recovered": recovered,
+                    "cancelled": True,
+                }
+            continue
+
+        # 스피너 없음
+        if loading_seen:
+            return {
+                "loading_seen": True,
+                "end_hint": bool(st.get("endHint")),
+                "timed_out": False,
+                "recovered": recovered,
+                "cancelled": False,
+            }
+
+        # 스피너가 안 보였어도 새 ID가 곧 들어올 수 있음 → 짧게만 추가 대기
+        # (이미수집 패스 위주일 때 PageDown마다 길게 멈추지 않게)
+        elapsed = time.time() - start
+        visible = _list_items_now(session)
+        new_n = sum(1 for it in visible if str(it.get("goods_id") or "") not in seen_gids)
+        if new_n > 0 or elapsed >= PAGE_DOWN_SETTLE_SEC + 1.8:
+            return {
+                "loading_seen": False,
+                "end_hint": bool(st.get("endHint")),
+                "timed_out": False,
+                "recovered": recovered,
+                "cancelled": False,
+            }
+        if not _sleep_interruptible(
+            LOADING_POLL_SEC, cancel=cancel, pause=pause, on_progress=on_progress
+        ):
+            return {
+                "loading_seen": False,
+                "end_hint": False,
+                "timed_out": False,
+                "recovered": recovered,
+                "cancelled": True,
+            }
+
+
+def _page_down(session: CdpSession) -> dict:
+    """Prefer real PageDown key (lazy-load friendly), fallback to scrollTop."""
+    try:
+        session.evaluate(FOCUS_LIST_JS)
+    except Exception:
+        pass
+    before = -1
+    try:
+        before = int(
+            session.evaluate(
+                """(() => {
+                  const el = document.scrollingElement || document.documentElement || document.body;
+                  return el ? (el.scrollTop || 0) : 0;
+                })()"""
+            )
+            or 0
+        )
+    except Exception:
+        before = -1
+    try:
+        for typ in ("keyDown", "keyUp"):
+            session.call(
+                "Input.dispatchKeyEvent",
+                {
+                    "type": typ,
+                    "windowsVirtualKeyCode": 34,
+                    "nativeVirtualKeyCode": 34,
+                    "code": "PageDown",
+                    "key": "PageDown",
+                },
+            )
+        time.sleep(PAGE_DOWN_KEY_SEC)
+        after = int(
+            session.evaluate(
+                """(() => {
+                  const el = document.scrollingElement || document.documentElement || document.body;
+                  return el ? (el.scrollTop || 0) : 0;
+                })()"""
+            )
+            or 0
+        )
+        if after > before + 8:
+            return {"moved": True, "via": "PageDown", "before": before, "after": after}
+    except Exception:
+        pass
+    try:
+        scroll = session.evaluate(SCROLL_PAGE_JS) or {}
+        scroll["via"] = "scroll"
+        return scroll
+    except Exception:
+        return {"moved": False, "via": "none"}
 
 
 def _wait(
@@ -461,79 +913,11 @@ def _open_collect_one(
 
 
 def _item_index(item: dict) -> int:
+    """Display-only list index (unstable when feed changes)."""
     try:
         return int(item.get("index", -1))
     except (TypeError, ValueError):
         return -1
-
-
-def _scroll_after_index(
-    session: CdpSession,
-    after_index: int,
-    *,
-    on_progress: ProgressCb | None,
-    cancel: threading.Event | None,
-    max_scrolls: int = 80,
-) -> int:
-    """
-    Page-down until a card with data-index > after_index is visible.
-    Returns the highest visible index after seeking (or -1).
-    """
-    if after_index < 0:
-        return -1
-
-    _log(
-        on_progress,
-        f"이어서 수집: 마지막 인덱스 #{after_index} 다음부터 보이도록 스크롤…",
-    )
-    try:
-        session.evaluate(SCROLL_TOP_JS)
-        time.sleep(0.35)
-    except Exception:
-        pass
-
-    best_seen = -1
-    stagnant = 0
-    for i in range(max_scrolls):
-        if _cancelled(cancel):
-            break
-        visible = _list_items_now(session)
-        idxs = [_item_index(it) for it in visible if _item_index(it) >= 0]
-        max_i = max(idxs) if idxs else -1
-        min_i = min(idxs) if idxs else -1
-        if max_i > best_seen:
-            best_seen = max_i
-            stagnant = 0
-        else:
-            stagnant += 1
-
-        # Target reached: next index is on screen
-        if any(idx > after_index for idx in idxs):
-            _log(
-                on_progress,
-                f"스크롤 완료 — 화면 인덱스 {min_i}~{max_i} (목표 > #{after_index})",
-            )
-            return max_i
-
-        try:
-            scroll = session.evaluate(SCROLL_PAGE_JS) or {}
-        except Exception:
-            scroll = {"moved": False}
-        time.sleep(0.4)
-        moved = bool(scroll.get("moved"))
-        if not moved:
-            _log(
-                on_progress,
-                f"스크롤 끝 — 최대 인덱스 #{best_seen} (목표 > #{after_index})",
-            )
-            break
-        if stagnant >= 5:
-            _log(on_progress, "인덱스가 더 이상 안 올라감 — 현재 위치에서 계속")
-            break
-        if (i + 1) % 10 == 0:
-            _log(on_progress, f"  …스크롤 중 (현재 최대 #{max_i})")
-
-    return best_seen
 
 
 def walk_list_details(
@@ -541,30 +925,47 @@ def walk_list_details(
     on_progress: ProgressCb | None = None,
     on_product: Callable[[ParsedProduct], None] | None = None,
     cancel: threading.Event | None = None,
+    pause: threading.Event | None = None,
     excluded_goods_ids: set[str] | None = None,
     excluded_search_codes: set[str] | None = None,
     known_goods_ids: set[str] | None = None,
-    max_items: int = 40,
-    scroll_rounds: int = 30,
-    open_wait: float = 10.0,
-    detail_settle: float = 1.1,
-    back_wait: float = 8.0,
-    between_items: float = 0.3,
+    max_items: int = 0,
+    open_wait: float = 12.0,
+    detail_settle: float = 1.4,
+    back_wait: float = 10.0,
+    between_items: float = AFTER_COLLECT_SEC,  # 신규 수집 직후 대기(이미수집 패스에는 미적용)
+    refresh_skips: Callable[[], tuple[set[str], set[str], set[str]]] | None = None,
+    # Legacy kwargs ignored (index cursor removed — goods_id is the identity)
+    scroll_rounds: int = 0,
     resume_after_index: int | None = None,
     get_cursor: Callable[[str], int] | None = None,
     on_cursor: Callable[[str, int], None] | None = None,
 ) -> tuple[list[ParsedProduct], str]:
     """
-    Viewport walk (not scroll-to-absolute-end):
-      resume after last data-index → visible cards → collect only new → page-down
-    Stop when several pages yield no new goods_id, or 1-run new limit reached.
-    Already collected / excluded goods_id are never clicked.
+    Infinite list collect keyed by goods_id (not data-index):
+
+      scroll to top → for each visible card:
+        skip if already collected / excluded / published (by goods_id·搜索码)
+        else open detail & save
+      PageDown → repeat until feed end or user pause/stop
+
+    data-index is only logged — new uploads / search reorder do not break skips.
+    max_items > 0 → 해당 신규 건수만 수집 후 종료
+    max_items <= 0 → 무제한 (목록 끝까지)
     """
+    del scroll_rounds, resume_after_index, get_cursor, on_cursor  # unused legacy
+
     skip_excluded = set(excluded_goods_ids or set())
     skip_codes = set(excluded_search_codes or set())
     skip_known = set(known_goods_ids or set())
-    max_new = max_items if max_items and max_items > 0 else 40
-    max_pages = max(6, scroll_rounds)
+    if max_items and max_items > 0:
+        unlimited = False
+        max_new = int(max_items)
+        session_cap = True
+    else:
+        unlimited = True
+        max_new = 10**9
+        session_cap = False
 
     session, msg = open_album_session()
     if not session:
@@ -573,34 +974,42 @@ def walk_list_details(
     products: list[ParsedProduct] = []
     skipped_excluded = 0
     skipped_known = 0
-    seen_gids: set[str] = set()
-    empty_pages = 0
-    cursor = -1
-    shop_id = ""
+    # goods_ids already handled this run (collect or skip) — avoid re-click
+    handled_gids: set[str] = set()
+    # all goods_ids ever seen on screen this run (detect end of feed)
+    ever_seen_gids: set[str] = set()
+    stagnant_pages = 0
+    page = 0
 
-    def bump_cursor(item: dict) -> None:
-        nonlocal cursor, shop_id
-        idx = _item_index(item)
-        sid = str(item.get("shop_id") or shop_id or "")
-        if sid and not shop_id:
-            shop_id = sid
-        if idx < 0:
+    def reload_skips() -> None:
+        nonlocal skip_excluded, skip_codes, skip_known
+        if not refresh_skips:
             return
-        if idx > cursor:
-            cursor = idx
-            if on_cursor and shop_id:
-                try:
-                    on_cursor(shop_id, cursor)
-                except Exception:
-                    pass
+        try:
+            ex_g, ex_c, known = refresh_skips()
+            skip_excluded = set(ex_g or set())
+            skip_codes = set(ex_c or set())
+            skip_known = set(known or set()) | {p.goods_id for p in products if p.goods_id}
+        except Exception:
+            pass
 
     try:
         _log(on_progress, msg)
         _log(
             on_progress,
-            f"방식: data-index 순서(0→1→2…) · 커서 이어서 · 1회 신규 최대 {max_new}개 · "
-            f"이미수집/제외는 클릭 안 함",
+            "방식: 상품ID(goods_id)·搜索码 기준 스킵 · PageDown 무한 수집 · "
+            "인덱스 번호는 사용 안 함 (새 상품/검색어에도 안전)",
         )
+        _log(
+            on_progress,
+            f"속도: 수집 후 {between_items:.1f}초 · PageDown 후 로딩대기(최대 {LOADING_WAIT_SEC:.0f}초) · "
+            f"{REST_EVERY_N}건마다 {REST_SEC:.0f}초 휴식 · 서버오류/스피너 자동 회복",
+        )
+        if session_cap:
+            _log(
+                on_progress,
+                f"세션 한도: 신규 {max_new}건 — 도달 후 종료, 다시 실행하면 이미 수집·제외는 패스하고 이어감",
+            )
         state = session.evaluate(PAGE_STATE_JS) or {}
         if state.get("detail") and (state.get("hasSearch") or state.get("listCount", 0) <= 1):
             _log(on_progress, "현재가 상세 화면입니다. 상세 1건만 수집합니다.")
@@ -622,38 +1031,36 @@ def walk_list_details(
                 return [detail], "상세 화면 1건 수집 완료"
             return [], "상세 화면에서 상품을 파싱하지 못했습니다."
 
-        # Peek shop_id → load saved cursor → scroll past it
-        peek = _list_items_now(session)
-        if peek:
-            shop_id = str(peek[0].get("shop_id") or "")
-        if resume_after_index is not None:
-            cursor = int(resume_after_index)
-        elif get_cursor and shop_id:
-            try:
-                cursor = int(get_cursor(shop_id))
-            except Exception:
-                cursor = -1
-        if cursor >= 0:
-            _scroll_after_index(
-                session,
-                cursor,
-                on_progress=on_progress,
-                cancel=cancel,
-            )
-        else:
-            _log(on_progress, "첫 수집 — 인덱스 #0부터")
+        # Always start from top so newly uploaded items (shifted indices) are found
+        try:
+            session.evaluate(SCROLL_TOP_JS)
+            time.sleep(0.45)
+        except Exception:
+            pass
+        _log(on_progress, "목록 맨 위부터 · 이미 있는 상품은 클릭 없이 패스 · PageDown 계속")
 
-        page = 0
-        while page < max_pages:
+        while True:
+            if not _wait_pause(pause, cancel, on_progress):
+                _log(on_progress, "사용자 중지로 중단됨")
+                break
             if _cancelled(cancel):
                 _log(on_progress, "사용자 중지로 중단됨")
                 break
             if len(products) >= max_new:
-                _log(
-                    on_progress,
-                    f"1회 신규 한도 {max_new}개 도달 — 종료 "
-                    f"(다음엔 #{cursor + 1}부터 이어서)",
-                )
+                if session_cap:
+                    _log(
+                        on_progress,
+                        f"세션 한도 {max_new}건 도달 — 이번 회차 종료 "
+                        f"(다시 실행하면 이어서 수집)",
+                    )
+                else:
+                    _log(on_progress, f"신규 한도 {max_new}개 도달 — 종료")
+                break
+
+            if not _recover_server_busy(
+                session, cancel=cancel, pause=pause, on_progress=on_progress
+            ):
+                _log(on_progress, "사용자 중지로 중단됨")
                 break
 
             visible = _list_items_now(session)
@@ -663,45 +1070,42 @@ def walk_list_details(
                     "친구 앨범 목록을 연 뒤 다시 시도하세요."
                 )
 
-            if not shop_id and visible:
-                shop_id = str(visible[0].get("shop_id") or "")
+            new_on_screen = 0
+            collected_this_page = 0
+            for item in visible:
+                if not _wait_pause(pause, cancel, on_progress):
+                    break
+                if _cancelled(cancel):
+                    break
 
-            # Only handle cards after remembered cursor
-            queue = [
-                it
-                for it in visible
-                if _item_index(it) < 0 or _item_index(it) > cursor
-            ]
-            # If all visible are <= cursor, just scroll further
-            new_ids = 0
-            for item in queue:
                 gid = str(item.get("goods_id") or "")
-                if not gid or gid in seen_gids:
+                if not gid:
                     continue
-                seen_gids.add(gid)
-                new_ids += 1
+                if gid not in ever_seen_gids:
+                    ever_seen_gids.add(gid)
+                    new_on_screen += 1
+                if gid in handled_gids:
+                    continue
+                handled_gids.add(gid)
+
                 title = str(item.get("title") or "")
                 label = title[:40] or gid[:24]
                 idx = _item_index(item)
+                idx_tag = f"[화면#{idx}]" if idx >= 0 else ""
 
                 if gid in skip_excluded:
                     skipped_excluded += 1
-                    _log(on_progress, f"제외 패스[#{idx}]: {label}")
-                    bump_cursor(item)
+                    _log(on_progress, f"제외 패스{idx_tag}: {label}")
                     continue
                 if gid in skip_known:
                     skipped_known += 1
-                    if skipped_known <= 5 or skipped_known % 25 == 0:
-                        _log(on_progress, f"이미수집 패스[#{idx}]: {label}")
-                    bump_cursor(item)
+                    if skipped_known <= 8 or skipped_known % 30 == 0:
+                        _log(on_progress, f"이미수집 패스{idx_tag}: {label}")
                     continue
-                if len(products) >= max_new:
-                    break
 
-                _log(
-                    on_progress,
-                    f"신규 열기 ({len(products) + 1}/{max_new})[#{idx}]: {label}",
-                )
+                n_show = len(products) + 1
+                limit_txt = "∞" if unlimited else str(max_new)
+                _log(on_progress, f"신규 열기 ({n_show}/{limit_txt}){idx_tag}: {label}")
                 detail = _open_collect_one(
                     session,
                     item,
@@ -712,55 +1116,115 @@ def walk_list_details(
                     back_wait=back_wait,
                 )
                 if detail:
+                    code = (detail.search_code or "").strip()
                     if (detail.goods_id and detail.goods_id in skip_excluded) or (
-                        detail.search_code and detail.search_code in skip_codes
+                        code and code in skip_codes
                     ):
                         skipped_excluded += 1
-                        _log(on_progress, "  제외 목록 — 저장 생략")
+                        _log(on_progress, "  제외/등록됨 — 저장 생략")
                     else:
                         products.append(detail)
-                        skip_known.add(detail.goods_id)
+                        collected_this_page += 1
+                        if detail.goods_id:
+                            skip_known.add(detail.goods_id)
+                        if code:
+                            skip_codes.add(code)
                         if on_product:
                             try:
                                 on_product(detail)
                             except Exception as e:
                                 _log(on_progress, f"  저장 실패: {e}")
-                bump_cursor(item)
-                time.sleep(between_items)
-                if _cancelled(cancel):
+                        # Pick up skips from sync / other actions
+                        if len(products) % 12 == 0:
+                            reload_skips()
+                        if not _sleep_interruptible(
+                            between_items,
+                            cancel=cancel,
+                            pause=pause,
+                            on_progress=on_progress,
+                        ):
+                            break
+                        if len(products) % REST_EVERY_N == 0:
+                            _log(
+                                on_progress,
+                                f"서버 부하 완화 — {REST_EVERY_N}건마다 {REST_SEC:.0f}초 휴식 "
+                                f"(누적 신규 {len(products)})",
+                            )
+                            if not _sleep_interruptible(
+                                REST_SEC,
+                                cancel=cancel,
+                                pause=pause,
+                                on_progress=on_progress,
+                            ):
+                                break
+                else:
+                    if not _recover_server_busy(
+                        session, cancel=cancel, pause=pause, on_progress=on_progress
+                    ):
+                        break
+                    if not _sleep_interruptible(
+                        AFTER_FAIL_SEC,
+                        cancel=cancel,
+                        pause=pause,
+                        on_progress=on_progress,
+                    ):
+                        break
+                if len(products) >= max_new:
                     break
 
-            try:
-                scroll = session.evaluate(SCROLL_PAGE_JS) or {}
-            except Exception:
-                scroll = {"moved": False}
-            time.sleep(0.45)
+            if _cancelled(cancel):
+                break
+
+            scroll = _page_down(session)
+            settle = _wait_list_settle(
+                session,
+                seen_gids=ever_seen_gids,
+                cancel=cancel,
+                pause=pause,
+                on_progress=on_progress,
+            )
+            if settle.get("cancelled"):
+                break
             page += 1
             moved = bool(scroll.get("moved"))
-            if new_ids == 0 and not queue:
-                # visible all behind cursor — count as empty progress toward more scroll
-                empty_pages += 1
-            elif new_ids == 0:
-                empty_pages += 1
+            at_end = bool(scroll.get("atEnd"))
+            loading_seen = bool(settle.get("loading_seen"))
+            end_hint = bool(settle.get("end_hint"))
+
+            # 로딩 중이었거나 회복했으면 '정체'로 세지 않음 (오판 종료 방지)
+            if loading_seen or settle.get("recovered"):
+                stagnant_pages = 0
+            elif new_on_screen == 0 and collected_this_page == 0:
+                stagnant_pages += 1
             else:
-                empty_pages = 0
+                stagnant_pages = 0
 
             _log(
                 on_progress,
-                f"화면 {page}: 처리 {new_ids} · 커서 #{cursor} · 스크롤={moved} · 연속빈 {empty_pages}/3",
+                f"PageDown #{page}: 화면신규ID {new_on_screen} · 수집 {collected_this_page} · "
+                f"이동={moved}({scroll.get('via')}) · 로딩={'Y' if loading_seen else 'N'} · "
+                f"정체 {stagnant_pages}/10 · 누적신규 {len(products)} · "
+                f"확인ID {len(ever_seen_gids)}",
             )
-            if empty_pages >= 3:
-                _log(on_progress, "새 상품이 더 안 보여 종료 (끝없이 스크롤하지 않음)")
+
+            if end_hint and new_on_screen == 0 and collected_this_page == 0:
+                _log(on_progress, "목록 끝 문구 감지 — 종료")
                 break
-            if not moved and new_ids == 0:
-                _log(on_progress, "스크롤 끝 — 종료")
+
+            # End of feed: no new IDs for several downs and scroll stuck / at end
+            # (스피너/로딩 직후에는 위에서 stagnant를 리셋함)
+            if stagnant_pages >= 10 and (not moved or at_end):
+                _log(on_progress, "목록 끝 — 더 이상 새 상품 ID가 없어 종료")
+                break
+            if stagnant_pages >= 14:
+                _log(on_progress, "새 상품이 계속 안 보임 — 종료")
                 break
 
         return (
             products,
             f"자동 수집 완료: 신규 {len(products)}건"
             f" (이미수집 패스 {skipped_known}, 제외 패스 {skipped_excluded},"
-            f" 확인 id {len(seen_gids)}개, 커서 #{cursor})",
+            f" 확인 상품ID {len(ever_seen_gids)}개, PageDown {page}회)",
         )
     finally:
         session.close()

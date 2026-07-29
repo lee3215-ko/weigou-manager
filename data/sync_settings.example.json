@@ -1,10 +1,8 @@
 {
   "enabled": true,
-  "github_owner": "lee3215-ko",
-  "github_repo": "weigou-manager",
-  "github_token": "ghp_여기에_토큰",
-  "branch": "main",
-  "path": "shared/catalog-sync.json",
-  "interval_sec": 12,
-  "device_name": "사무실PC"
+  "backend": "supabase",
+  "interval_sec": 2,
+  "device_name": "사무실PC",
+  "role": "full",
+  "prefer_table_sync": true
 }

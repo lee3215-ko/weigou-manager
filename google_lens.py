@@ -5,12 +5,67 @@ from __future__ import annotations
 import queue
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
 
 from multi_ai_parse import parse_multi_image_answers
 from product_name import build_product_name, extract_ai_labeled_fields, normalize_ai_color
+
+
+class AiGenerationFailed(Exception):
+    """Google AI Mode returned the 'cannot generate answer' error UI."""
+
+    def __init__(self, message: str = "") -> None:
+        self.message = (
+            (message or "").strip()
+            or "문제가 발생하여 AI 대답을 생성할 수 없습니다."
+        )
+        super().__init__(self.message)
+
+
+_AI_FAIL_RE = re.compile(
+    r"문제가\s*발생하여\s*AI\s*대답을\s*생성할\s*수\s*없습니다"
+    r"|AI\s*대답을\s*생성할\s*수\s*없습니다"
+    r"|Unable to generate (an )?AI (response|answer)"
+    r"|Something went wrong.*(AI|response|answer)"
+    r"|Couldn'?t generate.*(response|answer)",
+    re.I,
+)
+
+
+def _is_ai_fail_text(text: str) -> bool:
+    return bool(_AI_FAIL_RE.search(text or ""))
+
+
+def _ai_generation_failed(page) -> str:
+    """Return fail message if Google AI showed the generation-error block."""
+    try:
+        found = page.evaluate(
+            """() => {
+              const nodes = document.querySelectorAll(
+                '.Y3BBE, [data-complete="true"], [data-sfc-root], div[role="status"], body'
+              );
+              for (const el of nodes) {
+                const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!t) continue;
+                if (/문제가\\s*발생하여\\s*AI\\s*대답을\\s*생성할\\s*수\\s*없습니다/.test(t)
+                    || /AI\\s*대답을\\s*생성할\\s*수\\s*없습니다/.test(t)) {
+                  const m = t.match(/문제가\\s*발생하여\\s*AI\\s*대답을\\s*생성할\\s*수\\s*없습니다[^\\n]*/);
+                  return (m && m[0]) || '문제가 발생하여 AI 대답을 생성할 수 없습니다.';
+                }
+              }
+              const body = (document.body && document.body.innerText) || '';
+              if (/문제가\\s*발생하여\\s*AI\\s*대답을\\s*생성할\\s*수\\s*없습니다/.test(body)) {
+                return '문제가 발생하여 AI 대답을 생성할 수 없습니다.';
+              }
+              return '';
+            }"""
+        )
+        return str(found or "").strip()
+    except Exception:
+        return ""
 
 
 @dataclass
@@ -125,7 +180,7 @@ def _build_multi_ai_prompt(*, size: str = "", count: int = 0) -> str:
 
 
 def _copy_image_to_clipboard(path: Path) -> bool:
-    """Put image on Windows clipboard for Ctrl+V paste (faster than file upload)."""
+    """Put one image on Windows clipboard (bitmap) for Ctrl+V."""
     path = Path(path)
     if not path.exists():
         return False
@@ -188,38 +243,119 @@ def _copy_image_to_clipboard(path: Path) -> bool:
         return False
 
 
+def _copy_files_to_clipboard(paths: list[Path]) -> bool:
+    """Copy image FILES as a file-drop list (CF_HDROP) — Ctrl+V attaches all at once."""
+    files = [Path(p) for p in paths if Path(p).exists()]
+    if not files:
+        return False
+    if len(files) == 1:
+        return _copy_image_to_clipboard(files[0])
+    try:
+        import subprocess
+
+        # PowerShell StringCollection → Clipboard.SetFileDropList
+        ps_files = ", ".join(
+            "'" + str(p.resolve()).replace("'", "''") + "'" for p in files
+        )
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$sc = New-Object System.Collections.Specialized.StringCollection; "
+            f"@({ps_files}) | ForEach-Object {{ [void]$sc.Add($_) }}; "
+            "[System.Windows.Forms.Clipboard]::SetFileDropList($sc)"
+        )
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", ps],
+            capture_output=True,
+            timeout=30,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _focus_composer(page) -> bool:
-    """Focus the AI Mode text input — avoid clicking image chips (that replaces them)."""
-    for sel in (
-        'textarea[aria-label]',
-        'textarea[name="q"]',
-        'div[role="textbox"]',
-        '[contenteditable="true"]',
-        'textarea',
-        'input[name="q"]',
-        'div.jUiaTd[role="presentation"]',
-    ):
-        try:
-            loc = page.locator(sel)
-            if loc.count() == 0:
-                continue
-            el = loc.last
-            try:
-                box = el.bounding_box(timeout=1200)
-            except Exception:
-                box = None
-            if box and box.get("width", 0) > 8 and box.get("height", 0) > 8:
-                # Click lower-center of the field (chips sit above the caret)
-                page.mouse.click(
-                    box["x"] + box["width"] * 0.55,
-                    box["y"] + box["height"] * 0.75,
-                )
-            else:
-                el.click(timeout=1500)
+    """JS focus only — never mouse-click (+ 버튼/썸네일 클릭 방지)."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                  const cands = [
+                    ...document.querySelectorAll('textarea[aria-label], textarea[name="q"], textarea'),
+                    ...document.querySelectorAll('[role="textbox"], [contenteditable="true"]'),
+                  ];
+                  const el = cands.find((n) => {
+                    const r = n.getBoundingClientRect();
+                    return r.width > 40 && r.height > 12;
+                  });
+                  if (!el) return false;
+                  el.focus({ preventScroll: true });
+                  try {
+                    if (typeof el.setSelectionRange === 'function' && 'value' in el) {
+                      const n = (el.value || '').length;
+                      el.setSelectionRange(n, n);
+                    }
+                  } catch (e) {}
+                  return true;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _escape_dialogs(page) -> None:
+    """Dismiss replace / multi-file error with keyboard only."""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(100)
+    except Exception:
+        pass
+
+
+def _multi_file_search_blocked(page) -> bool:
+    """Google shows: 여러 파일을 사용하여 검색할 수 없습니다."""
+    try:
+        loc = page.locator("text=여러 파일을 사용하여 검색할 수 없습니다")
+        if loc.count() == 0:
+            return False
+        return bool(loc.first.is_visible(timeout=400))
+    except Exception:
+        return False
+
+
+def _dismiss_multi_file_error(page) -> bool:
+    if not _multi_file_search_blocked(page):
+        return False
+    # 닫기 button or Escape — do not click +
+    try:
+        btn = page.locator('button:has-text("닫기")')
+        if btn.count() > 0 and btn.first.is_visible(timeout=400):
+            btn.first.click(timeout=1200)
+            page.wait_for_timeout(200)
             return True
-        except Exception:
-            continue
-    return False
+    except Exception:
+        pass
+    _escape_dialogs(page)
+    return True
+
+
+def _composer_blob_count(page) -> int:
+    try:
+        return int(
+            page.evaluate(
+                """() => {
+                  const h = window.innerHeight || 800;
+                  let n = 0;
+                  document.querySelectorAll('img[src^="blob:"], img[src^="data:image"]').forEach((img) => {
+                    const r = img.getBoundingClientRect();
+                    if (r.width >= 20 && r.height >= 20 && r.top >= h * 0.35) n += 1;
+                  });
+                  return n;
+                }"""
+            )
+        )
+    except Exception:
+        return 0
 
 
 def _image_attached(page) -> bool:
@@ -238,36 +374,159 @@ def _image_attached(page) -> bool:
     return False
 
 
+def _paste_images_as_image_files_dom(page, paths: list[Path]) -> int:
+    """Inject image/* File paste into composer (not CF_HDROP 'files' — that triggers Google block)."""
+    import base64
+    import mimetypes
+
+    payload = []
+    for path in paths:
+        path = Path(path)
+        if not path.exists():
+            continue
+        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+        if not str(mime).startswith("image/"):
+            mime = "image/jpeg"
+        # Keep names looking like images
+        name = path.name
+        if not re.search(r"\.(jpe?g|png|webp|gif|bmp)$", name, re.I):
+            name = f"{path.stem}.jpg"
+        b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+        payload.append([name, mime, b64])
+    if not payload:
+        return 0
+
+    before = _composer_blob_count(page)
+    try:
+        n = int(
+            page.evaluate(
+                """(files) => {
+                  const dt = new DataTransfer();
+                  for (const [name, mime, b64] of files) {
+                    const binary = atob(b64);
+                    const arr = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
+                    dt.items.add(new File([arr], name, { type: mime }));
+                  }
+                  const cands = [
+                    ...document.querySelectorAll('[role="textbox"]'),
+                    ...document.querySelectorAll('textarea'),
+                    ...document.querySelectorAll('[contenteditable="true"]'),
+                  ];
+                  const el = cands.find((n) => {
+                    const r = n.getBoundingClientRect();
+                    return r.width > 40 && r.height > 12;
+                  });
+                  if (!el) return 0;
+                  el.focus();
+                  // Prefer drop (often accepted as image attach) then paste
+                  for (const type of ['dragenter', 'dragover', 'drop']) {
+                    el.dispatchEvent(new DragEvent(type, {
+                      bubbles: true, cancelable: true, dataTransfer: dt
+                    }));
+                  }
+                  try {
+                    el.dispatchEvent(new ClipboardEvent('paste', {
+                      bubbles: true, cancelable: true, clipboardData: dt
+                    }));
+                  } catch (e) {}
+                  return dt.files.length;
+                }""",
+                payload,
+            )
+        )
+    except Exception:
+        n = 0
+    for _ in range(15):
+        page.wait_for_timeout(200)
+        if _multi_file_search_blocked(page):
+            _dismiss_multi_file_error(page)
+            return 0
+        after = _composer_blob_count(page)
+        if after >= before + len(payload) or after >= len(payload):
+            return len(payload)
+        if after > before:
+            return after - before
+    after = _composer_blob_count(page)
+    gained = max(0, after - before)
+    return gained if gained else (n if _image_attached(page) else 0)
+
+
 def _quick_paste_image(page, path: Path) -> bool:
-    """Clipboard → composer Ctrl+V. No upload menus, no long waits."""
+    """저장된 이미지 → 클립보드(그림) → Ctrl+V."""
     if not _copy_image_to_clipboard(path):
         return False
     _focus_composer(page)
     page.keyboard.press("Control+v")
-    page.wait_for_timeout(350)
+    page.wait_for_timeout(400)
+    _escape_dialogs(page)
     return True
 
 
+def _paste_all_files_once(page, paths: list[Path]) -> int:
+    """Explorer-style file list + Ctrl+V (works in real Chrome; may fail in Chromium)."""
+    if not _copy_files_to_clipboard(paths):
+        return 0
+    before = _composer_blob_count(page)
+    _focus_composer(page)
+    page.wait_for_timeout(150)
+    page.keyboard.press("Control+v")
+    for _ in range(20):
+        page.wait_for_timeout(200)
+        if _multi_file_search_blocked(page):
+            _dismiss_multi_file_error(page)
+            return 0
+        after = _composer_blob_count(page)
+        if after >= before + len(paths) or after >= len(paths):
+            return len(paths)
+    after = _composer_blob_count(page)
+    gained = max(0, after - before)
+    return gained
+
+
 def _paste_images_one_by_one(page, paths: list[Path]) -> int:
-    """Clipboard → Ctrl+V only. No file upload, no replace/retry, no chip counting."""
+    """Each image as bitmap Ctrl+V. Escape between pastes (no + button)."""
+    _focus_composer(page)
     attached = 0
     for p in paths:
+        before = _composer_blob_count(page)
         if not _copy_image_to_clipboard(p):
             continue
+        _escape_dialogs(page)
         _focus_composer(page)
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(150)
         page.keyboard.press("Control+v")
-        attached += 1
-        # Wait so the next paste adds another chip instead of racing the UI
-        page.wait_for_timeout(750)
+        page.wait_for_timeout(600)
+        if _multi_file_search_blocked(page):
+            _dismiss_multi_file_error(page)
+        _escape_dialogs(page)
+        _focus_composer(page)
+        after = _composer_blob_count(page)
+        if after > before or (attached == 0 and _image_attached(page)):
+            attached = max(attached + 1, after - before if after > before else attached + 1)
+        page.wait_for_timeout(450)
     return attached
 
 
 def _attach_images_multi(page, paths: list[Path]) -> int:
-    """Attach images by paste only — never open file chooser / set_input_files."""
+    """Paste images like a human — prefer image paste, avoid '여러 파일 검색 불가'."""
     paths = [Path(p) for p in paths if Path(p).exists()]
     if not paths:
         return 0
+    if len(paths) == 1:
+        return 1 if _quick_paste_image(page, paths[0]) else 0
+
+    # 1) DOM image/* paste/drop (same as pasting pictures, not generic files)
+    n = _paste_images_as_image_files_dom(page, paths)
+    if n >= len(paths):
+        return n
+
+    # 2) Real clipboard file-list (user's Explorer multi-copy) — OK on real Chrome
+    n = _paste_all_files_once(page, paths)
+    if n >= len(paths):
+        return n
+
+    # 3) One image bitmap at a time
     return _paste_images_one_by_one(page, paths)
 
 
@@ -514,21 +773,36 @@ def _ai_still_loading(page) -> bool:
         return bool(
             page.evaluate(
                 """() => {
-                  // Skeleton bars while answering (user's loading DOM)
-                  const skeletons = document.querySelectorAll('.wrqyud, .qaHYKd');
+                  // Skeleton bars while answering
+                  const skeletons = document.querySelectorAll(
+                    '.wrqyud, .qaHYKd, [class*="skeleton"], [class*="Skeleton"]'
+                  );
                   for (const el of skeletons) {
                     const r = el.getBoundingClientRect();
                     if (r.width > 8 && r.height > 2 && r.bottom > 0) {
                       if (r.top < window.innerHeight && r.top > 40) return true;
                     }
                   }
-                  // Incomplete answer root
+                  // Incomplete / busy answer root
                   const roots = document.querySelectorAll(
                     '[data-complete="false"], [aria-busy="true"]'
                   );
                   for (const el of roots) {
                     const r = el.getBoundingClientRect();
                     if (r.width > 20 && r.height > 20) return true;
+                  }
+                  // Stop / 중지 button while generating
+                  const buttons = document.querySelectorAll('button, [role="button"]');
+                  for (const b of buttons) {
+                    const label = (
+                      (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')
+                    ).trim();
+                    if (/^(중지|Stop|Stop generating)$/i.test(label) ||
+                        /응답 중지|생성 중지|Stop generating/i.test(label)) {
+                      const r = b.getBoundingClientRect();
+                      if (r.width > 8 && r.height > 8 && r.bottom > 0 &&
+                          r.top < window.innerHeight) return true;
+                    }
                   }
                   return false;
                 }"""
@@ -541,7 +815,9 @@ def _ai_still_loading(page) -> bool:
 def _latest_answer_text(page) -> str:
     try:
         # Prefer the last completed markdown / AI block
-        aim = page.locator('div[data-subtree="aimc"], [data-md], .markdown')
+        aim = page.locator(
+            'div[data-subtree="aimc"], [data-md], .markdown, .Y3BBE'
+        )
         n = aim.count()
         if n > 0:
             return (aim.last.inner_text(timeout=500) or "").strip()
@@ -554,6 +830,8 @@ def _answer_looks_ready(text: str, prev_fingerprint: str = "") -> bool:
     t = (text or "").strip()
     if len(t) < 50:
         return False
+    if _is_ai_fail_text(t):
+        return False
     if t[:240] == (prev_fingerprint or "")[:240]:
         return False
     # Reject skeleton-only / tiny placeholders
@@ -564,19 +842,31 @@ def _answer_looks_ready(text: str, prev_fingerprint: str = "") -> bool:
     return True
 
 
-def _collect_ai_texts(page, *, prev_fingerprint: str = "") -> list[str]:
-    """Wait until the NEW answer finishes loading — never reuse the previous one."""
+def _collect_ai_texts(
+    page,
+    *,
+    prev_fingerprint: str = "",
+    timeout_sec: float = 60.0,
+) -> list[str]:
+    """Wait until the NEW answer finishes — empty only after timeout (no early skip)."""
     page.wait_for_timeout(600)
     stable = ""
     stable_hits = 0
     latest = ""
+    deadline = time.monotonic() + max(15.0, float(timeout_sec))
 
-    # Up to ~45s for a full AI reply
-    for _ in range(60):
+    while time.monotonic() < deadline:
+        fail = _ai_generation_failed(page)
+        if fail:
+            raise AiGenerationFailed(fail)
+
         loading = _ai_still_loading(page)
         txt = _latest_answer_text(page)
+        if _is_ai_fail_text(txt):
+            raise AiGenerationFailed(txt)
 
         if loading:
+            # Still generating — never treat as done
             stable = ""
             stable_hits = 0
             page.wait_for_timeout(500)
@@ -586,27 +876,34 @@ def _collect_ai_texts(page, *, prev_fingerprint: str = "") -> list[str]:
             page.wait_for_timeout(500)
             continue
 
-        # Require text to stay unchanged for 2 polls (streaming finished)
+        # Require text unchanged across polls (streaming finished)
         if txt == stable:
             stable_hits += 1
         else:
             stable = txt
             stable_hits = 1
 
-        if stable_hits >= 2:
+        if stable_hits >= 3:
             latest = txt
             break
-        page.wait_for_timeout(450)
+        page.wait_for_timeout(400)
+
+    # Final fail check (error UI often has data-complete=true → not "loading")
+    fail = _ai_generation_failed(page)
+    if fail:
+        raise AiGenerationFailed(fail)
 
     if not latest:
-        # Last chance: only accept if clearly new and not loading
+        # Last chance only if loading finished with a new ready answer
         if not _ai_still_loading(page):
             txt = _latest_answer_text(page)
+            if _is_ai_fail_text(txt):
+                raise AiGenerationFailed(txt)
             if _answer_looks_ready(txt, prev_fingerprint):
                 latest = txt
 
     if not latest:
-        # Do NOT fall back to old page text / previous answer
+        # Timed out or still stuck — caller will refresh / reopen
         return []
 
     lines = [ln.strip() for ln in latest.splitlines() if ln.strip()]
@@ -646,7 +943,8 @@ class _AiBrowserSession:
         box: dict = {}
         done = threading.Event()
         self._q.put(("search", paths, prompt, headless, box, done))
-        if not done.wait(timeout=150):
+        # Allow wait(60s) × retries(refresh + browser restart + AI fail) + paste overhead
+        if not done.wait(timeout=600):
             return []
         return list(box.get("texts") or [])
 
@@ -711,10 +1009,26 @@ class _AiBrowserSession:
         self._shutdown()
         sync_playwright = _ensure_playwright()
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        launch_args = ["--disable-blink-features=AutomationControlled"]
+        # Use installed Google Chrome when possible — system clipboard paste
+        # matches manual Explorer multi-copy + Ctrl+V (Playwright Chromium often does not).
+        self._browser = None
+        if not headless:
+            for channel in ("chrome", "msedge"):
+                try:
+                    self._browser = self._pw.chromium.launch(
+                        channel=channel,
+                        headless=False,
+                        args=launch_args,
+                    )
+                    break
+                except Exception:
+                    continue
+        if self._browser is None:
+            self._browser = self._pw.chromium.launch(
+                headless=headless,
+                args=launch_args,
+            )
         self._context = self._browser.new_context(
             locale="ko-KR",
             user_agent=(
@@ -737,19 +1051,46 @@ class _AiBrowserSession:
         page.wait_for_timeout(500)
         self._on_ai_mode = True
 
+    def _soft_refresh_ai(self) -> None:
+        """Reload AI Mode page (stuck loading recovery)."""
+        page = self._page
+        if page is None or page.is_closed():
+            self._shutdown()
+            return
+        try:
+            page.goto(_AI_MODE_URL, wait_until="domcontentloaded", timeout=60000)
+            _dismiss_google_consent(page)
+            page.wait_for_timeout(800)
+            self._on_ai_mode = True
+        except Exception:
+            self._shutdown()
+
     def _do_search(self, paths: list[Path], prompt: str, headless: bool) -> list[str]:
-        """Paste image(s) with Ctrl+V → type prompt → Enter. No replace / re-upload."""
+        """Paste → prompt → wait for NEW answer. Retry with refresh / browser restart."""
         paths = [p for p in paths if p.exists()]
         if not paths:
             return []
-        for attempt in range(2):
+
+        # Extra attempts when Google shows "AI 대답을 생성할 수 없습니다"
+        max_attempts = 5
+        for attempt in range(max_attempts):
             try:
+                # After AI fail / hard recoveries: always reopen a fresh window
+                if attempt >= 2:
+                    self._shutdown()
+
                 self._ensure(headless)
                 page = self._page
                 assert page is not None
 
-                continuing = bool(self._on_ai_mode and self._alive())
-                if not continuing:
+                if attempt == 1:
+                    self._soft_refresh_ai()
+                    if not self._alive():
+                        self._ensure(headless)
+                        page = self._page
+                        assert page is not None
+                        self._open_ai_mode(page)
+                elif attempt >= 2 or not (self._on_ai_mode and self._alive()):
                     self._open_ai_mode(page)
                 else:
                     try:
@@ -759,30 +1100,75 @@ class _AiBrowserSession:
 
                 prev_fp = _latest_ai_fingerprint(page)
 
-                # 다중/단건 모두: 클립보드 붙여넣기만 (창 새로고침·파일교체 재시도 없음)
                 pasted = _attach_images_multi(page, paths)
                 if pasted == 0:
-                    if attempt == 0 and not continuing:
-                        self._shutdown()
+                    self._on_ai_mode = False
+                    if attempt < max_attempts - 1:
+                        if attempt == 0:
+                            self._soft_refresh_ai()
+                        else:
+                            self._shutdown()
+                            time.sleep(2.0)
                         continue
                     return []
 
                 page.wait_for_timeout(300)
                 _type_prompt_and_enter(page, prompt)
-                texts = _collect_ai_texts(page, prev_fingerprint=prev_fp)
-                self._on_ai_mode = True
-                return texts
+
+                # Must wait for a real new answer — do not advance while loading
+                texts = _collect_ai_texts(
+                    page,
+                    prev_fingerprint=prev_fp,
+                    timeout_sec=60.0,
+                )
+                if texts:
+                    self._on_ai_mode = True
+                    return texts
+
+                # Empty result: if fail banner is up, close window and retry same image
+                fail_msg = _ai_generation_failed(page)
+                self._on_ai_mode = False
+                if fail_msg:
+                    self._shutdown()
+                    time.sleep(4.0)
+                    continue
+
+                # 1분 이상 결과 없음 / 로딩 고착 → 새로고침 또는 창 재시작 후 같은 상품 재시도
+                if attempt == 0:
+                    self._soft_refresh_ai()
+                else:
+                    self._shutdown()
+                    time.sleep(2.5)
+            except AiGenerationFailed:
+                # 「문제가 발생하여 AI 대답을 생성할 수 없습니다」
+                # → 인터넷 창 종료 → 잠시 대기 → 같은 이미지부터 재시도
+                self._on_ai_mode = False
+                self._shutdown()
+                time.sleep(4.0)
+                continue
             except Exception:
                 self._shutdown()
-                if attempt == 0:
-                    continue
-                raise
+                if attempt >= max_attempts - 1:
+                    raise
+                time.sleep(2.0)
         return []
 
 
 # Headed / headless sessions are separate so batch search won't close the visible window
 _AI_SESSION_HEADED = _AiBrowserSession()
 _AI_SESSION_HEADLESS = _AiBrowserSession()
+
+
+def close_ai_browsers() -> None:
+    """Force-close Google AI browser windows (call before retrying a failed image)."""
+    try:
+        _AI_SESSION_HEADED.close()
+    except Exception:
+        pass
+    try:
+        _AI_SESSION_HEADLESS.close()
+    except Exception:
+        pass
 
 
 def _google_ai_mode_search(

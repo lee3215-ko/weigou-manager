@@ -18,6 +18,7 @@
     "paths.py",
     "run.py",
     "app.py",
+    "app_role.py",
     "manager_app.py",
     "product_store.py",
     "product_attrs.py",
@@ -26,6 +27,7 @@
     "multi_ai_parse.py",
     "google_lens.py",
     "mall_publish.py",
+    "mall_cloud.py",
     "style_publish.py",
     "price_codec.py",
     "ime_win.py",
@@ -36,6 +38,8 @@
     "downloader.py",
     "enhance_uploads.py",
     "catalog_sync.py",
+    "customers_ui.py",
+    "orders_ui.py",
     "updater.py",
     "update_ui.py",
     "requirements.txt",
@@ -47,6 +51,7 @@
     "scripts",
     "shared",
     "data/sync_settings.example.json",
+    "data/mall_cloud.example.json",
     ".cursor/rules"
   ]
 }
