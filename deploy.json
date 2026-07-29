@@ -42,6 +42,7 @@
     "orders_ui.py",
     "updater.py",
     "update_ui.py",
+    "url_thumbs.py",
     "requirements.txt",
     "build.bat",
     "build.spec",

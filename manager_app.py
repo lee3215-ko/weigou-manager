@@ -2,6 +2,7 @@
 """Weigou product manager — browse, search, import with description."""
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as dt
 import io
 import os
@@ -91,6 +92,7 @@ from product_store import (
 )
 from style_publish import publish_style_look
 from update_ui import schedule_update_check
+from url_thumbs import fetch_thumb_file, prune_thumb_cache
 
 init_runtime_paths()
 
@@ -2908,6 +2910,7 @@ class ManagerApp(tk.Tk):
         for w in self.img_frame.winfo_children():
             w.destroy()
         self._photo_cache.clear()
+        self._photo_refs.clear()
 
     def _thumb(self, path: str, size: tuple[int, int] = (180, 180)) -> tk.PhotoImage | None:
         p = pathlib.Path(path)
@@ -2926,16 +2929,14 @@ class ManagerApp(tk.Tk):
             return None
 
     def _thumb_from_url(self, url: str, size: tuple[int, int] = (180, 180)) -> tk.PhotoImage | None:
-        """Same as ``_thumb`` but fetches a remote image (short timeout, best-effort)."""
+        """Load remote preview via disk cache + CDN resize (may hit network)."""
         if Image is None or ImageTk is None:
             return None
-        if not url or not url.startswith("http"):
+        path = fetch_thumb_file(url)
+        if not path:
             return None
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "WeigouManager/1.0"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = resp.read()
-            im = Image.open(io.BytesIO(data))
+            im = Image.open(path)
             im.thumbnail(size, Image.Resampling.LANCZOS)
             photo = ImageTk.PhotoImage(im)
             self._photo_refs.append(photo)
@@ -3065,35 +3066,91 @@ class ManagerApp(tk.Tk):
             self._end_form_load()
 
     def _schedule_url_thumbs(self, urls: list[str], gen: int) -> None:
-        """Fallback preview from remote image_urls — used before images are downloaded locally."""
+        """Fallback preview from remote image_urls — used before images are downloaded locally.
+
+        Parallel background fetch + disk cache so the UI thread stays responsive
+        and repeat opens are near-instant.
+        """
         if not urls:
             tk.Label(self.img_frame, text="이미지 없음", bg="#fffdf9", fg="#888").pack(pady=20)
             return
 
-        def load_one(index: int = 0) -> None:
-            self._thumb_after = None
-            if gen != self._select_gen or index >= len(urls):
-                return
-            url = urls[index]
+        # Cap preview count; cover first, rest in parallel.
+        urls = list(urls)[:9]
+        placeholders: list[tk.Label] = []
+        for index, _url in enumerate(urls):
             cell = tk.Frame(self.img_frame, bg="#fffdf9", padx=4, pady=4)
             cell.grid(row=index // 3, column=index % 3, sticky="n")
-            photo = self._thumb_from_url(url)
-            if photo:
-                tk.Label(cell, image=photo, bg="#fffdf9").pack()
-            else:
-                tk.Label(
-                    cell,
-                    text="이미지 로드 실패",
-                    bg="#fffdf9",
-                    fg="#888",
-                    font=("Consolas", 8),
-                ).pack()
-            if gen != self._select_gen:
-                return
-            if index + 1 < len(urls):
-                self._thumb_after = self.after(1, lambda: load_one(index + 1))
+            lbl = tk.Label(
+                cell,
+                text="로딩…" if index == 0 else "…",
+                bg="#fffdf9",
+                fg="#aaa",
+                font=("Consolas", 8),
+                width=18,
+                height=8,
+            )
+            lbl.pack()
+            placeholders.append(lbl)
 
-        load_one(0)
+        def place(index: int, path: str | None) -> None:
+            if gen != self._select_gen or index >= len(placeholders):
+                return
+            try:
+                lbl = placeholders[index]
+                if not lbl.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            if not path:
+                try:
+                    lbl.configure(text="로드 실패", fg="#888", width=0, height=0)
+                except tk.TclError:
+                    pass
+                return
+            photo = self._thumb(path)
+            try:
+                if photo:
+                    self._photo_refs.append(photo)
+                    lbl.configure(image=photo, text="", width=0, height=0)
+                    lbl.image = photo  # type: ignore[attr-defined]
+                else:
+                    lbl.configure(text="로드 실패", fg="#888", width=0, height=0)
+            except tk.TclError:
+                pass
+
+        def worker() -> None:
+            results: list[tuple[int, str | None]] = []
+
+            def one(i_u: tuple[int, str]) -> tuple[int, str | None]:
+                i, u = i_u
+                p = fetch_thumb_file(u)
+                return i, str(p) if p else None
+
+            # Cover first (index 0), then remaining in parallel for snappy first paint.
+            first = one((0, urls[0]))
+            results.append(first)
+            self.after(0, lambda f=first: place(f[0], f[1]))
+
+            rest = list(enumerate(urls))[1:]
+            if rest:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                    for fut in concurrent.futures.as_completed(
+                        [pool.submit(one, item) for item in rest]
+                    ):
+                        if gen != self._select_gen:
+                            return
+                        try:
+                            idx, path = fut.result()
+                        except Exception:
+                            continue
+                        self.after(0, lambda i=idx, p=path: place(i, p))
+            try:
+                prune_thumb_cache()
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _schedule_thumbs(
         self,
@@ -3106,7 +3163,7 @@ class ManagerApp(tk.Tk):
         """Load thumbnails asynchronously so list selection stays instant."""
         if not paths:
             if urls:
-                self._schedule_url_thumbs(list(urls)[:12], gen)
+                self._schedule_url_thumbs(list(urls)[:9], gen)
                 return
             tk.Label(self.img_frame, text="이미지 없음", bg="#fffdf9", fg="#888").pack(pady=20)
             return

@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.4",
+    "version":  "1.0.5",
     "url":  "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
-    "notes":  "Fix mall_cloud.json path for frozen exe (B PC sync)"
+    "notes":  "Faster B PC image preview: CDN thumbs, disk cache, parallel load"
 }
