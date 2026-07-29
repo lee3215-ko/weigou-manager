@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.7",
+    "version":  "1.0.8",
     "url":  "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
-    "notes":  "List shows shared search_code (#) on A and B instead of local id"
+    "notes":  "Fix stale local image paths showing filenames; fall back to URL preview"
 }

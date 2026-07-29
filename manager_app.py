@@ -3234,13 +3234,20 @@ class ManagerApp(tk.Tk):
         cover_only: bool = False,
         urls: list[str] | None = None,
     ) -> None:
-        """Load thumbnails asynchronously so list selection stays instant."""
-        if not paths:
+        """Load thumbnails asynchronously so list selection stays instant.
+
+        Only existing local files are used. Stale paths (common on B after sync
+        / cache prune) fall through to URL preview instead of showing filenames.
+        """
+        existing = [p for p in (paths or []) if p and pathlib.Path(p).exists()]
+        if not existing:
             if urls:
                 self._schedule_url_thumbs(list(urls)[:9], gen)
                 return
             tk.Label(self.img_frame, text="이미지 없음", bg="#fffdf9", fg="#888").pack(pady=20)
             return
+
+        paths = existing
 
         def load_one(index: int = 0) -> None:
             self._thumb_after = None
@@ -3261,13 +3268,28 @@ class ManagerApp(tk.Tk):
                 if photo:
                     lbl = tk.Label(cell, image=photo, bg="#fffdf9")
                     lbl.pack()
+                elif urls and i < len(urls):
+                    # Local file unreadable — try URL for this slot
+                    photo_u = self._thumb_from_url(urls[i])
+                    if photo_u:
+                        lbl = tk.Label(cell, image=photo_u, bg="#fffdf9")
+                        lbl.pack()
+                    else:
+                        lbl = tk.Label(
+                            cell,
+                            text="로드 실패",
+                            bg="#fffdf9",
+                            fg="#888",
+                            font=("Consolas", 8),
+                        )
+                        lbl.pack()
                 else:
                     lbl = tk.Label(
                         cell,
-                        text=pathlib.Path(path).name,
+                        text="로드 실패",
                         bg="#fffdf9",
+                        fg="#888",
                         font=("Consolas", 8),
-                        wraplength=160,
                     )
                     lbl.pack()
                 # Thumbnails steal focus — bind wheel so scroll still works
