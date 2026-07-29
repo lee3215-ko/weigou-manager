@@ -82,6 +82,7 @@ def build_customers(
         c["kind"] = "member"
         c["userId"] = uid
         c["name"] = _pick_str(m.get("name"), c["name"])
+        c["email"] = _pick_str(m.get("email"), c["email"])
         phone = _pick_str(m.get("phone"), c["phone"])
         c["phone"] = phone
         digits = normalize_phone(phone)
@@ -214,6 +215,7 @@ def filter_customers(
 def format_customer_line(c: dict[str, Any]) -> str:
     kind = "회원" if c.get("kind") == "member" else "비회원"
     name = str(c.get("name") or "(이름없음)")
+    login_id = str(c.get("email") or c.get("userId") or "-")
     phone = str(c.get("phone") or c.get("phoneDigits") or "-")
     pts = int(c.get("points") or 0)
     cnt = int(c.get("orderCount") or 0)
@@ -221,7 +223,7 @@ def format_customer_line(c: dict[str, Any]) -> str:
     last = str(c.get("lastOrderAt") or "")[:10]
     last_part = f" · 최근 {last}" if last else " · 주문없음"
     return (
-        f"[{kind}] {name} · {phone} · 마일리지 {pts:,} · "
+        f"[{kind}] {name} · {login_id} · {phone} · 마일리지 {pts:,} · "
         f"주문 {cnt}회 · {total:,}원{last_part}"
     )
 
@@ -237,15 +239,18 @@ def customer_detail_text(c: dict[str, Any]) -> str:
             x for x in (c.get("zipcode"), c.get("address1"), c.get("address2")) if x
         ),
     ) or "-"
+    login_id = _pick_str(c.get("email")) or "-"
+    uid = _pick_str(c.get("userId")) or "-"
 
     lines = [
         f"구분: {kind}",
         f"이름: {c.get('name') or '-'}",
+        f"회원ID(이메일): {login_id}",
         f"전화번호: {c.get('phone') or c.get('phoneDigits') or '-'}",
         f"마일리지(포인트): {int(c.get('points') or 0):,}P",
         f"통관부호(PCCC): {c.get('pccc') or '-'}",
         f"주소: {addr}",
-        f"회원ID: {c.get('userId') or '-'}",
+        f"내부UID: {uid}",
         f"가입일: {joined}",
         "",
         f"주문횟수: {int(c.get('orderCount') or 0)}회 "

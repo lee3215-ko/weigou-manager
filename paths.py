@@ -8,7 +8,7 @@ import sys
 
 APP_NAME = "WeigouManager"
 APP_DISPLAY_NAME = "Weigou Product Manager"
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.10"
 UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/lee3215-ko/weigou-manager/main/version.json"
 )
@@ -89,6 +89,7 @@ def migrate_legacy_data() -> None:
 def init_runtime_paths() -> None:
     os.chdir(get_app_dir())
     migrate_legacy_data()
+
 
 
 

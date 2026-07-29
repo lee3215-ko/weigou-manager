@@ -2987,15 +2987,13 @@ class ManagerApp(tk.Tk):
         if not p.exists():
             return None
         if Image is None or ImageTk is None:
-            # Fallback without Pillow: skip large raw PhotoImage
             return None
         try:
+            # Fast preview: do NOT im.load() full originals (that made A feel stuck).
             im = Image.open(p)
-            im.load()
-            # Tk PhotoImage is picky about mode (P/CMYK/LA…)
             if im.mode not in ("RGB", "RGBA"):
                 im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
-            im.thumbnail(size, Image.Resampling.LANCZOS)
+            im.thumbnail(size, Image.Resampling.BILINEAR)
             photo = ImageTk.PhotoImage(im)
             self._photo_cache.append(photo)
             return photo
@@ -3039,10 +3037,9 @@ class ManagerApp(tk.Tk):
         try:
             if pubid is not None:
                 paths = self.store.ensure_published_images(pubid)
-                self.store.prune_image_cache(keep_ids={pubid})
+                # Don't prune on every open — that can wipe other local galleries on A.
             elif pid is not None:
                 paths = self.store.ensure_product_images(pid)
-                self.store.prune_image_cache(keep_ids={pid})
         except Exception:
             pass
         return paths
@@ -3283,22 +3280,8 @@ class ManagerApp(tk.Tk):
                 if photo:
                     lbl = tk.Label(cell, image=photo, bg="#fffdf9")
                     lbl.pack()
-                elif urls and i < len(urls):
-                    # Local file unreadable — try URL for this slot
-                    photo_u = self._thumb_from_url(urls[i])
-                    if photo_u:
-                        lbl = tk.Label(cell, image=photo_u, bg="#fffdf9")
-                        lbl.pack()
-                    else:
-                        lbl = tk.Label(
-                            cell,
-                            text="로드 실패",
-                            bg="#fffdf9",
-                            fg="#888",
-                            font=("Consolas", 8),
-                        )
-                        lbl.pack()
                 else:
+                    # Never block UI with sync URL fetch — show placeholder only.
                     lbl = tk.Label(
                         cell,
                         text="로드 실패",
@@ -5676,6 +5659,15 @@ class ManagerApp(tk.Tk):
         self._ensure_images_for_action()
         path = self._resolve_image_folder()
         path.mkdir(parents=True, exist_ok=True)
+        # product.txt 는 수집 시 만들어지지만, 경로 복구/재다운로드 후에는 빠질 수 있음
+        try:
+            mode = self.list_mode.get()
+            if mode == "published" and self.current_published_id is not None:
+                self._ensure_published_txt(path, self.current_published_id)
+            elif mode == "products" and self.current_id is not None:
+                self.store.write_product_txt(self.current_id, path)
+        except Exception:
+            pass
         os.startfile(str(path))  # type: ignore[attr-defined]
 
     def _resolve_image_folder(self) -> pathlib.Path:

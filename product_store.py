@@ -2054,15 +2054,18 @@ class ProductStore:
     ) -> list[str]:
         """Download product gallery images on demand and return local paths.
 
-        Skips download and returns the existing paths if any already exist
-        on disk. Pass ``urls`` to override the product's stored ``image_urls``
-        (e.g. right after a sync merge, before the DB write is committed).
+        Skips download when files already exist under ``images/<id>/`` even if
+        DB paths point at an old location.
         """
         p = self.get(product_id)
         if not p:
             return []
-        existing = [x for x in (p.image_paths or []) if pathlib.Path(x).exists()]
+        existing = self.resolve_local_images(
+            product_id, paths=list(p.image_paths or []), cover_path=p.cover_path or ""
+        )
         if existing:
+            if existing != list(p.image_paths or []):
+                self.rewrite_product_image_paths(product_id, existing)
             return existing
         src_urls = urls if urls is not None else list(p.image_urls or [])
         folder = self.img_root / str(product_id)
@@ -2079,7 +2082,38 @@ class ProductStore:
                     product_id,
                 ),
             )
+        self.write_product_txt(product_id)
         return saved
+
+    def write_product_txt(self, product_id: int, folder: pathlib.Path | None = None) -> pathlib.Path | None:
+        """Write/refresh ``product.txt`` next to gallery images (folder 열기용)."""
+        p = self.get(product_id)
+        if not p:
+            return None
+        dest_dir = folder or (self.img_root / str(product_id))
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        meta = dest_dir / "product.txt"
+        lines = [
+            p.google_name or p.title or "",
+            f"搜索码：{p.search_code}" if p.search_code else "",
+            f"NO：{p.sku_no}" if p.sku_no else "",
+            p.tags or "",
+            f"카테고리：{p.category}" if p.category else "",
+            f"컬러：{p.colors}" if p.colors else "",
+            f"사이즈：{p.sizes}" if p.sizes else "",
+            "",
+            p.description or "",
+            "",
+            f"goods_id={p.goods_id}" if p.goods_id else "",
+        ]
+        try:
+            meta.write_text(
+                "\n".join(x for x in lines if x is not None).strip() + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            return None
+        return meta
 
     def ensure_published_images(
         self, published_id: int, max_images: int = 20
@@ -2088,10 +2122,15 @@ class ProductStore:
         item = self.get_published(published_id)
         if not item:
             return []
+        folder = self.published_img_root / f"p{published_id}"
         existing = [x for x in (item.image_paths or []) if pathlib.Path(x).exists()]
+        if not existing and folder.is_dir():
+            exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+            for f in sorted(folder.iterdir()):
+                if f.is_file() and f.suffix.lower() in exts:
+                    existing.append(str(f))
         if existing:
             return existing
-        folder = self.published_img_root / f"p{published_id}"
         saved = self._download_gallery(list(item.image_urls or []), folder, max_images)
         if not saved:
             return []
