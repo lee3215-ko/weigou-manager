@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.8",
+    "version":  "1.0.9",
     "url":  "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
-    "notes":  "Fix stale local image paths showing filenames; fall back to URL preview"
+    "notes":  "A: heal stale image paths under images/id; fix Pillow mode for thumbs"
 }

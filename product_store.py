@@ -1972,6 +1972,79 @@ class ProductStore:
                 continue
         return saved
 
+    def resolve_local_images(
+        self,
+        product_id: int,
+        *,
+        paths: list[str] | None = None,
+        cover_path: str = "",
+    ) -> list[str]:
+        """Return existing image file paths for a product.
+
+        Recovers when DB still points at an old catalog location (e.g. Documents
+        migrate) but files now live under ``images/<id>/``.
+        """
+        p = self.get(product_id)
+        raw = list(paths if paths is not None else (p.image_paths if p else []))
+        cover = (cover_path or (p.cover_path if p else "") or "").strip()
+        folder = self.img_root / str(product_id)
+
+        def resolve_one(path: str) -> str | None:
+            s = (path or "").strip()
+            if not s:
+                return None
+            cand = pathlib.Path(s)
+            try:
+                if cand.is_file():
+                    return str(cand.resolve())
+            except OSError:
+                pass
+            name = cand.name
+            if name:
+                alt = folder / name
+                try:
+                    if alt.is_file():
+                        return str(alt.resolve())
+                except OSError:
+                    pass
+            # relative to catalog root
+            alt2 = self.root / s
+            try:
+                if alt2.is_file():
+                    return str(alt2.resolve())
+            except OSError:
+                pass
+            return None
+
+        out: list[str] = []
+        for path in raw:
+            hit = resolve_one(path)
+            if hit and hit not in out:
+                out.append(hit)
+        if not out and cover:
+            hit = resolve_one(cover)
+            if hit:
+                out.append(hit)
+        if not out and folder.is_dir():
+            exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+            for f in sorted(folder.iterdir()):
+                if f.is_file() and f.suffix.lower() in exts:
+                    try:
+                        out.append(str(f.resolve()))
+                    except OSError:
+                        out.append(str(f))
+        return out
+
+    def rewrite_product_image_paths(self, product_id: int, paths: list[str]) -> None:
+        """Persist healed local paths after resolve (keeps cover + gallery in sync)."""
+        if not paths:
+            return
+        with self._connect() as con:
+            con.execute(
+                "UPDATE products SET cover_path=?, image_paths=? WHERE id=?",
+                (paths[0], json.dumps(paths, ensure_ascii=False), product_id),
+            )
+
     def ensure_product_images(
         self,
         product_id: int,

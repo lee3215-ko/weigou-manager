@@ -2991,6 +2991,10 @@ class ManagerApp(tk.Tk):
             return None
         try:
             im = Image.open(p)
+            im.load()
+            # Tk PhotoImage is picky about mode (P/CMYK/LA…)
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
             im.thumbnail(size, Image.Resampling.LANCZOS)
             photo = ImageTk.PhotoImage(im)
             self._photo_cache.append(photo)
@@ -3128,9 +3132,20 @@ class ManagerApp(tk.Tk):
             paths = list(item.image_paths) if item.image_paths else []
             if not paths and item.cover_path:
                 paths = [item.cover_path]
+            # Prefer files that still exist; published pack folder is p{id}
+            existing: list[str] = []
+            for pth in paths:
+                if pth and pathlib.Path(pth).exists():
+                    existing.append(pth)
+                    continue
+                name = pathlib.Path(pth).name if pth else ""
+                if name:
+                    alt = self.store.published_img_root / f"p{item.id}" / name
+                    if alt.is_file():
+                        existing.append(str(alt))
             gen = self._select_gen
             self._schedule_thumbs(
-                paths, gen, cover_only=False, urls=list(item.image_urls or [])
+                existing, gen, cover_only=False, urls=list(item.image_urls or [])
             )
         finally:
             self._end_form_load()
@@ -3341,7 +3356,14 @@ class ManagerApp(tk.Tk):
             self._refresh_price_preview()
             self._clear_images()
             gen = self._select_gen
-            paths = list(p.image_paths) if p.image_paths else []
+            paths = self.store.resolve_local_images(
+                p.id, paths=list(p.image_paths or []), cover_path=p.cover_path or ""
+            )
+            if paths and paths != list(p.image_paths or []):
+                try:
+                    self.store.rewrite_product_image_paths(p.id, paths)
+                except Exception:
+                    pass
             self._schedule_thumbs(paths, gen, urls=list(p.image_urls or []))
         finally:
             self._end_form_load()
@@ -5054,13 +5076,11 @@ class ManagerApp(tk.Tk):
 
     def _gallery_image_paths(self, product: Product) -> list[str]:
         """화면 썸네일과 같은 순서의 로컬 이미지 경로."""
-        out: list[str] = []
-        for pth in product.image_paths or []:
-            if pth and pathlib.Path(pth).exists() and pth not in out:
-                out.append(pth)
-        if not out and product.cover_path and pathlib.Path(product.cover_path).exists():
-            out.append(product.cover_path)
-        return out
+        return self.store.resolve_local_images(
+            product.id,
+            paths=list(product.image_paths or []),
+            cover_path=product.cover_path or "",
+        )
 
     def _nth_image_path(self, product: Product, index: int) -> str:
         gallery = self._gallery_image_paths(product)
