@@ -2295,6 +2295,21 @@ class ManagerApp(tk.Tk):
             self._list_page += 1
             self.refresh_list()
 
+    @staticmethod
+    def _shared_list_ref(
+        *,
+        search_code: str = "",
+        goods_id: str = "",
+    ) -> str:
+        """A/B-identical badge for list rows (never local SQLite id)."""
+        code = (search_code or "").strip()
+        if code:
+            return code
+        gid = (goods_id or "").strip()
+        if gid:
+            return gid[-10:] if len(gid) > 10 else gid
+        return "-"
+
     def _update_list_page_label(self, shown: int) -> None:
         total = self._list_total
         size = self._list_page_size
@@ -2558,8 +2573,10 @@ class ManagerApp(tk.Tk):
                 name = item.title or "(제목 없음)"
                 if len(name) > 52:
                     name = name[:52] + "…"
-                code = f" [{item.search_code}]" if item.search_code else ""
-                self.listbox.insert(tk.END, f"[제외][{cat}] #{item.id} {name}{code}")
+                ref = self._shared_list_ref(
+                    search_code=item.search_code, goods_id=item.goods_id
+                )
+                self.listbox.insert(tk.END, f"[제외][{cat}] #{ref} {name}")
             if self.excluded_items:
                 self._restore_list_ui_state(
                     ui,
@@ -2604,12 +2621,12 @@ class ManagerApp(tk.Tk):
                 name = item.google_name or item.title or "(제목 없음)"
                 if len(name) > 52:
                     name = name[:52] + "…"
-                code = f" [{item.search_code}]" if item.search_code else ""
+                ref = self._shared_list_ref(
+                    search_code=item.search_code, goods_id=item.goods_id
+                )
                 color = f" · {item.colors}" if item.colors else ""
                 rec = "[추천]" if item.recommended else "[등록]"
-                self.listbox.insert(
-                    tk.END, f"{rec}[{cat}] #{item.id} {name}{code}{color}"
-                )
+                self.listbox.insert(tk.END, f"{rec}[{cat}] #{ref} {name}{color}")
             if rec_only:
                 self.list_hint.configure(
                     text=f"추천 상품만 {len(self.published_items)}건 · 체크 해제 시 전체 등록 목록"
@@ -2654,8 +2671,8 @@ class ManagerApp(tk.Tk):
             name = p.google_name or p.title or "(제목 없음)"
             if len(name) > 52:
                 name = name[:52] + "…"
-            code = f" [{p.search_code}]" if p.search_code else ""
-            self.listbox.insert(tk.END, f"[{cat}] #{p.id} {name}{code}")
+            ref = self._shared_list_ref(search_code=p.search_code, goods_id=p.goods_id)
+            self.listbox.insert(tk.END, f"[{cat}] #{ref} {name}")
 
         if self.products:
             self._restore_list_ui_state(

@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.6",
+    "version":  "1.0.7",
     "url":  "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
-    "notes":  "A/B same list sort (search_code); fix product-name sync overwrite on A"
+    "notes":  "List shows shared search_code (#) on A and B instead of local id"
 }
