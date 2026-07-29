@@ -220,6 +220,7 @@ class ManagerApp(tk.Tk):
         self.query = tk.StringVar()
         self.filter_category = tk.StringVar(value="전체")
         self.filter_recommended_only = tk.BooleanVar(value=False)
+        self.filter_searched_only = tk.BooleanVar(value=False)
         # 자동수집 신규 한도 — 표시값 / 내부값(0=무제한)
         self.collect_limit_var = tk.StringVar(value="100건")
         self.status = tk.StringVar(value="준비됨")
@@ -267,6 +268,8 @@ class ManagerApp(tk.Tk):
         self._publish_prog: dict | None = None
         self._publish_next_id: int | None = None
         self._publish_yview: tuple[float, float] | None = None
+        self._search_active_id: int | None = None
+        self._search_queued_ids: set[int] = set()
 
         self._sync = CatalogSyncService(
             self.store,
@@ -1229,6 +1232,16 @@ class ManagerApp(tk.Tk):
             state="disabled",
         )
         self.chk_recommended_only.pack(side="left", padx=(10, 0))
+        self.chk_searched_only = tk.Checkbutton(
+            filter_row,
+            text="검색완료만",
+            variable=self.filter_searched_only,
+            command=self._reset_list_page_and_refresh,
+            bg="#f3efe8",
+            activebackground="#f3efe8",
+            font=("Malgun Gothic", 9),
+        )
+        self.chk_searched_only.pack(side="left", padx=(8, 0))
 
         mode_row = tk.Frame(left, bg="#f3efe8")
         mode_row.pack(fill="x", pady=(0, 6))
@@ -2310,6 +2323,69 @@ class ManagerApp(tk.Tk):
             return gid[-10:] if len(gid) > 10 else gid
         return "-"
 
+    def _product_busy_tags(self, product_id: int) -> list[str]:
+        """Status tags for in-progress search / homepage publish."""
+        tags: list[str] = []
+        if product_id == self._search_active_id:
+            tags.append("검색중")
+        elif product_id in self._search_queued_ids:
+            tags.append("검색대기")
+        if product_id == self._publish_active_id:
+            tags.append("등록중")
+        elif product_id in self._publish_queued_ids:
+            tags.append("등록대기")
+        return tags
+
+    def _format_product_list_line(self, p: Product) -> str:
+        cat = p.category or "?"
+        name = p.google_name or p.title or "(제목 없음)"
+        if len(name) > 48:
+            name = name[:48] + "…"
+        ref = self._shared_list_ref(search_code=p.search_code, goods_id=p.goods_id)
+        tags = self._product_busy_tags(p.id)
+        badge = "".join(f"[{t}]" for t in tags)
+        return f"{badge}[{cat}] #{ref} {name}"
+
+    def _paint_product_list_styles(self) -> None:
+        """Tint busy rows (search=amber, publish=blue) after list rebuild."""
+        if self.list_mode.get() != "products":
+            return
+        try:
+            n = int(self.listbox.size())
+        except Exception:
+            return
+        for i, p in enumerate(self.products):
+            if i >= n:
+                break
+            tags = self._product_busy_tags(p.id)
+            try:
+                if "검색중" in tags:
+                    self.listbox.itemconfig(i, bg="#ffe8a3", fg="#5c4800")
+                elif "등록중" in tags:
+                    self.listbox.itemconfig(i, bg="#b8d4f0", fg="#0b3d66")
+                elif "검색대기" in tags:
+                    self.listbox.itemconfig(i, bg="#fff6d9", fg="#6b5720")
+                elif "등록대기" in tags:
+                    self.listbox.itemconfig(i, bg="#e3eef8", fg="#1e3a5f")
+                else:
+                    self.listbox.itemconfig(i, bg="#fffdf9", fg="#222222")
+            except Exception:
+                pass
+
+    def _refresh_list_busy(self) -> None:
+        """Quiet list refresh so busy tags/colors stay current during jobs."""
+        if self.list_mode.get() != "products":
+            return
+        self.refresh_list(reload_detail=False, quiet=True)
+
+    def _set_search_busy(
+        self, active: int | None, queued: set[int] | None = None
+    ) -> None:
+        self._search_active_id = active
+        if queued is not None:
+            self._search_queued_ids = set(queued)
+        self.after(0, self._refresh_list_busy)
+
     def _update_list_page_label(self, shown: int) -> None:
         total = self._list_total
         size = self._list_page_size
@@ -2339,6 +2415,7 @@ class ManagerApp(tk.Tk):
             self.btn_unexclude.pack(side="left", padx=6)
             self.listbox.configure(selectmode=tk.EXTENDED)
             self.chk_recommended_only.configure(state="disabled")
+            self.chk_searched_only.configure(state="disabled")
             self.list_hint.configure(text="Ctrl·Shift 클릭으로 여러 개 선택 → 제외 해제")
         elif mode == "published":
             self.btn_republish.pack(side="left", padx=6)
@@ -2350,6 +2427,7 @@ class ManagerApp(tk.Tk):
             # 일반 클릭=1개, Ctrl/Shift=다중 (MULTIPLE 토글 방식 아님)
             self.listbox.configure(selectmode=tk.EXTENDED)
             self.chk_recommended_only.configure(state="normal")
+            self.chk_searched_only.configure(state="disabled")
             if self.filter_recommended_only.get():
                 self.list_hint.configure(
                     text="추천 상품만 표시 중 · [추천 해제]로 목록에서 빠짐"
@@ -2365,7 +2443,11 @@ class ManagerApp(tk.Tk):
             self.btn_delete.pack(side="left", padx=6)
             self.listbox.configure(selectmode=tk.EXTENDED)
             self.chk_recommended_only.configure(state="disabled")
-            self.list_hint.configure(text="Ctrl·Shift 클릭으로 여러 개 선택 → 등록/제외")
+            self.chk_searched_only.configure(state="normal")
+            hint = "Ctrl·Shift 클릭으로 여러 개 선택 → 등록/제외"
+            if self.filter_searched_only.get():
+                hint = "검색완료(제품명 있음)만 표시 중 · " + hint
+            self.list_hint.configure(text=hint)
 
     def _list_entity_ids(self) -> list[int]:
         """Current listbox row → entity ids for active mode."""
@@ -2655,24 +2737,25 @@ class ManagerApp(tk.Tk):
             return
 
         _clamp_page(
-            self.store.count_products(self.query.get(), category=self.filter_category.get())
+            self.store.count_products(
+                self.query.get(),
+                category=self.filter_category.get(),
+                searched_only=bool(self.filter_searched_only.get()),
+            )
         )
         self.products = self.store.list_products(
             self.query.get(),
             category=self.filter_category.get(),
             limit=self._list_page_size,
             offset=self._list_page * self._list_page_size,
+            searched_only=bool(self.filter_searched_only.get()),
         )
         self._update_list_page_label(len(self.products))
         self.excluded_items = []
         self.published_items = []
         for p in self.products:
-            cat = p.category or "?"
-            name = p.google_name or p.title or "(제목 없음)"
-            if len(name) > 52:
-                name = name[:52] + "…"
-            ref = self._shared_list_ref(search_code=p.search_code, goods_id=p.goods_id)
-            self.listbox.insert(tk.END, f"[{cat}] #{ref} {name}")
+            self.listbox.insert(tk.END, self._format_product_list_line(p))
+        self._paint_product_list_styles()
 
         if self.products:
             self._restore_list_ui_state(
@@ -3869,6 +3952,8 @@ class ManagerApp(tk.Tk):
                     f"등록 대기열 +{a} · 총 {t}개"
                 ),
             )
+        if added:
+            self.after(0, self._refresh_list_busy)
         return added
 
     def _on_publish(self) -> None:
@@ -4047,6 +4132,7 @@ class ManagerApp(tk.Tk):
                     total = self._publish_total
                     ok_n = self._publish_ok
                     fail_n = self._publish_fail
+                self.after(0, self._refresh_list_busy)
 
                 name_hint = (
                     (product.google_name or product.title or f"#{product.id}").strip()
@@ -4123,6 +4209,7 @@ class ManagerApp(tk.Tk):
                     total = self._publish_total
                     ok_n = self._publish_ok
                     fail_n = self._publish_fail
+                self.after(0, self._refresh_list_busy)
 
                 if prog:
                     prog["progress"](
@@ -5362,6 +5449,7 @@ class ManagerApp(tk.Tk):
 
         title = "이미지 검색" if image_index <= 0 else f"{image_index + 1}번째 이미지 검색"
         self._append(f"----- {title} #{products[0].id} -----")
+        self._set_search_busy(products[0].id, set())
         self._set_channel_progress(
             LOG_SEARCH,
             done=0,
@@ -5427,6 +5515,7 @@ class ManagerApp(tk.Tk):
                 )
                 self.after(0, lambda: messagebox.showerror("오류", str(e)))
             finally:
+                self._set_search_busy(None, set())
                 self.after(0, lambda: self._job_end("search"))
 
         threading.Thread(target=work, daemon=True).start()
@@ -5471,6 +5560,10 @@ class ManagerApp(tk.Tk):
             return
         self._append(f"----- {title} {len(targets)}개 -----")
         total_search = len(targets)
+        queued = {p.id for p in targets}
+        first_id = targets[0].id
+        queued.discard(first_id)
+        self._set_search_busy(first_id, queued)
         self._set_channel_progress(
             LOG_SEARCH,
             done=0,
@@ -5484,6 +5577,8 @@ class ManagerApp(tk.Tk):
             fail_n = 0
             try:
                 for i, p in enumerate(targets, start=1):
+                    rest = {t.id for t in targets[i:]}
+                    self._set_search_busy(p.id, rest)
                     self._set_channel_progress(
                         LOG_SEARCH,
                         done=i - 1,
@@ -5573,6 +5668,7 @@ class ManagerApp(tk.Tk):
                 )
                 self.after(0, lambda: messagebox.showerror("오류", str(e)))
             finally:
+                self._set_search_busy(None, set())
                 self.after(0, lambda: self._job_end("search"))
 
         threading.Thread(target=work, daemon=True).start()

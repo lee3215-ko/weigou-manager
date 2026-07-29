@@ -336,7 +336,9 @@ class ProductStore:
             sizes=(row["sizes"] if "sizes" in keys else "") or "",
         )
 
-    def _list_products_sql(self, query: str, category: str) -> tuple[str, list[str]]:
+    def _list_products_sql(
+        self, query: str, category: str, *, searched_only: bool = False
+    ) -> tuple[str, list[str]]:
         q = (query or "").strip()
         cat = (category or "").strip()
         sql = " WHERE 1=1"
@@ -352,6 +354,8 @@ class ProductStore:
         if cat and cat != "전체":
             sql += " AND category = ?"
             args.append(cat)
+        if searched_only:
+            sql += " AND trim(COALESCE(google_name,'')) != ''"
         return sql, args
 
     def list_products(
@@ -361,13 +365,16 @@ class ProductStore:
         *,
         limit: int | None = None,
         offset: int = 0,
+        searched_only: bool = False,
     ) -> list[Product]:
         """List products matching query/category.
 
         Order is stable across machines (A/B): search_code numeric, then
         search_code/goods_id/created_at — never local ``id`` (those differ per PC).
         """
-        where_sql, args = self._list_products_sql(query, category)
+        where_sql, args = self._list_products_sql(
+            query, category, searched_only=searched_only
+        )
         sql = "SELECT * FROM products" + where_sql + _PRODUCT_ORDER_SQL
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
@@ -391,8 +398,12 @@ class ProductStore:
         products.sort(key=sort_key)
         return products
 
-    def count_products(self, query: str = "", category: str = "") -> int:
-        where_sql, args = self._list_products_sql(query, category)
+    def count_products(
+        self, query: str = "", category: str = "", *, searched_only: bool = False
+    ) -> int:
+        where_sql, args = self._list_products_sql(
+            query, category, searched_only=searched_only
+        )
         with self._connect() as con:
             row = con.execute(
                 "SELECT COUNT(*) AS c FROM products" + where_sql, args
