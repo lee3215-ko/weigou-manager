@@ -10,6 +10,8 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from paths import data_path
+
 DEFAULT_MALL_API = "https://shoot-repl.vercel.app/api/catalog"
 DEFAULT_STYLES_API = "https://shoot-repl.vercel.app/api/styles"
 DEFAULT_ORDERS_API = "https://shoot-repl.vercel.app/api/orders"
@@ -17,7 +19,8 @@ DEFAULT_CUSTOMERS_API = "https://shoot-repl.vercel.app/api/customers"
 
 
 def _settings_path() -> pathlib.Path:
-    return pathlib.Path(__file__).resolve().parent / "data" / "mall_cloud.json"
+    """Always next to the exe: WeigouManager/data/mall_cloud.json (not _internal)."""
+    return pathlib.Path(data_path("mall_cloud.json"))
 
 
 def load_cloud_settings() -> dict[str, Any]:

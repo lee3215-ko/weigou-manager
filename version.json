@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.3",
+    "version":  "1.0.4",
     "url":  "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
-    "notes":  "Fix: ModuleNotFoundError paths; A/B role, on-demand images, pagination"
+    "notes":  "Fix mall_cloud.json path for frozen exe (B PC sync)"
 }
