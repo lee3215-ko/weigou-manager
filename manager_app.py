@@ -3067,17 +3067,25 @@ class ManagerApp(tk.Tk):
 
     def _thumb(self, path: str, size: tuple[int, int] = (180, 180)) -> tk.PhotoImage | None:
         p = pathlib.Path(path)
-        if not p.exists():
+        if not p.is_file():
             return None
         if Image is None or ImageTk is None:
             return None
         try:
-            # Fast preview: do NOT im.load() full originals (that made A feel stuck).
-            im = Image.open(p)
-            if im.mode not in ("RGB", "RGBA"):
-                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
-            im.thumbnail(size, Image.Resampling.BILINEAR)
-            photo = ImageTk.PhotoImage(im)
+            with Image.open(p) as src:
+                # Always flatten to RGB — some Tk builds reject RGBA/P/CMYK.
+                im = src.convert("RGB")
+                im.thumbnail(size, Image.Resampling.BILINEAR)
+                # Copy so file handle can close before PhotoImage holds pixels.
+                im = im.copy()
+            try:
+                photo = ImageTk.PhotoImage(im)
+            except Exception:
+                # Last resort: re-encode as PNG bytes (fixes odd JPEG/Tk combos)
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                buf.seek(0)
+                photo = ImageTk.PhotoImage(Image.open(buf))
             self._photo_cache.append(photo)
             return photo
         except Exception:
@@ -3328,13 +3336,19 @@ class ManagerApp(tk.Tk):
         *,
         cover_only: bool = False,
         urls: list[str] | None = None,
+        product_id: int | None = None,
     ) -> None:
         """Load thumbnails asynchronously so list selection stays instant.
 
-        Only existing local files are used. Stale paths (common on B after sync
-        / cache prune) fall through to URL preview instead of showing filenames.
+        Prefer local files (including healed paths). URL preview is only a
+        fallback when nothing readable exists on disk.
         """
-        existing = [p for p in (paths or []) if p and pathlib.Path(p).exists()]
+        existing = [p for p in (paths or []) if p and pathlib.Path(p).is_file()]
+        if not existing and product_id is not None:
+            try:
+                existing = self.store.resolve_local_images(product_id)
+            except Exception:
+                existing = []
         if not existing:
             if urls:
                 self._schedule_url_thumbs(list(urls)[:9], gen)
@@ -3364,10 +3378,9 @@ class ManagerApp(tk.Tk):
                     lbl = tk.Label(cell, image=photo, bg="#fffdf9")
                     lbl.pack()
                 else:
-                    # Never block UI with sync URL fetch — show placeholder only.
                     lbl = tk.Label(
                         cell,
-                        text="로드 실패",
+                        text="열기 실패",
                         bg="#fffdf9",
                         fg="#888",
                         font=("Consolas", 8),
@@ -3430,7 +3443,9 @@ class ManagerApp(tk.Tk):
                     self.store.rewrite_product_image_paths(p.id, paths)
                 except Exception:
                     pass
-            self._schedule_thumbs(paths, gen, urls=list(p.image_urls or []))
+            self._schedule_thumbs(
+                paths, gen, urls=list(p.image_urls or []), product_id=p.id
+            )
         finally:
             self._end_form_load()
 

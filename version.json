@@ -1,5 +1,5 @@
 ﻿{
-    "version":  "1.0.11",
+    "version":  "1.0.12",
     "url":  "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
-    "notes":  "List: busy tags+colors for search/publish; filter checkbox 검색완료만"
+    "notes":  "Fix A load-fail: heal legacy image paths, robust RGB thumbs, prefer local over URL"
 }

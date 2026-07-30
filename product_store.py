@@ -1999,6 +1999,36 @@ class ProductStore:
         raw = list(paths if paths is not None else (p.image_paths if p else []))
         cover = (cover_path or (p.cover_path if p else "") or "").strip()
         folder = self.img_root / str(product_id)
+        legacy = (
+            pathlib.Path.home()
+            / "Documents"
+            / "WeigouManager"
+            / "images"
+            / str(product_id)
+        )
+        candidate_dirs = [folder]
+        try:
+            if legacy.exists() and legacy.resolve() != folder.resolve():
+                candidate_dirs.append(legacy)
+        except OSError:
+            if legacy.exists():
+                candidate_dirs.append(legacy)
+
+        def list_dir_images(d: pathlib.Path) -> list[str]:
+            if not d.is_dir():
+                return []
+            exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+            out: list[str] = []
+            try:
+                for f in sorted(d.iterdir()):
+                    if f.is_file() and f.suffix.lower() in exts:
+                        try:
+                            out.append(str(f.resolve()))
+                        except OSError:
+                            out.append(str(f))
+            except OSError:
+                return []
+            return out
 
         def resolve_one(path: str) -> str | None:
             s = (path or "").strip()
@@ -2012,12 +2042,13 @@ class ProductStore:
                 pass
             name = cand.name
             if name:
-                alt = folder / name
-                try:
-                    if alt.is_file():
-                        return str(alt.resolve())
-                except OSError:
-                    pass
+                for d in candidate_dirs:
+                    alt = d / name
+                    try:
+                        if alt.is_file():
+                            return str(alt.resolve())
+                    except OSError:
+                        pass
             # relative to catalog root
             alt2 = self.root / s
             try:
@@ -2036,14 +2067,12 @@ class ProductStore:
             hit = resolve_one(cover)
             if hit:
                 out.append(hit)
-        if not out and folder.is_dir():
-            exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
-            for f in sorted(folder.iterdir()):
-                if f.is_file() and f.suffix.lower() in exts:
-                    try:
-                        out.append(str(f.resolve()))
-                    except OSError:
-                        out.append(str(f))
+        if not out:
+            for d in candidate_dirs:
+                found = list_dir_images(d)
+                if found:
+                    out = found
+                    break
         return out
 
     def rewrite_product_image_paths(self, product_id: int, paths: list[str]) -> None:
