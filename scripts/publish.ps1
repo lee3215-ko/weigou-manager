@@ -71,16 +71,18 @@ function Write-VersionJson($cfg, [string]$Version, [string]$ReleaseNotes) {
     $downloadUrlVersioned = "https://github.com/$owner/$repo/releases/download/$tag/$asset"
     $assetId = $null
     try {
-        $assetId = gh api "repos/$owner/$repo/releases/tags/$tag" --jq ".assets[] | select(.name==`"$asset`") | .id" 2>$null
+        # Prefer matching asset name; fall back to first asset id.
+        $raw = gh api "repos/$owner/$repo/releases/tags/$tag" 2>$null | ConvertFrom-Json
+        if ($raw -and $raw.assets) {
+            $match = @($raw.assets | Where-Object { $_.name -eq $asset } | Select-Object -First 1)
+            if ($match.Count -gt 0 -and $match[0].id) {
+                $assetId = [string]$match[0].id
+            } elseif ($raw.assets[0].id) {
+                $assetId = [string]$raw.assets[0].id
+            }
+        }
     } catch {
         $assetId = $null
-    }
-    if (-not $assetId) {
-        try {
-            $assetId = gh api "repos/$owner/$repo/releases/latest" --jq ".assets[] | select(.name==`"$asset`") | .id" 2>$null
-        } catch {
-            $assetId = $null
-        }
     }
     $apiDownloadUrl = $null
     if ($assetId) {
