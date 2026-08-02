@@ -166,6 +166,11 @@ class ProductStore:
         self.excluded_img_root.mkdir(parents=True, exist_ok=True)
         self.published_img_root.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        # Heal leftovers from older builds that archived without tombstones.
+        try:
+            self.purge_products_already_published()
+        except Exception:
+            pass
 
     def _connect(self) -> sqlite3.Connection:
         """Per-call connection; WAL + busy_timeout allow collect/publish/search together."""
@@ -491,6 +496,24 @@ class ProductStore:
                 "DELETE FROM sync_tombstones WHERE kind=? AND sync_key=?", (k, key)
             )
 
+    def _product_sync_keys(
+        self,
+        *,
+        goods_id: str = "",
+        search_code: str = "",
+        fallback_id: int | None = None,
+    ) -> list[str]:
+        keys: list[str] = []
+        gid = (goods_id or "").strip()
+        code = (search_code or "").strip()
+        if gid:
+            keys.append(gid)
+        if code and code not in keys:
+            keys.append(code)
+        if not keys and fallback_id is not None:
+            keys.append(f"id:{fallback_id}")
+        return keys
+
     def delete(self, product_id: int) -> None:
         p = self.get(product_id)
         if not p:
@@ -500,8 +523,59 @@ class ProductStore:
             shutil.rmtree(folder, ignore_errors=True)
         with self._connect() as con:
             con.execute("DELETE FROM products WHERE id=?", (product_id,))
-        key = p.goods_id or p.search_code or f"id:{product_id}"
-        self.record_tombstone("product", key)
+        for key in self._product_sync_keys(
+            goods_id=p.goods_id, search_code=p.search_code, fallback_id=product_id
+        ):
+            self.record_tombstone("product", key)
+
+    def purge_products_already_published(self) -> int:
+        """Remove catalog rows that already exist in published (same goods_id/search_code)."""
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT p.id FROM products p
+                WHERE
+                  (trim(COALESCE(p.goods_id, '')) != '' AND EXISTS (
+                      SELECT 1 FROM published pub
+                      WHERE trim(pub.goods_id) != '' AND pub.goods_id = p.goods_id
+                  ))
+                  OR
+                  (trim(COALESCE(p.search_code, '')) != '' AND EXISTS (
+                      SELECT 1 FROM published pub
+                      WHERE trim(pub.search_code) != '' AND pub.search_code = p.search_code
+                  ))
+                """
+            ).fetchall()
+        removed = 0
+        for row in rows:
+            self.delete(int(row["id"]))
+            removed += 1
+        return removed
+
+    def _purge_products_matching(self, goods_id: str = "", search_code: str = "") -> int:
+        gid = (goods_id or "").strip()
+        code = (search_code or "").strip()
+        if not gid and not code:
+            return 0
+        ids: list[int] = []
+        with self._connect() as con:
+            if gid:
+                for row in con.execute(
+                    "SELECT id FROM products WHERE goods_id=?", (gid,)
+                ).fetchall():
+                    ids.append(int(row["id"]))
+            if code:
+                for row in con.execute(
+                    "SELECT id FROM products WHERE search_code=?", (code,)
+                ).fetchall():
+                    pid = int(row["id"])
+                    if pid not in ids:
+                        ids.append(pid)
+        removed = 0
+        for pid in ids:
+            self.delete(pid)
+            removed += 1
+        return removed
 
     def _row_to_excluded(self, row: sqlite3.Row) -> ExcludedItem:
         return ExcludedItem(
@@ -1044,6 +1118,17 @@ class ProductStore:
             )
             # Remove catalog row only (images already moved)
             con.execute("DELETE FROM products WHERE id=?", (product_id,))
+        # Tell other devices to drop this catalog row (archive used to skip this).
+        for key in self._product_sync_keys(
+            goods_id=p.goods_id, search_code=p.search_code, fallback_id=product_id
+        ):
+            self.record_tombstone("product", key)
+        if p.goods_id:
+            self.clear_tombstone("published", p.goods_id)
+        if p.search_code:
+            self.clear_tombstone("published", p.search_code)
+        if mall_id:
+            self.clear_tombstone("published", mall_id)
         return pid
 
     def unpublish(self, published_id: int) -> int | None:
@@ -1128,8 +1213,19 @@ class ProductStore:
                 ),
             )
             con.execute("DELETE FROM published WHERE id=?", (published_id,))
-        key = item.goods_id or item.search_code or f"id:{published_id}"
-        self.record_tombstone("published", key)
+        for key in self._product_sync_keys(
+            goods_id=item.goods_id,
+            search_code=item.search_code,
+            fallback_id=published_id,
+        ):
+            self.record_tombstone("published", key)
+        if item.mall_id:
+            self.record_tombstone("published", item.mall_id)
+        # Restored into catalog — allow product sync again.
+        if item.goods_id:
+            self.clear_tombstone("product", item.goods_id)
+        if item.search_code:
+            self.clear_tombstone("product", item.search_code)
 
         # leftover single cover file (legacy archives)
         if item.cover_path:
@@ -1767,6 +1863,10 @@ class ProductStore:
             code = (row.get("search_code") or "").strip()
             if not gid and not code and not (row.get("title") or "").strip():
                 continue
+            # Already on homepage / 등록 목록 — never keep a duplicate in 상품.
+            if self.is_published(goods_id=gid, search_code=code):
+                self._purge_products_matching(gid, code)
+                continue
             remote_u = self._ts(str(row.get("updated_at") or ""))
             pid = self._lookup_product_id(gid, code)
             urls = row.get("image_urls") or []
@@ -1932,6 +2032,8 @@ class ProductStore:
                         ),
                     )
                     stats["published"] += 1
+            # Published wins over catalog — drop any matching 상품 rows.
+            self._purge_products_matching(gid, code)
             if mall:
                 self.clear_tombstone("published", mall)
             if gid:
