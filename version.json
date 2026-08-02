@@ -1,5 +1,10 @@
-﻿{
-    "version":  "1.0.12",
-    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip",
-    "notes":  "Fix A load-fail: heal legacy image paths, robust RGB thumbs, prefer local over URL"
+{
+    "version":  "1.0.13",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.13/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.13/WeigouManager.zip",
+    "notes":  "Fix auto-update restart: correct WeigouManager.zip asset, UTF-8 BOM PS1, kill leftover processes, robocopy+restart, version.json asset_id/download_urls",
+    "download_urls":  [
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.13/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
+                      ]
 }

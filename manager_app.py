@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime as dt
 import io
+import json
 import os
 import pathlib
 import queue
@@ -52,6 +53,7 @@ from mall_cloud import (
     mall_customers_api,
     mall_orders_api,
     mall_product_page_url,
+    mall_site_base,
     patch_member_points,
     patch_order,
 )
@@ -75,7 +77,9 @@ from paths import (
     APP_NAME,
     APP_VERSION,
     EXE_NAME,
+    RELEASE_ASSET,
     UPDATE_VERSION_URL,
+    data_path,
     init_runtime_paths,
 )
 from price_codec import DEFAULT_PRICE_TEXT, effective_price_code
@@ -93,6 +97,7 @@ from product_store import (
 from style_publish import publish_style_look
 from update_ui import schedule_update_check
 from url_thumbs import fetch_thumb_file, prune_thumb_cache
+from desktop_notify import alert as desktop_alert
 
 init_runtime_paths()
 
@@ -248,6 +253,12 @@ class ManagerApp(tk.Tk):
         self.customer_query = tk.StringVar()
         self.customer_kind = tk.StringVar(value="all")
         self.customer_points_var = tk.StringVar(value="0")
+        # 신규 주문/고객 알림 (소리 + 작업표시줄 풍선)
+        self._watch_order_ids: set[str] | None = None
+        self._watch_customer_keys: set[str] | None = None
+        self._mall_watch_after: str | None = None
+        self._mall_watch_interval_ms = 45_000
+        self._load_mall_watch_seen()
         # 목록 새로고침 시에도 유지할 선택(상품/등록/제외 id)
         self._sticky_selected_ids: list[int] = []
         # 목록 페이지네이션 (대용량 카탈로그에서도 목록 로딩이 느려지지 않도록)
@@ -288,6 +299,7 @@ class ManagerApp(tk.Tk):
         threading.Thread(target=self._status_loop, daemon=True).start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(1200, self._sync.start)
+        self.after(4000, self._start_mall_watch)
         self.after(
             1800,
             lambda: schedule_update_check(
@@ -297,6 +309,7 @@ class ManagerApp(tk.Tk):
                 app_name=APP_NAME,
                 exe_name=EXE_NAME,
                 zip_inner_folder=APP_NAME,
+                release_asset=RELEASE_ASSET,
                 log_callback=lambda m: self._put_log(m, channel=LOG_COLLECT),
             ),
         )
@@ -365,6 +378,17 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         ).pack(side="right")
+        tk.Button(
+            head,
+            text="관리자페이지 바로가기",
+            command=self._open_admin_page,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#c45c26",
+            fg="white",
+            activebackground="#a34a1d",
+            relief="flat",
+            padx=10,
+        ).pack(side="right", padx=(0, 8))
 
         body = tk.Frame(parent, bg="#f3efe8")
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -476,6 +500,14 @@ class ManagerApp(tk.Tk):
             self.orders_api_hint.configure(text=f"API: {mall_orders_api()}")
         except Exception:
             pass
+
+    def _open_admin_page(self) -> None:
+        url = f"{mall_site_base().rstrip('/')}/admin"
+        try:
+            webbrowser.open(url)
+            self._append(f"관리자페이지 열기: {url}", channel=LOG_MALL)
+        except Exception as e:
+            messagebox.showerror("관리자페이지", str(e) or "브라우저를 열 수 없습니다.")
 
     def refresh_orders(self) -> None:
         def work() -> None:
@@ -713,6 +745,17 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         ).pack(side="right")
+        tk.Button(
+            head,
+            text="관리자페이지 바로가기",
+            command=self._open_admin_page,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#c45c26",
+            fg="white",
+            activebackground="#a34a1d",
+            relief="flat",
+            padx=10,
+        ).pack(side="right", padx=(0, 8))
 
         filt = tk.Frame(parent, bg="#f3efe8")
         filt.pack(fill="x", padx=12, pady=(0, 6))
@@ -1765,11 +1808,197 @@ class ManagerApp(tk.Tk):
 
     def _on_close(self) -> None:
         self._stop.set()
+        if self._mall_watch_after is not None:
+            try:
+                self.after_cancel(self._mall_watch_after)
+            except Exception:
+                pass
+            self._mall_watch_after = None
         try:
             self._sync.stop()
         except Exception:
             pass
         self.destroy()
+
+    def _mall_watch_seen_path(self) -> pathlib.Path:
+        return pathlib.Path(data_path("mall_watch_seen.json"))
+
+    def _load_mall_watch_seen(self) -> None:
+        path = self._mall_watch_seen_path()
+        try:
+            if not path.is_file():
+                return
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            orders = raw.get("orders") or []
+            customers = raw.get("customers") or []
+            if isinstance(orders, list) and orders:
+                self._watch_order_ids = {str(x) for x in orders if str(x).strip()}
+            if isinstance(customers, list) and customers:
+                self._watch_customer_keys = {
+                    str(x) for x in customers if str(x).strip()
+                }
+        except Exception:
+            pass
+
+    def _save_mall_watch_seen(self) -> None:
+        try:
+            payload = {
+                "orders": sorted(self._watch_order_ids or []),
+                "customers": sorted(self._watch_customer_keys or []),
+                "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            }
+            self._mall_watch_seen_path().write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _start_mall_watch(self) -> None:
+        """Background poll for new homepage orders / customers."""
+        if self._stop.is_set():
+            return
+        self._mall_watch_tick()
+
+    def _mall_watch_tick(self) -> None:
+        if self._stop.is_set():
+            return
+        threading.Thread(target=self._mall_watch_work, daemon=True).start()
+        try:
+            self._mall_watch_after = self.after(
+                self._mall_watch_interval_ms, self._mall_watch_tick
+            )
+        except Exception:
+            self._mall_watch_after = None
+
+    def _mall_watch_work(self) -> None:
+        orders: list | None = None
+        customers: list | None = None
+        try:
+            orders = fetch_orders()
+        except Exception:
+            pass
+        try:
+            customers = fetch_customers()
+        except Exception:
+            pass
+        if self._stop.is_set():
+            return
+        self.after(0, lambda: self._mall_watch_apply(orders, customers))
+
+    def _mall_watch_apply(
+        self, orders: list | None, customers: list | None
+    ) -> None:
+        if self._stop.is_set():
+            return
+        changed_seen = False
+
+        if orders is not None:
+            order_ids = {
+                str(o.get("id") or "").strip()
+                for o in orders
+                if isinstance(o, dict) and str(o.get("id") or "").strip()
+            }
+            if self._watch_order_ids is None:
+                self._watch_order_ids = set(order_ids)
+                changed_seen = True
+            else:
+                new_order_ids = order_ids - self._watch_order_ids
+                if new_order_ids:
+                    self._watch_order_ids |= order_ids
+                    changed_seen = True
+                    samples = []
+                    for o in orders:
+                        if not isinstance(o, dict):
+                            continue
+                        oid = str(o.get("id") or "").strip()
+                        if oid not in new_order_ids:
+                            continue
+                        name = str(
+                            o.get("customerName") or o.get("name") or ""
+                        ).strip()
+                        code = product_no(o) or str(o.get("productId") or "")
+                        samples.append(f"{name or '고객'} · {code or oid}")
+                        if len(samples) >= 3:
+                            break
+                    body = f"새 주문 {len(new_order_ids)}건"
+                    if samples:
+                        body += "\n" + "\n".join(samples)
+                    desktop_alert("새 주문", body)
+                    self._put_log(
+                        f"[알림] 새 주문 {len(new_order_ids)}건", channel=LOG_MALL
+                    )
+                    try:
+                        self.deiconify()
+                        self.lift()
+                    except Exception:
+                        pass
+                else:
+                    self._watch_order_ids |= order_ids
+
+        if customers is not None:
+            customer_keys = {
+                str(c.get("key") or "").strip()
+                for c in customers
+                if isinstance(c, dict) and str(c.get("key") or "").strip()
+            }
+            if self._watch_customer_keys is None:
+                self._watch_customer_keys = set(customer_keys)
+                changed_seen = True
+            else:
+                new_customer_keys = customer_keys - self._watch_customer_keys
+                if new_customer_keys:
+                    self._watch_customer_keys |= customer_keys
+                    changed_seen = True
+                    samples = []
+                    for c in customers:
+                        if not isinstance(c, dict):
+                            continue
+                        key = str(c.get("key") or "").strip()
+                        if key not in new_customer_keys:
+                            continue
+                        kind = "회원" if c.get("kind") == "member" else "비회원"
+                        name = str(c.get("name") or "").strip() or "(이름 없음)"
+                        phone = str(c.get("phone") or "").strip()
+                        samples.append(
+                            f"{kind} {name}" + (f" · {phone}" if phone else "")
+                        )
+                        if len(samples) >= 3:
+                            break
+                    body = f"새 고객 {len(new_customer_keys)}명"
+                    if samples:
+                        body += "\n" + "\n".join(samples)
+                    desktop_alert("새 고객", body)
+                    self._put_log(
+                        f"[알림] 새 고객 {len(new_customer_keys)}명",
+                        channel=LOG_MALL,
+                    )
+                    try:
+                        self.deiconify()
+                        self.lift()
+                    except Exception:
+                        pass
+                else:
+                    self._watch_customer_keys |= customer_keys
+
+        if changed_seen:
+            self._save_mall_watch_seen()
+        self._mall_watch_refresh_ui(orders, customers)
+
+    def _mall_watch_refresh_ui(
+        self, orders: list | None, customers: list | None
+    ) -> None:
+        """If user is on orders/customers tab, refresh list without status flicker."""
+        try:
+            tab = self.main_nb.index(self.main_nb.select())
+        except Exception:
+            return
+        if tab == 1 and orders is not None:
+            self._apply_orders(list(orders), "")
+        elif tab == 2 and customers is not None:
+            self._apply_customers(list(customers), "")
 
     def _mark_catalog_dirty(self) -> None:
         try:

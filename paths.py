@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """App paths / version for Weigou Manager (exe + auto-update)."""
 from __future__ import annotations
 
@@ -8,11 +8,12 @@ import sys
 
 APP_NAME = "WeigouManager"
 APP_DISPLAY_NAME = "Weigou Product Manager"
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
+EXE_NAME = "WeigouManager.exe"
+RELEASE_ASSET = "WeigouManager.zip"
 UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/lee3215-ko/weigou-manager/main/version.json"
 )
-EXE_NAME = "WeigouManager.exe"
 
 # Preserved across updates (robocopy /XD data)
 DATA_FILES = (

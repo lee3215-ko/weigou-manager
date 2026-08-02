@@ -10,6 +10,21 @@ $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 . (Join-Path $PSScriptRoot "gh-env.ps1")
 
+function Invoke-Git {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & git @GitArgs 2>&1 | Out-Null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    if ($code -ne 0) { throw "git failed: git @GitArgs" }
+}
+
+function Write-TextNoBom([string]$Path, [string]$Text) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($Path, $Text, $utf8NoBom)
+}
+
 function Read-DeployConfig {
     Get-Content (Join-Path $Root "deploy.json") -Raw | ConvertFrom-Json
 }
@@ -29,7 +44,7 @@ function Set-AppVersion($cfg, [string]$Version) {
     $text = Get-Content $path -Raw
     $var = [regex]::Escape($cfg.version.variable)
     $text = $text -replace "${var}\s*=\s*`"[^`"]+`"", "$($cfg.version.variable) = `"$Version`""
-    Set-Content -Path $path -Value $text -Encoding UTF8
+    Write-TextNoBom $path $text
 }
 
 function Bump-Version([string]$Version, [string]$Part) {
@@ -48,13 +63,47 @@ function Bump-Version([string]$Version, [string]$Part) {
 }
 
 function Write-VersionJson($cfg, [string]$Version, [string]$ReleaseNotes) {
-    $downloadUrl = "https://github.com/$($cfg.github_owner)/$($cfg.github_repo)/releases/latest/download/$($cfg.release_asset)"
+    $tag = "v$Version"
+    $owner = $cfg.github_owner
+    $repo = $cfg.github_repo
+    $asset = $cfg.release_asset
+    $downloadUrlLatest = "https://github.com/$owner/$repo/releases/latest/download/$asset"
+    $downloadUrlVersioned = "https://github.com/$owner/$repo/releases/download/$tag/$asset"
+    $assetId = $null
+    try {
+        $assetId = gh api "repos/$owner/$repo/releases/tags/$tag" --jq ".assets[] | select(.name==`"$asset`") | .id" 2>$null
+    } catch {
+        $assetId = $null
+    }
+    if (-not $assetId) {
+        try {
+            $assetId = gh api "repos/$owner/$repo/releases/latest" --jq ".assets[] | select(.name==`"$asset`") | .id" 2>$null
+        } catch {
+            $assetId = $null
+        }
+    }
+    $apiDownloadUrl = $null
+    if ($assetId) {
+        $apiDownloadUrl = "https://api.github.com/repos/$owner/$repo/releases/assets/$assetId"
+    }
     $payload = [ordered]@{
-        version = $Version
-        url     = $downloadUrl
-        notes   = $ReleaseNotes
-    } | ConvertTo-Json -Depth 3
-    Set-Content -Path (Join-Path $Root "version.json") -Value $payload -Encoding UTF8
+        version      = $Version
+        url          = if ($apiDownloadUrl) { $apiDownloadUrl } else { $downloadUrlVersioned }
+        download_url = $downloadUrlVersioned
+        notes        = $ReleaseNotes
+    }
+    if ($apiDownloadUrl) {
+        $payload.api_download_url = $apiDownloadUrl
+        $payload.asset_id = [int]$assetId
+    }
+    $payload.download_urls = @(
+        $(if ($apiDownloadUrl) { $apiDownloadUrl }),
+        $downloadUrlVersioned,
+        $downloadUrlLatest
+    ) | Where-Object { $_ }
+    $json = $payload | ConvertTo-Json -Depth 4
+    $path = Join-Path $Root "version.json"
+    Write-TextNoBom $path ($json + "`n")
 }
 
 function Ensure-GitRemote($cfg) {
@@ -127,20 +176,20 @@ foreach ($item in $cfg.git_add) {
     $addArgs += $item
 }
 if ($addArgs.Count -gt 0) {
-    git add @addArgs
+    Invoke-Git add @addArgs
 }
-git add deploy.json deploy.bat version.json scripts 2>$null
-git add -u
+Invoke-Git add deploy.json deploy.bat version.json scripts
+Invoke-Git add -u
 
 if (git status --porcelain) {
-    git commit -m "Release $newVersion"
+    Invoke-Git commit -m "Release $newVersion"
 }
 
-git push -u origin main
+Invoke-Git push -u origin main
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[git] pull --rebase then push..."
-    git pull origin main --rebase
-    git push -u origin main
+    Invoke-Git pull origin main --rebase
+    Invoke-Git push -u origin main
 }
 
 Write-Host "[4/4] GitHub Release..."
@@ -151,7 +200,16 @@ if (Test-GhRelease $tag) {
     Invoke-Gh release create $tag $zipPath --title $newVersion --notes $Notes --latest
 }
 
+# Rewrite version.json with asset_id / api download URLs after release exists
+Write-VersionJson $cfg $newVersion $Notes
+if (git status --porcelain version.json) {
+    Invoke-Git add version.json
+    Invoke-Git commit -m "Update version.json download URLs for $newVersion"
+    Invoke-Git push origin main
+}
+
 Write-Host ""
 Write-Host "Done!"
 Write-Host "  version: $newVersion"
 Write-Host "  https://github.com/$($cfg.github_owner)/$($cfg.github_repo)/releases/tag/$tag"
+Write-Host "  download: https://github.com/$($cfg.github_owner)/$($cfg.github_repo)/releases/latest/download/$($cfg.release_asset)"

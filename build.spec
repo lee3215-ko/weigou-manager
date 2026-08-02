@@ -38,6 +38,7 @@ hiddenimports = [
     "downloader",
     "image_enhance",
     "url_thumbs",
+    "desktop_notify",
 ]
 
 a = Analysis(

@@ -43,6 +43,7 @@
     "updater.py",
     "update_ui.py",
     "url_thumbs.py",
+    "desktop_notify.py",
     "requirements.txt",
     "build.bat",
     "build.spec",

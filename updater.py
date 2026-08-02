@@ -24,6 +24,10 @@ _RAW_GITHUB_RE = re.compile(
     r"^https://raw\.githubusercontent\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?P<branch>[^/]+)/(?P<path>.+)$"
 )
 
+# Default release zip for this app (never leave NaverReport leftovers).
+DEFAULT_RELEASE_ASSET = "WeigouManager.zip"
+DEFAULT_APP_SLUG = "WeigouManager"
+
 
 def _ca_bundle_path() -> str | None:
     if getattr(sys, "frozen", False):
@@ -36,6 +40,7 @@ def _ca_bundle_path() -> str | None:
                 return candidate
     try:
         import certifi
+
         return certifi.where()
     except ImportError:
         return None
@@ -138,7 +143,13 @@ def fetch_version_payload(version_url: str, user_agent: str) -> dict | None:
         return None
 
 
-def check_for_update(version_url: str, current_version: str, *, app_name: str = "App") -> UpdateInfo | None:
+def check_for_update(
+    version_url: str,
+    current_version: str,
+    *,
+    app_name: str = "App",
+    release_asset: str = DEFAULT_RELEASE_ASSET,
+) -> UpdateInfo | None:
     user_agent = f"{app_name}/{current_version}"
     payload = fetch_version_payload(version_url, user_agent)
     if payload is None:
@@ -150,6 +161,7 @@ def check_for_update(version_url: str, current_version: str, *, app_name: str = 
         payload,
         version_url=version_url,
         user_agent=user_agent,
+        asset_name=release_asset or DEFAULT_RELEASE_ASSET,
     )
     primary = download_urls[0] if download_urls else str(payload.get("url", "")).strip()
     return UpdateInfo(
@@ -170,8 +182,8 @@ def get_install_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def get_update_log_path() -> Path:
-    return Path(tempfile.gettempdir()) / "NaverReport_update.log"
+def get_update_log_path(app_slug: str = DEFAULT_APP_SLUG) -> Path:
+    return Path(tempfile.gettempdir()) / f"{app_slug}_update.log"
 
 
 ProgressCallback = Callable[[int, int], None]
@@ -208,6 +220,10 @@ def _versioned_release_url(owner: str, repo: str, version: str, asset: str) -> s
     )
 
 
+def _latest_release_url(owner: str, repo: str, asset: str) -> str:
+    return f"https://github.com/{owner}/{repo}/releases/latest/download/{asset}"
+
+
 def _github_api_asset_url(owner: str, repo: str, asset_id: int) -> str:
     return f"https://api.github.com/repos/{owner}/{repo}/releases/assets/{asset_id}"
 
@@ -238,7 +254,14 @@ def _fetch_release_asset_id(
             for asset in release.get("assets") or []:
                 if asset.get("name") == asset_name and asset.get("id"):
                     return int(asset["id"])
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, TypeError, KeyError):
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+            KeyError,
+        ):
             continue
     return None
 
@@ -260,11 +283,12 @@ def collect_download_urls(
     *,
     version_url: str = "",
     user_agent: str = "App",
-    asset_name: str = "NaverReport.zip",
+    asset_name: str = DEFAULT_RELEASE_ASSET,
 ) -> tuple[str, ...]:
     """다운로드 URL 후보. api.github.com 자산 URL을 우선해 github.com DNS 오류를 우회."""
     urls: list[str] = []
     version = str(payload.get("version", "")).strip()
+    asset = (asset_name or DEFAULT_RELEASE_ASSET).strip()
 
     for key in ("url", "download_url", "api_download_url"):
         value = str(payload.get(key, "")).strip()
@@ -284,10 +308,11 @@ def collect_download_urls(
         except (TypeError, ValueError):
             asset_id = None
         if asset_id is None:
-            asset_id = _fetch_release_asset_id(owner, repo, version, asset_name, user_agent)
+            asset_id = _fetch_release_asset_id(owner, repo, version, asset, user_agent)
         if asset_id is not None:
             urls.insert(0, _github_api_asset_url(owner, repo, asset_id))
-        urls.append(_versioned_release_url(owner, repo, version, asset_name))
+        urls.append(_versioned_release_url(owner, repo, version, asset))
+        urls.append(_latest_release_url(owner, repo, asset))
 
     return _dedupe_urls(urls)
 
@@ -295,7 +320,11 @@ def collect_download_urls(
 def format_network_error(exc: BaseException) -> str:
     message = str(exc).strip()
     lowered = message.lower()
-    if "getaddrinfo failed" in lowered or "11001" in message or "name or service not known" in lowered:
+    if (
+        "getaddrinfo failed" in lowered
+        or "11001" in message
+        or "name or service not known" in lowered
+    ):
         return (
             "인터넷 연결 또는 DNS 설정을 확인해 주세요.\n"
             "(GitHub 서버 주소를 찾지 못했습니다)\n\n"
@@ -383,58 +412,102 @@ def extract_zip_to_staging(zip_path: Path, staging_dir: Path) -> Path:
     return staging_dir
 
 
-def _write_update_script(script_path: Path) -> None:
+def _write_update_script(script_path: Path, *, app_slug: str) -> None:
+    # UTF-8 BOM required so PowerShell -File parses correctly on Korean Windows.
     script_path.write_text(
-        r"""param(
-    [string]$Staging,
-    [string]$Install,
-    [string]$Exe,
-    [string]$Inner,
-    [int]$WaitPid
+        rf"""param(
+    [Parameter(Mandatory=$true)][string]$Staging,
+    [Parameter(Mandatory=$true)][string]$Install,
+    [Parameter(Mandatory=$true)][string]$Exe,
+    [Parameter(Mandatory=$true)][string]$Inner,
+    [Parameter(Mandatory=$true)][int]$WaitPid
 )
 $ErrorActionPreference = "Continue"
-$Log = Join-Path $env:TEMP "NaverReport_update.log"
-function Write-Log([string]$Message) {
-    Add-Content -Path $Log -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
-}
+$Log = Join-Path $env:TEMP "{app_slug}_update.log"
+function Write-Log([string]$Message) {{
+    Add-Content -Path $Log -Value ("[{{0}}] {{1}}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
+}}
 
 Write-Log "update start (powershell)"
 Write-Log "Staging=$Staging"
 Write-Log "Install=$Install"
 Write-Log "Exe=$Exe"
+Write-Log "Inner=$Inner"
 Write-Log "WaitPid=$WaitPid"
 
+$exeName = [IO.Path]::GetFileName($Exe)
+$procName = [IO.Path]::GetFileNameWithoutExtension($Exe)
+
 $deadline = (Get-Date).AddSeconds(90)
-while ((Get-Date) -lt $deadline) {
-    if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) { break }
+while ((Get-Date) -lt $deadline) {{
+    if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) {{ break }}
     Start-Sleep -Seconds 1
-}
-if (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) {
+}}
+if (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) {{
     Write-Log "force stop pid $WaitPid"
     Stop-Process -Id $WaitPid -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
-}
-Write-Log "process wait done"
+}}
+
+# Also stop any leftover app instances locking files
+Get-Process -Name $procName -ErrorAction SilentlyContinue | ForEach-Object {{
+    Write-Log ("stop leftover pid " + $_.Id)
+    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+}}
 Start-Sleep -Seconds 2
+Write-Log "process wait done"
 
 $src = Join-Path $Staging $Inner
-if (-not (Test-Path $src)) { $src = $Staging }
-Write-Log "robocopy $src -> $Install (data folder excluded)"
+if (-not (Test-Path -LiteralPath $src)) {{
+    Write-Log "inner folder missing, search for $exeName under staging"
+    $hit = Get-ChildItem -LiteralPath $Staging -Recurse -Filter $exeName -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($hit) {{
+        $src = $hit.Directory.FullName
+        Write-Log "found exe under $src"
+    }} else {{
+        $src = $Staging
+    }}
+}} elseif (-not (Test-Path -LiteralPath (Join-Path $src $exeName))) {{
+    $hit = Get-ChildItem -LiteralPath $Staging -Recurse -Filter $exeName -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($hit) {{
+        $src = $hit.Directory.FullName
+        Write-Log "relocated src to $src"
+    }}
+}}
 
-& robocopy $src $Install /E /IS /IT /XD data /R:8 /W:3 /NFL /NDL /NJH /NJS | Out-Null
-if ($LASTEXITCODE -ge 8) {
-    Write-Log "robocopy failed code $LASTEXITCODE"
+Write-Log "robocopy `"$src`" -> `"$Install`" (data excluded)"
+& robocopy $src $Install /E /IS /IT /XD data /R:10 /W:2 /NFL /NDL /NJH /NJS | Out-Null
+$rc = $LASTEXITCODE
+Write-Log "robocopy exit=$rc"
+if ($rc -ge 8) {{
+    Write-Log "robocopy failed code $rc — still attempting restart"
+}}
+
+Start-Sleep -Seconds 1
+$workDir = Split-Path -Parent $Exe
+if (-not (Test-Path -LiteralPath $Exe)) {{
+    $fallback = Join-Path $src $exeName
+    Write-Log "install exe missing, fallback=$fallback"
+    if (Test-Path -LiteralPath $fallback) {{
+        Start-Process -LiteralPath $fallback -WorkingDirectory (Split-Path -Parent $fallback)
+        Write-Log "started fallback exe"
+        Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+        exit 0
+    }}
+    Write-Log "FATAL: cannot find exe to restart"
     exit 1
-}
+}}
+
+Write-Log "starting $Exe (cwd=$workDir)"
+Start-Process -LiteralPath $Exe -WorkingDirectory $workDir
+Write-Log "update success"
 
 Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
-Write-Log "starting $Exe"
-Start-Process -FilePath $Exe
-Write-Log "update success"
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 exit 0
 """,
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
 
 
@@ -444,7 +517,7 @@ def schedule_apply_update(
     install_dir: Path | None = None,
     exe_name: str,
     zip_inner_folder: str | None = None,
-    app_slug: str = "app",
+    app_slug: str = DEFAULT_APP_SLUG,
 ) -> None:
     if not can_auto_update():
         raise RuntimeError("Auto-update works only in packaged exe builds.")
@@ -454,7 +527,8 @@ def schedule_apply_update(
     target_dir = install_dir or get_install_dir()
     inner = zip_inner_folder or target_dir.name
     exe_path = target_dir / exe_name
-    staging_dir = Path(tempfile.gettempdir()) / f"NaverReport_staging_{os.getpid()}"
+    slug = (app_slug or DEFAULT_APP_SLUG).strip() or DEFAULT_APP_SLUG
+    staging_dir = Path(tempfile.gettempdir()) / f"{slug}_staging_{os.getpid()}"
 
     try:
         extract_zip_to_staging(zip_path, staging_dir)
@@ -462,13 +536,27 @@ def schedule_apply_update(
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise RuntimeError(f"업데이트 zip 풀기 실패: {exc}") from exc
 
-    script_path = Path(tempfile.gettempdir()) / f"{app_slug}_update_{os.getpid()}.ps1"
-    _write_update_script(script_path)
+    # Verify extracted tree contains the exe (fail early with clear error)
+    exe_hits = list(staging_dir.rglob(exe_name))
+    if not exe_hits:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"업데이트 zip 안에 {exe_name} 이(가) 없습니다. 배포 zip 구조를 확인하세요."
+        )
 
+    script_path = Path(tempfile.gettempdir()) / f"{slug}_update_{os.getpid()}.ps1"
+    _write_update_script(script_path, app_slug=slug)
+
+    # Prefer Hidden window without CREATE_NO_WINDOW — some PCs drop the child otherwise.
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = 0
-    subprocess.Popen(
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        # Keep 0: WindowStyle Hidden is enough; CREATE_NO_WINDOW has caused silent no-restart.
+        creationflags = 0
+
+    proc = subprocess.Popen(
         [
             "powershell.exe",
             "-NoProfile",
@@ -478,16 +566,23 @@ def schedule_apply_update(
             "Hidden",
             "-File",
             str(script_path),
+            "-Staging",
             str(staging_dir),
+            "-Install",
             str(target_dir),
+            "-Exe",
             str(exe_path),
-            inner,
+            "-Inner",
+            str(inner),
+            "-WaitPid",
             str(os.getpid()),
         ],
         startupinfo=startupinfo,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        close_fds=True,
+        creationflags=creationflags,
+        close_fds=False,
     )
+    # Detach: parent will os._exit soon; child must keep running.
+    del proc
 
     try:
         zip_path.unlink(missing_ok=True)

@@ -12,6 +12,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 from updater import (
+    DEFAULT_RELEASE_ASSET,
     UpdateInfo,
     can_auto_update,
     check_for_update,
@@ -33,6 +34,7 @@ def schedule_update_check(
     exe_name: str,
     delay_ms: int = 2500,
     zip_inner_folder: str | None = None,
+    release_asset: str = DEFAULT_RELEASE_ASSET,
     log_callback=None,
 ) -> None:
     if not version_url.strip():
@@ -47,7 +49,12 @@ def schedule_update_check(
 
     def worker() -> None:
         try:
-            info = check_for_update(version_url, current_version, app_name=app_name)
+            info = check_for_update(
+                version_url,
+                current_version,
+                app_name=app_name,
+                release_asset=release_asset or DEFAULT_RELEASE_ASSET,
+            )
         except Exception as exc:
             root.after(0, lambda: log(f"[업데이트] 확인 오류: {exc}"))
             return
@@ -55,13 +62,25 @@ def schedule_update_check(
             root.after(
                 0,
                 lambda: _show_dialog(
-                    root, info, current_version, app_name, exe_name, zip_inner_folder, log,
+                    root,
+                    info,
+                    current_version,
+                    app_name,
+                    exe_name,
+                    zip_inner_folder,
+                    release_asset,
+                    log,
                 ),
             )
         else:
             payload = fetch_version_payload(version_url, f"{app_name}/{current_version}")
             if payload is None:
-                root.after(0, lambda: log("[업데이트] version.json 조회 실패 (네트워크 또는 GitHub 접근 확인)"))
+                root.after(
+                    0,
+                    lambda: log(
+                        "[업데이트] version.json 조회 실패 (네트워크 또는 GitHub 접근 확인)"
+                    ),
+                )
 
     root.after(delay_ms, lambda: threading.Thread(target=worker, daemon=True).start())
 
@@ -73,6 +92,7 @@ def _show_dialog(
     app_name: str,
     exe_name: str,
     zip_inner_folder,
+    release_asset,
     log,
 ):
     try:
@@ -91,7 +111,9 @@ def _show_dialog(
         message += "\n\n「예」= 자동 업데이트 후 재실행\n「아니오」= 브라우저에서 받기"
         choice = messagebox.askyesnocancel("업데이트", message, parent=root)
         if choice is True:
-            _auto_update(root, info, app_name, exe_name, zip_inner_folder, log)
+            _auto_update(
+                root, info, app_name, exe_name, zip_inner_folder, release_asset, log
+            )
         elif choice is False:
             webbrowser.open(info.url)
         return
@@ -101,7 +123,9 @@ def _show_dialog(
         webbrowser.open(info.url)
 
 
-def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner_folder, log):
+def _auto_update(
+    root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner_folder, release_asset, log
+):
     dialog = __import__("tkinter").Toplevel(root)
     dialog.title("업데이트 중")
     dialog.geometry("380x110")
@@ -125,7 +149,7 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
 
     def worker() -> None:
         zip_path = Path(tempfile.gettempdir()) / f"{app_name}-{info.version}.zip"
-        log_path = get_update_log_path()
+        log_path = get_update_log_path(app_name)
         try:
             log(f"[업데이트] 다운로드 시작: {info.version}")
             urls = list(info.download_urls) if info.download_urls else [info.url]
@@ -136,7 +160,10 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
                 on_progress=on_progress,
             )
             validate_zip_file(zip_path, min_bytes=1024 * 1024)
-            log(f"[업데이트] 다운로드 완료 ({zip_path.stat().st_size // 1024 // 1024} MB) via {used_url}")
+            log(
+                f"[업데이트] 다운로드 완료 "
+                f"({zip_path.stat().st_size // 1024 // 1024} MB) via {used_url}"
+            )
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             detail = format_network_error(exc)
             root.after(0, dialog.destroy)
@@ -169,7 +196,8 @@ def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner
                 return
 
             dialog.destroy()
-            time.sleep(1.5)
+            # Give PowerShell a moment to attach before this process dies
+            time.sleep(2.0)
             os._exit(0)
 
         root.after(0, finish)
