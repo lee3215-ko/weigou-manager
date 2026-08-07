@@ -6,6 +6,7 @@ import json
 import pathlib
 import re
 import shutil
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
 
@@ -270,17 +271,47 @@ def _upsert_catalog_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _catalog_api_base() -> str:
+    return mall_catalog_api() if cloud_enabled() else MALL_API
+
+
+def _api_url(extra_query: str) -> str:
+    base = _catalog_api_base().rstrip("/")
+    extra = (extra_query or "").lstrip("?&")
+    if not extra:
+        return base
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}{extra}"
+
+
 def _fetch_live_catalog() -> list[dict[str, Any]]:
-    """Prefer remote catalog when cloud is on; fall back to local JSON."""
-    api = mall_catalog_api() if cloud_enabled() else MALL_API
+    """Full remote catalog (all=1). Paginated GET is NOT enough for recommend/delete."""
     try:
-        data = get_json(api, timeout=90)
+        data = get_json(_api_url("all=1"), timeout=180)
         products = data.get("products")
         if isinstance(products, list) and products:
             return [p for p in products if isinstance(p, dict)]
     except Exception:
         pass
     return _load_catalog()
+
+
+def _fetch_product_by_id(mall_id: str) -> dict[str, Any] | None:
+    """Fetch one homepage product by id (reliable; ignores pagination)."""
+    mid = (mall_id or "").strip()
+    if not mid:
+        return None
+    try:
+        data = get_json(_api_url(f"id={urllib.parse.quote(mid)}"), timeout=60)
+        product = data.get("product")
+        if isinstance(product, dict) and product.get("id"):
+            return dict(product)
+    except Exception:
+        pass
+    for row in _load_catalog():
+        if str(row.get("id") or "").strip() == mid:
+            return dict(row)
+    return None
 
 
 def resolve_mall_id(
@@ -293,13 +324,39 @@ def resolve_mall_id(
     """Resolve homepage product id. Prefer stored mall_id, else match by 搜索码/goods."""
     mid = (mall_id or "").strip()
     if mid:
-        return mid
+        # Verify it still exists on homepage when possible
+        hit = _fetch_product_by_id(mid)
+        if hit:
+            return mid
+        # Stale mall_id — fall through to code match
     code = (search_code or "").strip()
     gid = (goods_id or "").strip()
     if not code and not gid:
-        return ""
-    rows = catalog if catalog is not None else _fetch_live_catalog()
-    for row in rows:
+        return mid  # keep stale id for caller messaging
+    # Prefer codes= lookup (cheap) over full dump
+    if code:
+        try:
+            data = get_json(
+                _api_url(f"codes={urllib.parse.quote(code)}"), timeout=60
+            )
+            products = data.get("products") or []
+            if isinstance(products, list):
+                for row in products:
+                    if not isinstance(row, dict):
+                        continue
+                    rid = str(row.get("id") or "").strip()
+                    sku = str(row.get("skuNo") or row.get("searchCode") or "").strip()
+                    if rid and sku == code:
+                        return rid
+                    if rid and rid == code:
+                        return rid
+        except Exception:
+            pass
+    rows = catalog if catalog is not None else None
+    if rows is None and (code or gid):
+        # Last resort: do not pull all=1 here (slow); local mirror only
+        rows = _load_catalog()
+    for row in rows or []:
         if not isinstance(row, dict):
             continue
         rid = str(row.get("id") or "").strip()
@@ -308,10 +365,12 @@ def resolve_mall_id(
         sku = str(row.get("skuNo") or row.get("searchCode") or "").strip()
         if code and sku and sku == code:
             return rid
-        remote_gid = str(row.get("goodsId") or row.get("goods_id") or "").strip()
+        remote_gid = str(
+            row.get("weigouId") or row.get("goodsId") or row.get("goods_id") or ""
+        ).strip()
         if gid and remote_gid and remote_gid == gid:
             return rid
-    return ""
+    return mid if mid else ""
 
 
 def delete_mall_products(
@@ -387,27 +446,29 @@ def set_products_recommended(
     recommended: bool = True,
     push_api: bool = True,
 ) -> dict[str, Any]:
-    """Mark existing mall products as homepage recommended (or clear)."""
+    """Mark existing mall products as homepage recommended (or clear).
+
+    Fetches each product by id (not the paginated list) so older items
+    still get the flag on the live homepage.
+    """
     ids = [str(x).strip() for x in mall_ids if str(x).strip()]
     if not ids:
         return {"updated": 0, "api": "none", "products": [], "missing": []}
 
-    catalog = _fetch_live_catalog()
-    by_id = {str(p.get("id")): dict(p) for p in catalog if p.get("id")}
     updated: list[dict[str, Any]] = []
     missing: list[str] = []
     now = datetime.now(timezone.utc).isoformat()
     for mid in ids:
-        row = by_id.get(mid)
+        row = _fetch_product_by_id(mid)
         if not row:
             missing.append(mid)
             continue
+        row = dict(row)
         row["recommended"] = bool(recommended)
         if recommended:
             row["recommendedAt"] = now
         else:
             row.pop("recommendedAt", None)
-        by_id[mid] = row
         updated.append(row)
 
     if updated:
@@ -415,6 +476,19 @@ def set_products_recommended(
     api_msg = _post_api_many(updated) if (push_api and updated) else "skipped"
     if push_api and updated and cloud_enabled() and _api_failed(api_msg):
         raise RuntimeError(f"추천 상품 API 반영 실패: {api_msg}")
+    # Verify at least one remote row actually has the flag (when cloud on)
+    if push_api and updated and cloud_enabled() and not _api_failed(api_msg):
+        still_bad: list[str] = []
+        for row in updated:
+            mid = str(row.get("id") or "")
+            check = _fetch_product_by_id(mid)
+            if not check or bool(check.get("recommended")) != bool(recommended):
+                still_bad.append(mid)
+        if still_bad:
+            raise RuntimeError(
+                "홈페이지에 추천 상태가 반영되지 않았습니다: "
+                + ", ".join(still_bad[:5])
+            )
     return {
         "updated": len(updated),
         "api": api_msg,
@@ -431,6 +505,7 @@ def publish_product(
     category: str | None = None,
     push_api: bool = True,
     mall_id: str | None = None,
+    recommended: bool | None = None,
 ) -> dict[str, Any]:
     item = build_mall_product(
         product,
@@ -439,6 +514,19 @@ def publish_product(
         category=category,
         mall_id=mall_id,
     )
+    if recommended is not None:
+        item["recommended"] = bool(recommended)
+        if recommended:
+            item["recommendedAt"] = datetime.now(timezone.utc).isoformat()
+        else:
+            item.pop("recommendedAt", None)
+    else:
+        # Preserve existing homepage recommended flag when re-publishing.
+        existing = _fetch_product_by_id(str(item.get("id") or ""))
+        if existing and existing.get("recommended"):
+            item["recommended"] = True
+            if existing.get("recommendedAt"):
+                item["recommendedAt"] = existing.get("recommendedAt")
     out = _upsert_catalog_items([item])
     api_msg = _post_api(item) if push_api else "skipped"
     if push_api and cloud_enabled() and _api_failed(api_msg):

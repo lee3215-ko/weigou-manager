@@ -171,6 +171,10 @@ class ProductStore:
             self.purge_products_already_published()
         except Exception:
             pass
+        try:
+            self.dedupe_published()
+        except Exception:
+            pass
 
     def _connect(self) -> sqlite3.Connection:
         """Per-call connection; WAL + busy_timeout allow collect/publish/search together."""
@@ -551,6 +555,67 @@ class ProductStore:
             self.delete(int(row["id"]))
             removed += 1
         return removed
+
+    def dedupe_published(self) -> int:
+        """Drop duplicate 등록 rows (same mall_id / goods_id / search_code). Keep newest."""
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT id, mall_id, goods_id, search_code, updated_at, created_at, recommended
+                FROM published
+                ORDER BY id DESC
+                """
+            ).fetchall()
+        keep: set[int] = set()
+        seen_mall: set[str] = set()
+        seen_gid: set[str] = set()
+        seen_code: set[str] = set()
+        drop: list[int] = []
+        # Prefer recommended + higher id (already DESC)
+        ordered = sorted(
+            rows,
+            key=lambda r: (
+                int(r["recommended"] or 0),
+                str(r["updated_at"] or r["created_at"] or ""),
+                int(r["id"]),
+            ),
+            reverse=True,
+        )
+        for r in ordered:
+            pid = int(r["id"])
+            mall = (r["mall_id"] or "").strip()
+            gid = (r["goods_id"] or "").strip()
+            code = (r["search_code"] or "").strip()
+            dup = False
+            if mall and mall in seen_mall:
+                dup = True
+            if gid and gid in seen_gid:
+                dup = True
+            if code and code in seen_code:
+                dup = True
+            if dup:
+                drop.append(pid)
+                continue
+            keep.add(pid)
+            if mall:
+                seen_mall.add(mall)
+            if gid:
+                seen_gid.add(gid)
+            if code:
+                seen_code.add(code)
+        for pid in drop:
+            item = self.get_published(pid)
+            with self._connect() as con:
+                con.execute("DELETE FROM published WHERE id=?", (pid,))
+            pack = self.published_img_root / f"p{pid}"
+            if pack.exists():
+                shutil.rmtree(pack, ignore_errors=True)
+            if item and item.cover_path:
+                try:
+                    pathlib.Path(item.cover_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return len(drop)
 
     def _purge_products_matching(self, goods_id: str = "", search_code: str = "") -> int:
         gid = (goods_id or "").strip()

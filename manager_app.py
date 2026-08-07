@@ -58,6 +58,7 @@ from mall_cloud import (
     patch_order,
 )
 from mall_publish import (
+    _api_failed,
     delete_mall_products,
     preview_price,
     publish_product,
@@ -4878,7 +4879,6 @@ class ManagerApp(tk.Tk):
 
         def work() -> None:
             try:
-                # First pass: set recommended for ids we already know.
                 known = [(it, mid) for it, mid in jobs if mid]
                 unknown = [it for it, mid in jobs if not mid]
                 mall_ids = [m for _, m in known]
@@ -4888,20 +4888,23 @@ class ManagerApp(tk.Tk):
                     "missing": [],
                     "products": [],
                 }
+                ok_malls: set[str] = set()
                 if mall_ids:
                     result = set_products_recommended(
                         mall_ids, recommended=want, push_api=True
                     )
+                    for p in result.get("products") or []:
+                        if isinstance(p, dict) and p.get("id"):
+                            ok_malls.add(str(p["id"]))
                 missing = list(result.get("missing") or [])
-                # Treat unresolved mall_id as missing too.
                 for it in unknown:
                     missing.append(f"(등록#{it.id})")
 
                 republished = 0
-                # Auto re-publish missing items onto homepage, then recommend.
+                # Missing on homepage → publish with recommended flag in one shot.
                 if want and (missing or unknown):
-                    need_items: list[PublishedItem] = []
                     miss_set = set(missing)
+                    need_items: list[PublishedItem] = []
                     for it, mid in jobs:
                         if not mid or mid in miss_set:
                             need_items.append(it)
@@ -4913,7 +4916,6 @@ class ManagerApp(tk.Tk):
                             colors = re_split_colors(fresh.colors)
                             sizes = self._split_csv(fresh.sizes)
                             category = fresh.category or None
-                            # Keep existing mall_id when known so we overwrite the same homepage row.
                             force_mid = (fresh.mall_id or "").strip() or None
                             if not force_mid:
                                 gid = (fresh.goods_id or "").strip()
@@ -4929,14 +4931,23 @@ class ManagerApp(tk.Tk):
                                 category=category,
                                 push_api=True,
                                 mall_id=force_mid,
+                                recommended=True,
                             )
                             new_mid = str((pub.get("product") or {}).get("id") or "")
-                            if new_mid:
-                                self.store.update_published(it.id, mall_id=new_mid)
-                                set_products_recommended(
+                            api_note = str(pub.get("api") or "")
+                            if new_mid and not _api_failed(api_note):
+                                # Confirm homepage flag
+                                confirm = set_products_recommended(
                                     [new_mid], recommended=True, push_api=True
                                 )
-                                self.store.update_published(it.id, recommended=True)
+                                if int(confirm.get("updated") or 0) < 1:
+                                    raise RuntimeError(
+                                        f"홈페이지 추천 확인 실패: {new_mid}"
+                                    )
+                                self.store.update_published(
+                                    it.id, mall_id=new_mid, recommended=True
+                                )
+                                ok_malls.add(new_mid)
                                 republished += 1
                                 if new_mid in missing:
                                     missing.remove(new_mid)
@@ -4944,22 +4955,29 @@ class ManagerApp(tk.Tk):
                                 if tag in missing:
                                     missing.remove(tag)
                                 result["updated"] = int(result.get("updated") or 0) + 1
+                                result["api"] = api_note
                                 self._put_log(
-                                    f"추천: 홈 재등록 후 추천 #{it.id} → {new_mid}",
+                                    f"추천: 홈 등록+추천 완료 #{it.id} → {new_mid}",
                                     channel=LOG_MALL,
                                 )
+                            else:
+                                raise RuntimeError(api_note or "API 실패")
                         except Exception as e:
                             self._put_log(
                                 f"추천 재등록 실패 등록#{it.id}: {e}",
                                 channel=LOG_MALL,
                             )
 
-                updated = int(result.get("updated") or 0)
+                updated = len(ok_malls) if ok_malls else int(result.get("updated") or 0)
+                # Local [추천] only when homepage actually accepted the flag.
                 for item, mall_id in known:
-                    if mall_id and mall_id in missing:
-                        continue
-                    if mall_id:
+                    if mall_id and mall_id in ok_malls:
                         self.store.update_published(item.id, recommended=want)
+                    elif mall_id and mall_id in missing:
+                        # Keep local honest if homepage reject
+                        if not want:
+                            continue
+                        # leave recommended as-is; do not fake success
 
                 def finish() -> None:
                     self._mark_catalog_dirty(push_now=True)
@@ -4981,7 +4999,7 @@ class ManagerApp(tk.Tk):
                         )
                         if len(still_missing) > 8:
                             msg += f"\n… 외 {len(still_missing) - 8}건"
-                    if updated == 0 and still_missing:
+                    if updated == 0:
                         messagebox.showerror("추천 실패", msg)
                     else:
                         messagebox.showinfo("추천 상품", msg)
