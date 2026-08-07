@@ -1,10 +1,13 @@
 {
     "version":  "1.0.17",
-    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.17/WeigouManager.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504915412",
     "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.17/WeigouManager.zip",
-    "notes":  "Fix recommend: fetch product by id (not paginated list); only mark local [추천] after homepage confirms; dedupe published list",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504915412",
+    "asset_id":  504915412,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504915412",
                           "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.17/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
-                      ]
+                      ],
+    "notes":  "Fix recommend: fetch product by id (not paginated list); only mark local [추천] after homepage confirms; dedupe published list"
 }
