@@ -83,7 +83,7 @@ from paths import (
     init_runtime_paths,
 )
 from price_codec import DEFAULT_PRICE_TEXT, effective_price_code
-from product_attrs import extract_attrs
+from product_attrs import extract_attrs, resolve_product_category
 from product_name import ko_name_to_en
 from product_parse import parse_products
 from product_store import (
@@ -279,8 +279,17 @@ class ManagerApp(tk.Tk):
         self._publish_prog: dict | None = None
         self._publish_next_id: int | None = None
         self._publish_yview: tuple[float, float] | None = None
-        self._search_active_id: int | None = None
+        # 이미지 검색 대기열 (진행 중 추가 검색)
+        self._search_q: queue.Queue = queue.Queue()
+        self._search_lock = threading.Lock()
+        self._search_total = 0
+        self._search_done = 0
+        self._search_ok = 0
+        self._search_fail = 0
+        self._search_lines: list[str] = []
         self._search_queued_ids: set[int] = set()
+        self._search_active_id: int | None = None
+        self._search_prog: dict | None = None
 
         self._sync = CatalogSyncService(
             self.store,
@@ -4168,6 +4177,79 @@ class ManagerApp(tk.Tk):
         state["set_total"] = ui_set_total
         return state
 
+    def _open_search_progress(self, total: int, *, action: str = "이미지 검색중") -> dict:
+        """Progress via log-tab gauge for image search (no popup window)."""
+        total = max(1, int(total))
+        self._set_channel_progress(
+            LOG_SEARCH,
+            done=0,
+            total=total,
+            action=action,
+            detail="준비 중…",
+        )
+
+        state = {
+            "total": total,
+            "done": 0,
+            "ok": 0,
+            "fail": 0,
+            "action": action,
+        }
+
+        def ui_line(msg: str) -> None:
+            self._put_log(msg, channel=LOG_SEARCH)
+
+        def ui_progress(done: int, current: str, ok: int = 0, fail: int = 0) -> None:
+            state["done"] = done
+            state["ok"] = ok
+            state["fail"] = fail
+            tot = max(1, int(state.get("total") or total))
+            self._set_channel_progress(
+                LOG_SEARCH,
+                done=done,
+                total=tot,
+                action=action,
+                detail=current,
+                ok=ok,
+                fail=fail,
+            )
+
+        def ui_counts(ok: int, fail: int) -> None:
+            state["ok"] = ok
+            state["fail"] = fail
+
+        def ui_finish(summary: str, ok: int, fail: int) -> None:
+            state["ok"] = ok
+            state["fail"] = fail
+            tot = max(1, int(state.get("total") or total))
+            self._finish_channel_progress(
+                LOG_SEARCH,
+                summary=summary,
+                done=tot,
+                total=tot,
+                ok=ok,
+                fail=fail,
+            )
+
+        def ui_set_total(new_total: int) -> None:
+            state["total"] = max(1, int(new_total))
+            self._set_channel_progress(
+                LOG_SEARCH,
+                done=int(state.get("done") or 0),
+                total=state["total"],
+                action=action,
+                detail=state.get("detail_msg") or "",
+                ok=int(state.get("ok") or 0),
+                fail=int(state.get("fail") or 0),
+            )
+
+        state["line"] = ui_line
+        state["progress"] = ui_progress
+        state["counts"] = ui_counts
+        state["finish"] = ui_finish
+        state["set_total"] = ui_set_total
+        return state
+
     def _publish_enqueue_jobs(
         self,
         jobs: list[tuple[Product, list[str] | None, list[str] | None, str | None]],
@@ -5451,7 +5533,15 @@ class ManagerApp(tk.Tk):
             return False, result.error
         if not result.product_name:
             return False, "제품명을 찾지 못했습니다."
-        category = result.category or extract_attrs(result.product_name, product.tags, hint).category
+        category = resolve_product_category(
+            tags=product.tags,
+            title=product.title,
+            description=hint,
+            google_name=result.product_name,
+            name_en=result.name_en or "",
+            existing=product.category,
+            ai_category=result.category or "",
+        )
         raw_blob = "\n".join(result.raw_texts[:50]) if result.raw_texts else ""
         # 검색(AI) 컬러 우선 — 이미지 픽셀 추정(화이트,골드…)으로 덮지 않음
         from product_name import extract_ai_labeled_fields, normalize_ai_color
@@ -5533,7 +5623,15 @@ class ManagerApp(tk.Tk):
         if not result.product_name:
             return False, "제품명을 찾지 못했습니다."
         hint = " ".join(x for x in (product.title, product.tags, product.description) if x)
-        category = result.category or extract_attrs(result.product_name, product.tags, hint).category
+        category = resolve_product_category(
+            tags=product.tags,
+            title=product.title,
+            description=hint,
+            google_name=result.product_name,
+            name_en=result.name_en or "",
+            existing=product.category,
+            ai_category=result.category or "",
+        )
         from product_name import extract_ai_labeled_fields, normalize_ai_color
 
         colors = normalize_ai_color((result.color or "").strip())
@@ -5656,197 +5754,204 @@ class ManagerApp(tk.Tk):
         self._ensure_images_for_action()
         self._on_google_selected(image_index=1)
 
-    def _start_google_search(self, *, image_index: int = 0) -> None:
-        if not self._job_start("search"):
-            self._warn_job_busy("search")
-            return
-        if self.list_mode.get() != "products":
-            self._job_end("search")
-            messagebox.showwarning("선택", "상품 목록에서 선택하세요.")
-            return
-        ids = self._selected_product_ids()
-        if not ids and self.current_id is not None:
-            ids = [self.current_id]
-        if not ids:
-            self._job_end("search")
-            messagebox.showwarning("선택", "상품을 먼저 선택하세요.")
-            return
-
-        # Soft-save current form before batch
-        if self.current_id is not None and self.current_id in ids:
-            self._soft_save_current(force=True)
-
-        products: list[Product] = []
-        for pid in ids:
-            p = self.store.get(pid)
-            if p:
-                products.append(p)
-        if not products:
-            self._job_end("search")
-            return
-
-        # 여러 개면 선택된 이미지 검색과 같이 하나씩 순차 검색
-        if len(products) > 1:
-            self._job_end("search")
-            self._on_google_selected(image_index=image_index)
-            return
-
-        title = "이미지 검색" if image_index <= 0 else f"{image_index + 1}번째 이미지 검색"
-        self._append(f"----- {title} #{products[0].id} -----")
-        self._set_search_busy(products[0].id, set())
-        self._set_channel_progress(
-            LOG_SEARCH,
-            done=0,
-            total=1,
-            action="이미지 검색중",
-            detail=f"#{products[0].id}",
-        )
-
-        def work() -> None:
+    def _search_enqueue_jobs(
+        self,
+        jobs: list[tuple[Product, int]],
+    ) -> int:
+        """Add image-search jobs to the queue. Skips duplicates already queued/active."""
+        added = 0
+        with self._search_lock:
+            for job in jobs:
+                pid = int(job[0].id)
+                if pid == self._search_active_id or pid in self._search_queued_ids:
+                    continue
+                self._search_queued_ids.add(pid)
+                self._search_q.put(job)
+                self._search_total += 1
+                added += 1
+            total = self._search_total
+            prog = self._search_prog
+        if added and prog is not None:
             try:
-                self._ensure_images_for_action(product_id=products[0].id)
-                refreshed0 = self.store.get(products[0].id)
-                if refreshed0:
-                    products[0] = refreshed0
-                self._set_channel_progress(
-                    LOG_SEARCH,
-                    done=0,
-                    total=1,
-                    action="이미지 검색중",
-                    detail=f"#{products[0].id} 검색 중…",
-                )
-                ok, msg = self._run_google_for(
-                    products[0], headless=False, image_index=image_index
-                )
-                if not ok:
-                    self._put_log(
-                        f"창 종료 후 잠시 대기, 같은 이미지 재시도: {msg}",
-                        channel=LOG_SEARCH,
-                    )
-                    try:
-                        close_ai_browsers()
-                    except Exception:
-                        pass
-                    time.sleep(4.0)
-                    ok, msg = self._run_google_for(
-                        products[0], headless=False, image_index=image_index
-                    )
-                self._put_log(("OK: " if ok else "실패: ") + msg, channel=LOG_SEARCH)
-                self._finish_channel_progress(
-                    LOG_SEARCH,
-                    summary=msg,
-                    done=1,
-                    total=1,
-                    ok=1 if ok else 0,
-                    fail=0 if ok else 1,
-                )
+                prog["set_total"](total)
+            except Exception:
+                pass
+            self.after(
+                0,
+                lambda t=total, a=added: self.status.set(
+                    f"검색 대기열 +{a} · 총 {t}개"
+                ),
+            )
+        if added:
+            self.after(0, self._refresh_list_busy)
+        return added
 
-                def after_one() -> None:
-                    self.refresh_list(reload_detail=False, quiet=True)
-                    if ok:
-                        refreshed = self.store.get(products[0].id)
-                        if refreshed and self.current_id == products[0].id:
-                            self._show_product(refreshed)
-                        messagebox.showinfo(title, f"제품명 저장됨\n{msg}")
-                    else:
-                        messagebox.showwarning(title, msg)
-
-                self.after(0, after_one)
-            except Exception as e:
-                self._put_log(f"오류: {e}", channel=LOG_SEARCH)
-                self._finish_channel_progress(
-                    LOG_SEARCH, summary=str(e), done=0, total=1, ok=0, fail=1
-                )
-                self.after(0, lambda: messagebox.showerror("오류", str(e)))
-            finally:
-                self._set_search_busy(None, set())
-                self.after(0, lambda: self._job_end("search"))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_google_selected(self, *, image_index: int = 0) -> None:
-        """목록에서 선택한 상품을 하나씩 이미지 검색해 제품명을 갱신."""
-        if not self._job_start("search"):
-            self._warn_job_busy("search")
-            return
-        if self.list_mode.get() != "products":
-            self._job_end("search")
-            messagebox.showwarning("선택", "상품 목록에서 선택하세요.")
-            return
-        ids = self._selected_product_ids()
-        if not ids:
-            self._job_end("search")
-            messagebox.showwarning("선택", "검색할 상품을 목록에서 선택하세요.")
-            return
+    def _google_search_submit(
+        self,
+        ids: list[int],
+        *,
+        image_index: int = 0,
+        confirm_batch: bool = True,
+    ) -> None:
+        """Enqueue image-search jobs (supports mid-run additions like homepage publish)."""
         if self.current_id is not None and self.current_id in ids:
             self._soft_save_current(force=True)
 
-        targets: list[Product] = []
+        jobs: list[tuple[Product, int]] = []
         for pid in ids:
-            p = self.store.get(pid)
-            if p:
-                targets.append(p)
-        if not targets:
-            self._job_end("search")
+            product = self.store.get(pid)
+            if product:
+                jobs.append((product, int(image_index)))
+        if not jobs:
             messagebox.showwarning("없음", "검색할 상품이 없습니다.")
             return
 
         nth = max(0, int(image_index)) + 1
-        title = "선택된 이미지 검색" if image_index <= 0 else f"선택된 {nth}번째 이미지 검색"
         img_label = "첫 이미지" if image_index <= 0 else f"{nth}번째 이미지"
-        if not messagebox.askyesno(
+        title = (
+            "선택된 이미지 검색"
+            if image_index <= 0
+            else f"선택된 {nth}번째 이미지 검색"
+        )
+        running = self._job_running("search")
+        if running:
+            if not messagebox.askyesno(
+                "검색 추가",
+                f"이미지 검색이 진행 중입니다.\n"
+                f"선택한 {len(jobs)}개를 이어서 검색할까요?",
+            ):
+                return
+        elif confirm_batch and len(jobs) > 1 and not messagebox.askyesno(
             title,
-            f"선택한 {len(targets)}개 상품을 하나씩 {img_label}로 검색할까요?\n"
+            f"선택한 {len(jobs)}개 상품을 하나씩 {img_label}로 검색할까요?\n"
             "시간이 걸릴 수 있습니다.\n"
+            "진행 중에도 다른 상품을 추가 검색할 수 있습니다.\n"
             "(수집·등록과 동시에 진행할 수 있습니다)",
         ):
-            self._job_end("search")
             return
-        self._append(f"----- {title} {len(targets)}개 -----")
-        total_search = len(targets)
-        queued = {p.id for p in targets}
-        first_id = targets[0].id
-        queued.discard(first_id)
-        self._set_search_busy(first_id, queued)
-        self._set_channel_progress(
-            LOG_SEARCH,
-            done=0,
-            total=total_search,
-            action="이미지 검색중",
-            detail=f"{img_label} · {total_search}개",
+
+        if running:
+            added = self._search_enqueue_jobs(jobs)
+            if added <= 0:
+                messagebox.showinfo(
+                    "검색 추가",
+                    "선택한 상품은 이미 검색 대기 중이거나 처리 중입니다.",
+                )
+            else:
+                self._append(
+                    f"검색 대기열에 {added}개 추가 (총 {self._search_total}개)",
+                    channel=LOG_SEARCH,
+                )
+                messagebox.showinfo(
+                    "검색 추가",
+                    f"{added}개를 검색 대기열에 넣었습니다.\n"
+                    f"현재 총 {self._search_total}개 진행·대기 중.",
+                )
+            return
+
+        if not self._job_start("search"):
+            # 거의 동시에 시작된 경우 → 대기열에 추가
+            added = self._search_enqueue_jobs(jobs)
+            if added:
+                self._append(
+                    f"검색 대기열에 {added}개 추가 (총 {self._search_total}개)",
+                    channel=LOG_SEARCH,
+                )
+            return
+
+        with self._search_lock:
+            self._search_total = 0
+            self._search_done = 0
+            self._search_ok = 0
+            self._search_fail = 0
+            self._search_lines = []
+            self._search_queued_ids.clear()
+            self._search_active_id = None
+            while True:
+                try:
+                    self._search_q.get_nowait()
+                except queue.Empty:
+                    break
+
+        added = self._search_enqueue_jobs(jobs)
+        if added <= 0:
+            self._job_end("search")
+            messagebox.showwarning("없음", "검색할 상품이 없습니다.")
+            return
+
+        total = self._search_total
+        prog = self._open_search_progress(total)
+        self._search_prog = prog
+        self._append(
+            f"----- {title} {total}개 (실시간 · 추가검색 가능 · {img_label}) -----",
+            channel=LOG_SEARCH,
         )
+        self.status.set(f"이미지 검색 중 0/{total}")
+        threading.Thread(target=self._search_worker_loop, daemon=True).start()
 
-        def work() -> None:
-            ok_n = 0
-            fail_n = 0
-            try:
-                for i, p in enumerate(targets, start=1):
-                    rest = {t.id for t in targets[i:]}
-                    self._set_search_busy(p.id, rest)
-                    self._set_channel_progress(
-                        LOG_SEARCH,
-                        done=i - 1,
-                        total=total_search,
-                        action="이미지 검색중",
-                        detail=f"[{i}/{total_search}] #{p.id} {img_label} 검색 중…",
-                        ok=ok_n,
-                        fail=fail_n,
-                    )
-                    self._put_log(
-                        f"[{i}/{total_search}] #{p.id} {img_label} 검색 중… "
-                        "(결과 나올 때까지 대기, 1분 초과 시 새로고침/재시작)",
-                        channel=LOG_SEARCH,
-                    )
+    def _search_worker_loop(self) -> None:
+        """Drain image-search queue until empty (supports mid-run enqueue)."""
+        prog = self._search_prog
+        idle_rounds = 0
+        try:
+            while True:
+                try:
+                    job = self._search_q.get(timeout=0.35)
+                    idle_rounds = 0
+                except queue.Empty:
+                    idle_rounds += 1
+                    if idle_rounds >= 2:
+                        with self._search_lock:
+                            if self._search_q.empty() and self._search_active_id is None:
+                                break
+                    continue
 
-                    self._ensure_images_for_action(product_id=p.id)
-                    refreshed_p = self.store.get(p.id)
-                    if refreshed_p:
-                        p = refreshed_p
+                product, image_index = job
+                pid = int(product.id)
+                image_index = int(image_index)
+                nth = max(0, image_index) + 1
+                img_label = "첫 이미지" if image_index <= 0 else f"{nth}번째 이미지"
+                try:
+                    self._ensure_images_for_action(product_id=pid)
+                    fresh = self.store.get(pid)
+                    if fresh:
+                        product = fresh
+                except Exception:
+                    pass
+                with self._search_lock:
+                    self._search_active_id = pid
+                    self._search_queued_ids.discard(pid)
+                    done_before = self._search_done
+                    total = self._search_total
+                    ok_n = self._search_ok
+                    fail_n = self._search_fail
+                self.after(0, self._refresh_list_busy)
+
+                name_hint = (
+                    (product.google_name or product.title or f"#{product.id}").strip()
+                )[:36]
+                i = done_before + 1
+                if prog:
+                    prog["progress"](
+                        done_before,
+                        f"[{i}/{total}] {img_label} 검색 중… #{product.id} {name_hint}",
+                        ok_n,
+                        fail_n,
+                    )
+                    prog["line"](
+                        f"→ [{i}/{total}] #{product.id} {img_label} 검색 중… "
+                        "(결과 나올 때까지 대기, 1분 초과 시 새로고침/재시작)"
+                    )
+                self.after(
+                    0,
+                    lambda i=i, t=total: self.status.set(f"이미지 검색 중 {i}/{t}"),
+                )
+
+                try:
                     ok, msg = self._run_google_for(
-                        p, headless=False, image_index=image_index
+                        product, headless=False, image_index=image_index
                     )
                     if not ok:
-                        # AI 생성 실패 / 결과 없음 → 창 종료 후 같은 이미지부터 재시도
                         self._put_log(
                             f"  → 창 종료 후 잠시 대기, 같은 이미지 재시도: {msg}",
                             channel=LOG_SEARCH,
@@ -5857,65 +5962,150 @@ class ManagerApp(tk.Tk):
                             pass
                         time.sleep(4.0)
                         ok, msg = self._run_google_for(
-                            p, headless=False, image_index=image_index
+                            product, headless=False, image_index=image_index
                         )
                     if ok:
-                        ok_n += 1
+                        with self._search_lock:
+                            self._search_ok += 1
+                            self._search_lines.append(f"#{product.id} OK — {msg}")
+                            ok_n = self._search_ok
+                            fail_n = self._search_fail
+                        if prog:
+                            prog["line"](f"  ✓ {msg}")
                         self._put_log(f"  → {msg}", channel=LOG_SEARCH)
                     else:
-                        fail_n += 1
+                        with self._search_lock:
+                            self._search_fail += 1
+                            self._search_lines.append(f"#{product.id} 실패 — {msg}")
+                            ok_n = self._search_ok
+                            fail_n = self._search_fail
+                        if prog:
+                            prog["line"](f"  ✗ 실패: {msg}")
                         self._put_log(
                             f"  → 실패(다음 상품으로): {msg}", channel=LOG_SEARCH
                         )
-                    self._set_channel_progress(
-                        LOG_SEARCH,
-                        done=i,
-                        total=total_search,
-                        action="이미지 검색중",
-                        detail=f"[{i}/{total_search}] #{p.id} — {'성공' if ok else '실패'}",
-                        ok=ok_n,
-                        fail=fail_n,
-                    )
-                    # 목록만 조용히 갱신 — 선택·스크롤·다른 상품 상세 유지
                     self.after(
                         0,
                         lambda: self.refresh_list(reload_detail=False, quiet=True),
                     )
-                    if self.current_id == p.id:
-                        refreshed = self.store.get(p.id)
+                    if self.current_id == product.id:
+                        refreshed = self.store.get(product.id)
                         if refreshed:
                             self.after(0, lambda r=refreshed: self._show_product(r))
-                self._finish_channel_progress(
-                    LOG_SEARCH,
-                    summary=f"성공 {ok_n} · 실패 {fail_n}",
-                    done=total_search,
-                    total=total_search,
-                    ok=ok_n,
-                    fail=fail_n,
-                )
-                self.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "완료",
-                        f"{title} 완료\n성공 {ok_n} / 실패 {fail_n}",
-                    ),
-                )
-            except Exception as e:
-                self._put_log(f"오류: {e}", channel=LOG_SEARCH)
-                self._finish_channel_progress(
-                    LOG_SEARCH,
-                    summary=str(e),
-                    done=ok_n + fail_n,
-                    total=total_search,
-                    ok=ok_n,
-                    fail=fail_n,
-                )
-                self.after(0, lambda: messagebox.showerror("오류", str(e)))
-            finally:
-                self._set_search_busy(None, set())
-                self.after(0, lambda: self._job_end("search"))
+                except Exception as e:
+                    err = str(e)
+                    with self._search_lock:
+                        self._search_fail += 1
+                        self._search_lines.append(f"#{product.id} 실패: {err}")
+                        ok_n = self._search_ok
+                        fail_n = self._search_fail
+                    if prog:
+                        prog["line"](f"  ✗ 실패: {err}")
+                    self._put_log(f"검색 실패 #{product.id}: {err}", channel=LOG_SEARCH)
 
-        threading.Thread(target=work, daemon=True).start()
+                with self._search_lock:
+                    self._search_done += 1
+                    self._search_active_id = None
+                    done = self._search_done
+                    total = self._search_total
+                    ok_n = self._search_ok
+                    fail_n = self._search_fail
+                self.after(0, self._refresh_list_busy)
+
+                if prog:
+                    prog["progress"](
+                        done,
+                        f"[{done}/{total}] 완료 — 성공 {ok_n} · 실패 {fail_n}",
+                        ok_n,
+                        fail_n,
+                    )
+
+            with self._search_lock:
+                ok_final = self._search_ok
+                fail_final = self._search_fail
+                lines = list(self._search_lines)
+                if not self._search_q.empty():
+                    threading.Thread(
+                        target=self._search_worker_loop, daemon=True
+                    ).start()
+                    return
+
+            summary = "\n".join(lines[:14])
+            if len(lines) > 14:
+                summary += f"\n… 외 {len(lines) - 14}건"
+            if prog:
+                prog["finish"](
+                    f"성공 {ok_final} / 실패 {fail_final}", ok_final, fail_final
+                )
+
+            def finish() -> None:
+                with self._search_lock:
+                    if not self._search_q.empty():
+                        threading.Thread(
+                            target=self._search_worker_loop, daemon=True
+                        ).start()
+                        return
+                    self._search_prog = None
+                    self._search_active_id = None
+                    self._search_queued_ids.clear()
+
+                self.refresh_list(reload_detail=False, quiet=True)
+                self.status.set(
+                    f"이미지 검색 완료 — 성공 {ok_final} / 실패 {fail_final}"
+                )
+                self._job_end("search")
+                if fail_final and ok_final == 0:
+                    messagebox.showerror("이미지 검색 실패", summary or "검색 실패")
+                else:
+                    messagebox.showinfo(
+                        "이미지 검색",
+                        f"완료: 성공 {ok_final} / 실패 {fail_final}\n\n{summary}",
+                    )
+
+            self.after(0, finish)
+        except Exception as e:
+            self._put_log(f"검색 오류: {e}", channel=LOG_SEARCH)
+            if prog:
+                prog["line"](f"오류: {e}")
+                prog["finish"]("오류로 중단", self._search_ok, self._search_fail)
+            self.after(0, lambda: messagebox.showerror("오류", str(e)))
+            with self._search_lock:
+                self._search_prog = None
+                self._search_active_id = None
+                self._search_queued_ids.clear()
+            self.after(0, lambda: self._job_end("search"))
+
+    def _start_google_search(self, *, image_index: int = 0) -> None:
+        if self.list_mode.get() != "products":
+            messagebox.showwarning("선택", "상품 목록에서 선택하세요.")
+            return
+        ids = self._selected_product_ids()
+        if not ids and self.current_id is not None:
+            ids = [self.current_id]
+        if not ids:
+            messagebox.showwarning("선택", "상품을 먼저 선택하세요.")
+            return
+        # 여러 개면 일괄 확인 후 대기열 등록
+        self._google_search_submit(
+            ids,
+            image_index=image_index,
+            confirm_batch=len(ids) > 1,
+        )
+
+    def _on_google_selected(self, *, image_index: int = 0) -> None:
+        """목록에서 선택한 상품을 이미지 검색 대기열에 넣어 제품명을 갱신."""
+        if self.list_mode.get() != "products":
+            messagebox.showwarning("선택", "상품 목록에서 선택하세요.")
+            return
+        ids = self._selected_product_ids()
+        if not ids:
+            messagebox.showwarning("선택", "검색할 상품을 목록에서 선택하세요.")
+            return
+        self._google_search_submit(
+            ids,
+            image_index=image_index,
+            confirm_batch=True,
+        )
 
     def _on_exclude(self) -> None:
         if self.list_mode.get() != "products":

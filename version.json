@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.14",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/498553602",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.14/WeigouManager.zip",
-    "notes":  "Fix duplicate products: archive tombstone + sync skip published + heal on startup",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/498553602",
-    "asset_id":  498553602,
+    "version":  "1.0.15",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.15/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.15/WeigouManager.zip",
+    "notes":  "Brand/category updates (Delvaux, Alaia, Valentino, MM6, Chloe, Golden Goose); image-search queue with mid-run enqueue and log progress",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/498553602",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.14/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.15/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }

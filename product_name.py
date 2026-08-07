@@ -18,6 +18,12 @@ _BRANDS = [
     (r"巴黎世家|BALENCIAGA|발렌시아가", "발렌시아가", "Balenciaga"),
     (r"葆蝶家|BOTTEGA|보테가", "보테가", "Bottega Veneta"),
     (r"戈雅|GOYARD|고야드", "고야드", "Goyard"),
+    (r"德尔沃|德尔福|DELVAUX|델보", "델보", "Delvaux"),
+    (r"阿莱娅|阿拉亚|ALA[IÏ]A|알라이아", "알라이아", "Alaïa"),
+    (r"华伦天奴|瓦伦蒂诺|VALENTINO|발렌티노", "발렌티노", "Valentino"),
+    (r"\bMM6\b|엠엠식스", "엠엠식스", "MM6"),
+    (r"蔻依|克洛伊|CHLO[EÉ]|CHIOE|클로에", "클로에", "Chloé"),
+    (r"小鹅|金鹅|GOLDEN\s*GOOSE|\bGGDB\b|골든구스", "골든구스", "Golden Goose"),
     (r"缪缪|MIU\s*MIU|미우미우", "미우미우", "Miu Miu"),
     (r"巴宝莉|博柏利|BURBERRY|버버리", "버버리", "Burberry"),
     (r"THE\s*ROW|더\s*로우|더로우", "더로우", "The Row"),
@@ -413,6 +419,13 @@ def _extract_parts(raw: str, hint: str = "") -> NameParts:
             "louisvuitton": "Louis Vuitton",
             "ysl": "Saint Laurent",
             "hermes": "Hermès",
+            "goyard": "Goyard",
+            "delvaux": "Delvaux",
+            "alaia": "Alaïa",
+            "valentino": "Valentino",
+            "mm6": "MM6",
+            "chloe": "Chloé",
+            "goldengoose": "Golden Goose",
             "balenciaga": "Balenciaga",
             "bottega": "Bottega Veneta",
             "fendi": "Fendi",
@@ -578,7 +591,8 @@ def normalize_ai_color(raw: str) -> str:
 
 _AI_BRANDS_KO = (
     "샤넬|디올|구찌|프라다|에르메스|루이비통|생로랑|셀린느|펜디|미우미우|"
-    "고야드|발렌시아가|보테가|톰브라운|크롬하츠"
+    "고야드|델보|알라이아|발렌티노|엠엠식스|클로에|골든구스|"
+    "발렌시아가|보테가|톰브라운|크롬하츠"
 )
 _AI_TYPE_TAIL = (
     r"(?:선글라스|선글래스|sunglasses?|"

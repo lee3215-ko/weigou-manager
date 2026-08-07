@@ -16,6 +16,17 @@ BRAND_MAP = [
     ("HERMES", "hermes", "에르메스"),
     ("HERMÈS", "hermes", "에르메스"),
     ("GOYARD", "goyard", "고야드"),
+    ("DELVAUX", "delvaux", "델보"),
+    ("ALAIA", "alaia", "알라이아"),
+    ("ALAÏA", "alaia", "알라이아"),
+    ("VALENTINO", "valentino", "발렌티노"),
+    ("MM6", "mm6", "엠엠식스"),
+    ("CHLOE", "chloe", "클로에"),
+    ("CHLOÉ", "chloe", "클로에"),
+    ("CHIOE", "chloe", "클로에"),
+    ("GOLDEN GOOSE", "goldengoose", "골든구스"),
+    ("GOLDENGOOSE", "goldengoose", "골든구스"),
+    ("GGDB", "goldengoose", "골든구스"),
     ("MIU MIU", "miumiu", "미우미우"),
     ("MIUMIU", "miumiu", "미우미우"),
     ("BURBERRY", "burberry", "버버리"),
@@ -38,6 +49,13 @@ BRAND_MAP = [
     ("보테가", "bottega", "보테가"),
     ("에르메스", "hermes", "에르메스"),
     ("고야드", "goyard", "고야드"),
+    ("델보", "delvaux", "델보"),
+    ("알라이아", "alaia", "알라이아"),
+    ("발렌티노", "valentino", "발렌티노"),
+    ("엠엠식스", "mm6", "엠엠식스"),
+    ("MM6", "mm6", "엠엠식스"),
+    ("클로에", "chloe", "클로에"),
+    ("골든구스", "goldengoose", "골든구스"),
     ("미우미우", "miumiu", "미우미우"),
     ("버버리", "burberry", "버버리"),
     ("더로우", "therow", "더로우"),
@@ -57,6 +75,16 @@ BRAND_MAP = [
     ("葆蝶家", "bottega", "보테가"),
     ("爱马仕", "hermes", "에르메스"),
     ("戈雅", "goyard", "고야드"),  # Goyard — was missing → fell through to Chanel
+    ("德尔沃", "delvaux", "델보"),
+    ("德尔福", "delvaux", "델보"),
+    ("阿莱娅", "alaia", "알라이아"),
+    ("阿拉亚", "alaia", "알라이아"),
+    ("华伦天奴", "valentino", "발렌티노"),
+    ("瓦伦蒂诺", "valentino", "발렌티노"),
+    ("蔻依", "chloe", "클로에"),
+    ("克洛伊", "chloe", "클로에"),
+    ("小鹅", "goldengoose", "골든구스"),
+    ("金鹅", "goldengoose", "골든구스"),
     ("缪缪", "miumiu", "미우미우"),
     ("miu miu", "miumiu", "미우미우"),
     ("巴宝莉", "burberry", "버버리"),
@@ -623,6 +651,267 @@ def _has_any(text: str, lower: str, keys: tuple[str, ...] | list[str]) -> bool:
     return any(k.lower() in lower or k in text for k in keys)
 
 
+def _has_scarf_cue(text: str, lower: str) -> bool:
+    """Scarf/shawl cues — do not treat 숄더(백) as 숄(shawl)."""
+    if _has_any(
+        text,
+        lower,
+        (
+            "스카프",
+            "scarf",
+            "twilly",
+            "트윌리",
+            "マフラー",
+            "围巾",
+            "丝巾",
+            "絲巾",
+            "방도",
+            "bandeau",
+            "shawl",
+            "머플러",
+        ),
+    ):
+        return True
+    # bare 「숄」 only when not 「숄더…」
+    return bool(re.search(r"숄(?!더)", text))
+
+
+def _shop_tag_category(tags: str) -> str | None:
+    """Category from shop tags only. Returns None when tags have no clear cue.
+
+    Shop tags are the source of truth (가방包包 / 가방지갑 / 신발 …) and must
+    not fall through to the default 「가방」 guess used by full-text detect.
+    """
+    text = (tags or "").strip()
+    if not text:
+        return None
+    lower = text.lower()
+
+    if _has_any(
+        text,
+        lower,
+        (
+            "모자",
+            "帽子",
+            "hat",
+            "cap",
+            "볼캡",
+            "야구모자",
+            "베이스볼캡",
+            "baseball cap",
+            "beanie",
+            "비니",
+            "베레",
+            "beret",
+            "sunhat",
+            "太阳帽",
+            "棒球帽",
+            "鸭舌帽",
+            "キャップ",
+        ),
+    ):
+        return "기타"
+
+    if _has_any(
+        text,
+        lower,
+        (
+            "가방",
+            "包包",
+            "箱包",
+            "bag",
+            "tote",
+            "클러치",
+            "크로스백",
+            "백팩",
+            "핸드백",
+            "shoulder bag",
+            "handbag",
+            "버킷백",
+            "버킨",
+            "birkin",
+            "kelly",
+            "켈리",
+            "背包",
+            "手提包",
+            "斜挎",
+            "手拿包",
+        ),
+    ):
+        return "가방"
+
+    if _has_any(
+        text,
+        lower,
+        (
+            "신발",
+            "鞋子",
+            "鞋",
+            "shoe",
+            "sneaker",
+            "로퍼",
+            "힐",
+            "부츠",
+            "슬리퍼",
+            "샌들",
+            "구두",
+            "拖鞋",
+        ),
+    ):
+        return "신발"
+
+    is_mens = _has_any(
+        text,
+        lower,
+        (
+            "옷-남",
+            "옷남",
+            "男装",
+            "男款",
+            "男士",
+            "남성",
+            "남자",
+            "men's",
+            "mens",
+            "homme",
+            "남성옷",
+        ),
+    )
+    is_womens = _has_any(
+        text,
+        lower,
+        (
+            "옷-여",
+            "옷여",
+            "女装",
+            "女款",
+            "女士",
+            "여성",
+            "여자",
+            "women",
+            "woman",
+            "ladies",
+            "femme",
+            "여성옷",
+            "원피스",
+            "dress",
+            "블라우스",
+            "blouse",
+            "스커트",
+            "skirt",
+            "半裙",
+            "裙子",
+        ),
+    )
+    is_clothing = _has_any(
+        text,
+        lower,
+        (
+            "하의",
+            "팬츠",
+            "pants",
+            "데님",
+            "슬랙스",
+            "자켓",
+            "jacket",
+            "코트",
+            "패딩",
+            "아우터",
+            "블레이저",
+            "outer",
+            "外套",
+            "大衣",
+            "상의",
+            "shirt",
+            "t-shirt",
+            "니트",
+            "후드",
+            "맨투맨",
+            "가디건",
+            "cardigan",
+            "sweater",
+            "스웨터",
+            "knit",
+            "hoodie",
+            "衣服",
+            "의류",
+            "의상",
+            "티셔츠",
+            "조끼",
+            "vest",
+            "여성옷",
+            "남성옷",
+        ),
+    )
+    if is_clothing or is_mens or is_womens:
+        if is_mens and not is_womens:
+            return "남성옷"
+        if is_womens and not is_mens:
+            return "여성옷"
+        if "男" in text and "女" not in text:
+            return "남성옷"
+        if "女" in text:
+            return "여성옷"
+        if is_mens:
+            return "남성옷"
+        return "여성옷"
+
+    if _has_any(
+        text,
+        lower,
+        (
+            "선글라스",
+            "선글래스",
+            "sunglasses",
+            "sunglass",
+            "墨镜",
+            "太阳镜",
+            "太陽鏡",
+            "サングラス",
+            "eyewear",
+        ),
+    ):
+        return "선글라스"
+
+    if _has_any(
+        text,
+        lower,
+        (
+            "벨트",
+            "belt",
+            "腰带",
+            "皮带",
+            "皮帶",
+            "ベルト",
+        ),
+    ):
+        return "벨트"
+
+    if _has_scarf_cue(text, lower) or _has_any(
+        text,
+        lower,
+        (
+            "지갑",
+            "钱包",
+            "wallet",
+            "卡包",
+            "watch",
+            "시계",
+            "목걸이",
+            "귀걸이",
+            "팔찌",
+            "브로치",
+            "악세사리",
+            "액세서리",
+            "配饰",
+            "饰品",
+        ),
+    ):
+        return "악세사리"
+
+    return None
+
+
 def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
     if is_shoes:
         return "신발"
@@ -660,6 +949,7 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
         (
             "가방",
             "包包",
+            "箱包",
             "bag",
             "tote",
             "클러치",
@@ -677,29 +967,16 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
             "手提包",
             "斜挎",
             "手拿包",
+            "숄더백",
+            "숄더 백",
         ),
     )
 
-    # 1) Scarves — before bag-dimension (90*90 etc.)
-    if _has_any(
-        text,
-        lower,
-        (
-            "스카프",
-            "scarf",
-            "twilly",
-            "트윌리",
-            "マフラー",
-            "围巾",
-            "丝巾",
-            "絲巾",
-            "방도",
-            "bandeau",
-            "shawl",
-            "숄",
-            "머플러",
-        ),
-    ):
+    has_scarf = _has_scarf_cue(text, lower)
+
+    # 1) Scarves — only when not clearly a bag (숄더백 등)
+    #    Shop tag「가방」+ AI명「Twilly」같이 충돌하면 가방(태그) 우선
+    if has_scarf and not has_bag:
         return "악세사리"
 
     # 2) Clothing — 여성옷 / 남성옷 (상의·하의·자켓 구분 없음)
@@ -791,7 +1068,8 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
             "남성옷",
         ),
     )
-    if is_clothing or is_mens or is_womens:
+    # 가방 태그가 있으면 의류 오탐(tee/진 등)보다 가방 우선
+    if (is_clothing or is_mens or is_womens) and not has_bag:
         if is_mens and not is_womens:
             return "남성옷"
         if is_womens and not is_mens:
@@ -809,6 +1087,9 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
     # 3) Bags — shop tags like 가방지갑 / 包包 win over bare 지갑
     if has_bag:
         return "가방"
+
+    if has_scarf:
+        return "악세사리"
 
     # 4) Sunglasses
     if _has_any(
@@ -940,7 +1221,9 @@ def extract_attrs(
     )
     colors = _detect_colors(blob)
     sizes, is_shoes, dimension = _parse_sizes(blob)
-    category = _detect_category(blob, is_shoes, dimension)
+    # Shop tags win over AI/product-name guesses (가방 → 악세사리 오인 방지)
+    tag_cat = _shop_tag_category(tags)
+    category = tag_cat or _detect_category(blob, is_shoes, dimension)
 
     paths: list[str] = []
     if image_paths:
@@ -997,3 +1280,35 @@ def extract_attrs(
         display_name=display_name,
         dimension=dimension,
     )
+
+
+def resolve_product_category(
+    *,
+    tags: str = "",
+    title: str = "",
+    description: str = "",
+    google_name: str = "",
+    name_en: str = "",
+    existing: str = "",
+    ai_category: str = "",
+) -> str:
+    """Pick category with shop-tag priority (image search must not clobber tags).
+
+    Priority: shop tags → existing → name/text detect → AI guess.
+    """
+    tag_cat = _shop_tag_category(tags)
+    if tag_cat:
+        return tag_cat
+    exist = (existing or "").strip()
+    if exist:
+        return exist
+    attrs = extract_attrs(
+        title,
+        tags,
+        description,
+        google_name=google_name,
+        name_en=name_en,
+    )
+    if attrs.category:
+        return attrs.category
+    return (ai_category or "").strip() or "가방"
