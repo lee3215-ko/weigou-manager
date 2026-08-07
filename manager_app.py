@@ -61,6 +61,7 @@ from mall_publish import (
     delete_mall_products,
     preview_price,
     publish_product,
+    resolve_mall_id,
     set_products_recommended,
 )
 from orders_ui import (
@@ -2009,9 +2010,11 @@ class ManagerApp(tk.Tk):
         elif tab == 2 and customers is not None:
             self._apply_customers(list(customers), "")
 
-    def _mark_catalog_dirty(self) -> None:
+    def _mark_catalog_dirty(self, *, push_now: bool = False) -> None:
         try:
             self._sync.mark_dirty()
+            if push_now:
+                self._sync.sync_now()
         except Exception:
             pass
 
@@ -4496,6 +4499,8 @@ class ManagerApp(tk.Tk):
                         mall_id=mall_id,
                         note=result.get("priceLabel") or "",
                     )
+                    # Push each success so the other PC sees 등록 list promptly.
+                    self._mark_catalog_dirty(push_now=True)
                     line = (
                         f"  ✓ 성공 → 등록 #{archived} / {item.get('name') or ''} "
                         f"/ {result.get('priceLabel') or ''} / {result.get('api') or ''}"
@@ -4576,7 +4581,7 @@ class ManagerApp(tk.Tk):
                     self._publish_active_id = None
                     self._publish_queued_ids.clear()
 
-                self._mark_catalog_dirty()
+                self._mark_catalog_dirty(push_now=True)
                 mode = self.list_mode.get()
                 if mode == "products":
                     if next_id is not None:
@@ -4852,9 +4857,18 @@ class ManagerApp(tk.Tk):
 
         jobs: list[tuple[PublishedItem, str]] = []
         for item in selected:
-            mall_id = (item.mall_id or "").strip()
-            if not mall_id:
-                mall_id = f"wg-{item.id}"
+            mall_id = resolve_mall_id(
+                mall_id=item.mall_id,
+                search_code=item.search_code,
+                goods_id=item.goods_id,
+            )
+            # Persist resolved id so later sync / recommend use the real homepage id.
+            if mall_id and mall_id != (item.mall_id or "").strip():
+                try:
+                    self.store.update_published(item.id, mall_id=mall_id)
+                    item = self.store.get_published(item.id) or item
+                except Exception:
+                    pass
             jobs.append((item, mall_id))
 
         self._append(
@@ -4864,41 +4878,117 @@ class ManagerApp(tk.Tk):
 
         def work() -> None:
             try:
-                mall_ids = [m for _, m in jobs]
-                result = set_products_recommended(mall_ids, recommended=want, push_api=True)
-                updated = int(result.get("updated") or 0)
+                # First pass: set recommended for ids we already know.
+                known = [(it, mid) for it, mid in jobs if mid]
+                unknown = [it for it, mid in jobs if not mid]
+                mall_ids = [m for _, m in known]
+                result: dict = {
+                    "updated": 0,
+                    "api": "skipped",
+                    "missing": [],
+                    "products": [],
+                }
+                if mall_ids:
+                    result = set_products_recommended(
+                        mall_ids, recommended=want, push_api=True
+                    )
                 missing = list(result.get("missing") or [])
-                for item, mall_id in jobs:
-                    if mall_id in missing:
+                # Treat unresolved mall_id as missing too.
+                for it in unknown:
+                    missing.append(f"(등록#{it.id})")
+
+                republished = 0
+                # Auto re-publish missing items onto homepage, then recommend.
+                if want and (missing or unknown):
+                    need_items: list[PublishedItem] = []
+                    miss_set = set(missing)
+                    for it, mid in jobs:
+                        if not mid or mid in miss_set:
+                            need_items.append(it)
+                    for it in need_items:
+                        try:
+                            self._ensure_images_for_action(published_id=it.id)
+                            fresh = self.store.get_published(it.id) or it
+                            product = self.store.published_to_product(fresh)
+                            colors = re_split_colors(fresh.colors)
+                            sizes = self._split_csv(fresh.sizes)
+                            category = fresh.category or None
+                            # Keep existing mall_id when known so we overwrite the same homepage row.
+                            force_mid = (fresh.mall_id or "").strip() or None
+                            if not force_mid:
+                                gid = (fresh.goods_id or "").strip()
+                                code = (fresh.search_code or "").strip()
+                                if gid:
+                                    force_mid = f"wg-{gid}"
+                                elif code:
+                                    force_mid = f"wg-sc-{code}"
+                            pub = publish_product(
+                                product,
+                                colors=colors or None,
+                                sizes=sizes or None,
+                                category=category,
+                                push_api=True,
+                                mall_id=force_mid,
+                            )
+                            new_mid = str((pub.get("product") or {}).get("id") or "")
+                            if new_mid:
+                                self.store.update_published(it.id, mall_id=new_mid)
+                                set_products_recommended(
+                                    [new_mid], recommended=True, push_api=True
+                                )
+                                self.store.update_published(it.id, recommended=True)
+                                republished += 1
+                                if new_mid in missing:
+                                    missing.remove(new_mid)
+                                tag = f"(등록#{it.id})"
+                                if tag in missing:
+                                    missing.remove(tag)
+                                result["updated"] = int(result.get("updated") or 0) + 1
+                                self._put_log(
+                                    f"추천: 홈 재등록 후 추천 #{it.id} → {new_mid}",
+                                    channel=LOG_MALL,
+                                )
+                        except Exception as e:
+                            self._put_log(
+                                f"추천 재등록 실패 등록#{it.id}: {e}",
+                                channel=LOG_MALL,
+                            )
+
+                updated = int(result.get("updated") or 0)
+                for item, mall_id in known:
+                    if mall_id and mall_id in missing:
                         continue
-                    self.store.update_published(item.id, recommended=want)
-                ok_ids = {m for _, m in jobs} - set(missing)
+                    if mall_id:
+                        self.store.update_published(item.id, recommended=want)
 
                 def finish() -> None:
-                    self._mark_catalog_dirty()
+                    self._mark_catalog_dirty(push_now=True)
                     self.refresh_list(reload_detail=False, quiet=True)
                     label = "추천 등록" if want else "추천 해제"
                     self.status.set(f"{label} 완료 — {updated}개")
                     msg = (
                         f"{label} 완료: {updated}개\n"
-                        f"API: {result.get('api') or ''}\n\n"
-                        "쇼핑몰을 새로고침하면 반영됩니다."
+                        f"API: {result.get('api') or ''}"
                     )
-                    if missing:
+                    if republished:
+                        msg += f"\n홈 재등록 후 추천: {republished}개"
+                    msg += "\n\n쇼핑몰을 새로고침하면 반영됩니다."
+                    still_missing = [m for m in missing if m]
+                    if still_missing:
                         msg += (
-                            "\n\n홈에 없는 상품(먼저 재등록 필요):\n"
-                            + "\n".join(missing[:8])
+                            "\n\n아직 홈에 없는 상품:\n"
+                            + "\n".join(still_missing[:8])
                         )
-                        if len(missing) > 8:
-                            msg += f"\n… 외 {len(missing) - 8}건"
-                    if updated == 0 and missing:
+                        if len(still_missing) > 8:
+                            msg += f"\n… 외 {len(still_missing) - 8}건"
+                    if updated == 0 and still_missing:
                         messagebox.showerror("추천 실패", msg)
                     else:
                         messagebox.showinfo("추천 상품", msg)
                     self._append(
                         f"추천 {'ON' if want else 'OFF'} {updated}개"
-                        + (f" / 누락 {len(missing)}" if missing else "")
-                        + f" / 대상 {len(ok_ids)}"
+                        + (f" / 재등록 {republished}" if republished else "")
+                        + (f" / 누락 {len(still_missing)}" if still_missing else "")
                     )
 
                 self.after(0, finish)
@@ -5581,7 +5671,7 @@ class ManagerApp(tk.Tk):
             sizes=sizes or None,
             category=category,
         )
-        self._mark_catalog_dirty()
+        self._mark_catalog_dirty(push_now=True)
         # 현재 선택 상품이면 입력란에도 바로 반영
         if self.current_id == product.id:
             self.after(0, lambda c=colors, s=sizes, cat=category, r=result: self._apply_search_fields(c, s, cat, r))
@@ -5669,6 +5759,7 @@ class ManagerApp(tk.Tk):
         # 검색 컬러가 있으면 기존 값을 덮어씀
         if colors:
             self.store.update_description(product.id, colors=colors)
+        self._mark_catalog_dirty(push_now=True)
         if self.current_id == product.id:
             self.after(
                 0,
@@ -6050,6 +6141,7 @@ class ManagerApp(tk.Tk):
                     self._search_queued_ids.clear()
 
                 self.refresh_list(reload_detail=False, quiet=True)
+                self._mark_catalog_dirty(push_now=True)
                 self.status.set(
                     f"이미지 검색 완료 — 성공 {ok_final} / 실패 {fail_final}"
                 )

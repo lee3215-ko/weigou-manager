@@ -283,6 +283,37 @@ def _fetch_live_catalog() -> list[dict[str, Any]]:
     return _load_catalog()
 
 
+def resolve_mall_id(
+    *,
+    mall_id: str = "",
+    search_code: str = "",
+    goods_id: str = "",
+    catalog: list[dict[str, Any]] | None = None,
+) -> str:
+    """Resolve homepage product id. Prefer stored mall_id, else match by 搜索码/goods."""
+    mid = (mall_id or "").strip()
+    if mid:
+        return mid
+    code = (search_code or "").strip()
+    gid = (goods_id or "").strip()
+    if not code and not gid:
+        return ""
+    rows = catalog if catalog is not None else _fetch_live_catalog()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id") or "").strip()
+        if not rid:
+            continue
+        sku = str(row.get("skuNo") or row.get("searchCode") or "").strip()
+        if code and sku and sku == code:
+            return rid
+        remote_gid = str(row.get("goodsId") or row.get("goods_id") or "").strip()
+        if gid and remote_gid and remote_gid == gid:
+            return rid
+    return ""
+
+
 def delete_mall_products(
     mall_ids: list[str],
     *,

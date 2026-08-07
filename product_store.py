@@ -1903,7 +1903,17 @@ class ProductStore:
                 stats["products"] += 1
             else:
                 local = self.get(pid)
-                if local and remote_u and local.updated_at and remote_u < local.updated_at:
+                remote_gn = (row.get("google_name") or "").strip()
+                local_gn = (local.google_name or "").strip() if local else ""
+                # Soft-save on the other PC can bump updated_at without google_name —
+                # still accept remote name when local name is empty.
+                if (
+                    local
+                    and remote_u
+                    and local.updated_at
+                    and remote_u < local.updated_at
+                    and not (remote_gn and not local_gn)
+                ):
                     continue
                 local_urls = list(local.image_urls or []) if local else []
                 merged_urls = _prefer_urls(urls, local_urls)
@@ -1999,8 +2009,10 @@ class ProductStore:
                 urls = row.get("image_urls") or []
                 if not isinstance(urls, list):
                     urls = []
+                remote_updated = (
+                    row.get("updated_at") or row.get("created_at") or now
+                )
                 if exists is None:
-                    remote_updated = row.get("updated_at") or row.get("created_at") or now
                     con.execute(
                         """
                         INSERT INTO published
@@ -2032,6 +2044,89 @@ class ProductStore:
                         ),
                     )
                     stats["published"] += 1
+                else:
+                    pub_id = int(exists["id"])
+                    local = self.get_published(pub_id)
+                    local_u = (local.updated_at or "") if local else ""
+                    remote_gn = (row.get("google_name") or "").strip()
+                    local_gn = (local.google_name or "").strip() if local else ""
+                    remote_mall = mall
+                    local_mall = (local.mall_id or "").strip() if local else ""
+                    # Always fill empty mall_id / google_name from remote.
+                    force_fill = (remote_mall and not local_mall) or (
+                        remote_gn and not local_gn
+                    )
+                    if (
+                        local
+                        and remote_updated
+                        and local_u
+                        and remote_updated < local_u
+                        and not force_fill
+                    ):
+                        pass
+                    else:
+                        local_urls = list(local.image_urls or []) if local else []
+                        merged_urls = _prefer_urls(urls, local_urls)
+                        con.execute(
+                            """
+                            UPDATE published SET
+                                goods_id=?, shop_id=?, search_code=?, sku_no=?, title=?,
+                                tags=?, category=?, note=?, mall_id=?, updated_at=?,
+                                google_name=?, name_en=?, colors=?, sizes=?, description=?,
+                                recommended=?, image_urls=?
+                            WHERE id=?
+                            """,
+                            (
+                                gid or (local.goods_id if local else ""),
+                                row.get("shop_id")
+                                or (local.shop_id if local else ""),
+                                _prefer_text(code, local.search_code if local else ""),
+                                _prefer_text(
+                                    row.get("sku_no"), local.sku_no if local else ""
+                                ),
+                                _prefer_text(
+                                    row.get("title"), local.title if local else ""
+                                ),
+                                _prefer_text(
+                                    row.get("tags"), local.tags if local else ""
+                                ),
+                                _prefer_text(
+                                    row.get("category"),
+                                    local.category if local else "",
+                                ),
+                                _prefer_text(
+                                    row.get("note"), local.note if local else ""
+                                ),
+                                _prefer_text(remote_mall, local_mall),
+                                remote_updated or now,
+                                _prefer_text(
+                                    row.get("google_name"),
+                                    local.google_name if local else "",
+                                ),
+                                _prefer_text(
+                                    row.get("name_en"),
+                                    local.name_en if local else "",
+                                ),
+                                _prefer_text(
+                                    row.get("colors"), local.colors if local else ""
+                                ),
+                                _prefer_text(
+                                    row.get("sizes"), local.sizes if local else ""
+                                ),
+                                _prefer_text(
+                                    row.get("description"),
+                                    local.description if local else "",
+                                ),
+                                int(
+                                    bool(row.get("recommended"))
+                                    if "recommended" in row
+                                    else (local.recommended if local else False)
+                                ),
+                                json.dumps(merged_urls, ensure_ascii=False),
+                                pub_id,
+                            ),
+                        )
+                        stats["published"] += 1
             # Published wins over catalog — drop any matching 상품 rows.
             self._purge_products_matching(gid, code)
             if mall:

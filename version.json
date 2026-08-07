@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.15",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504844973",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.15/WeigouManager.zip",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504844973",
-    "asset_id":  504844973,
+    "version":  "1.0.16",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.16/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.16/WeigouManager.zip",
+    "notes":  "Fix A/B sync: published mall_id/google_name merge; push on search/publish; recommend auto-republish when missing from homepage",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504844973",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.15/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.16/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
-                      ],
-    "notes":  "Brand/category updates (Delvaux, Alaia, Valentino, MM6, Chloe, Golden Goose); image-search queue with mid-run enqueue and log progress"
+                      ]
 }
