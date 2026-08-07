@@ -500,8 +500,24 @@ if (-not (Test-Path -LiteralPath $Exe)) {{
 }}
 
 Write-Log "starting $Exe (cwd=$workDir)"
-Start-Process -LiteralPath $Exe -WorkingDirectory $workDir
-Write-Log "update success"
+try {{
+    Start-Process -LiteralPath $Exe -WorkingDirectory $workDir
+}} catch {{
+    Write-Log ("Start-Process failed: " + $_)
+}}
+Start-Sleep -Seconds 3
+if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {{
+    Write-Log "process not up — retry via cmd start"
+    $cmd = 'cmd.exe'
+    $arg = '/c start "" "' + $Exe + '"'
+    Start-Process -FilePath $cmd -ArgumentList $arg -WorkingDirectory $workDir -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+}}
+if (Get-Process -Name $procName -ErrorAction SilentlyContinue) {{
+    Write-Log "update success — app running"
+}} else {{
+    Write-Log "WARNING: app still not running after restart attempts"
+}}
 
 Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
@@ -536,7 +552,6 @@ def schedule_apply_update(
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise RuntimeError(f"업데이트 zip 풀기 실패: {exc}") from exc
 
-    # Verify extracted tree contains the exe (fail early with clear error)
     exe_hits = list(staging_dir.rglob(exe_name))
     if not exe_hits:
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -547,42 +562,40 @@ def schedule_apply_update(
     script_path = Path(tempfile.gettempdir()) / f"{slug}_update_{os.getpid()}.ps1"
     _write_update_script(script_path, app_slug=slug)
 
-    # Prefer Hidden window without CREATE_NO_WINDOW — some PCs drop the child otherwise.
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = 0
-    creationflags = 0
-    if hasattr(subprocess, "CREATE_NO_WINDOW"):
-        # Keep 0: WindowStyle Hidden is enough; CREATE_NO_WINDOW has caused silent no-restart.
-        creationflags = 0
+    # Detach from this process tree so os._exit does not kill the updater.
+    flags = 0
+    if hasattr(subprocess, "DETACHED_PROCESS"):
+        flags |= subprocess.DETACHED_PROCESS
+    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+    if hasattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB"):
+        flags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
 
-    proc = subprocess.Popen(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-WindowStyle",
-            "Hidden",
-            "-File",
-            str(script_path),
-            "-Staging",
-            str(staging_dir),
-            "-Install",
-            str(target_dir),
-            "-Exe",
-            str(exe_path),
-            "-Inner",
-            str(inner),
-            "-WaitPid",
-            str(os.getpid()),
-        ],
-        startupinfo=startupinfo,
-        creationflags=creationflags,
-        close_fds=False,
+    # Launcher .cmd avoids PowerShell being tied to the dying GUI process.
+    cmd_path = Path(tempfile.gettempdir()) / f"{slug}_update_{os.getpid()}.cmd"
+    cmd_path.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                f'start "" /b powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script_path}" '
+                f'-Staging "{staging_dir}" -Install "{target_dir}" -Exe "{exe_path}" '
+                f'-Inner "{inner}" -WaitPid {os.getpid()}',
+                "exit /b 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
-    # Detach: parent will os._exit soon; child must keep running.
-    del proc
+
+    subprocess.Popen(
+        ["cmd.exe", "/c", str(cmd_path)],
+        creationflags=flags,
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=str(tempfile.gettempdir()),
+    )
 
     try:
         zip_path.unlink(missing_ok=True)

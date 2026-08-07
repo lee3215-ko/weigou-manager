@@ -2177,16 +2177,16 @@ class ManagerApp(tk.Tk):
             }
             save_sync_settings(new_cfg)
             self._mark_catalog_dirty()
-            self._sync.sync_now()
+            self._sync.force_full_sync()
             self._apply_role_ui()
-            self._append(f"[동기화] Supabase 설정 저장 — {role_label()} · 바로 동기화 시도")
+            self._append(f"[동기화] Supabase 설정 저장 — {role_label()} · 전체 목록 맞추기")
             win.destroy()
 
         btn = tk.Frame(win, bg="#f3efe8")
         btn.pack(fill="x", padx=16, pady=16)
         tk.Button(
             btn,
-            text="저장 후 동기화",
+            text="저장 후 전체 맞추기",
             command=save_and_close,
             font=("Malgun Gothic", 10, "bold"),
             bg="#1f4e79",
@@ -2197,13 +2197,26 @@ class ManagerApp(tk.Tk):
         ).pack(side="left")
         tk.Button(
             btn,
-            text="지금 동기화만",
+            text="전체 목록 맞추기",
+            command=lambda: (
+                self._append("[동기화] 전체 목록 맞추기 요청"),
+                self._sync.force_full_sync(),
+            ),
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#b45309",
+            fg="white",
+            relief="flat",
+            padx=10,
+        ).pack(side="left", padx=8)
+        tk.Button(
+            btn,
+            text="증분 동기화",
             command=lambda: (self._mark_catalog_dirty(), self._sync.sync_now()),
             font=("Malgun Gothic", 10),
             bg="#ebe4da",
             relief="flat",
             padx=10,
-        ).pack(side="left", padx=8)
+        ).pack(side="left", padx=4)
         tk.Button(btn, text="닫기", command=win.destroy, bg="#ebe4da", relief="flat").pack(
             side="right"
         )

@@ -7,6 +7,7 @@ No GitHub token required.
 from __future__ import annotations
 
 import json
+import hashlib
 import pathlib
 import threading
 import time
@@ -92,6 +93,8 @@ class CatalogSyncService:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._push_needed = False
+        self._force_full = False
+        self._cycle_n = 0
         self._last_remote_rev = -1
         self._last_etag = ""
         self._bucket_ready = False
@@ -115,11 +118,32 @@ class CatalogSyncService:
         self._push_needed = True
         self._wake.set()
 
-    def sync_now(self) -> None:
+    def sync_now(self, *, full: bool = False) -> None:
+        if full:
+            self.force_full_sync()
+            return
+        self._wake.set()
+        threading.Thread(target=self._cycle, daemon=True).start()
+
+    def force_full_sync(self) -> None:
+        """Full pull+push so diverged PCs converge to the union of both catalogs."""
+        self._force_full = True
+        self._push_needed = True
+        self._last_remote_rev = -1
+        # Clear delta cursors so next push/pull is complete.
+        try:
+            self.store.set_setting("sync_table_since", "")
+            self.store.set_setting("sync_table_pull_since", "")
+        except Exception:
+            pass
+        self.on_log("[동기화] 전체 목록 맞추기 시작 (양쪽 합집합)")
         self._wake.set()
         threading.Thread(target=self._cycle, daemon=True).start()
 
     def _loop(self) -> None:
+        # First cycle: always full reconcile once after launch.
+        self._force_full = True
+        self._push_needed = True
         self._cycle()
         while not self._stop.is_set():
             woken = self._wake.wait(timeout=self._interval())
@@ -156,18 +180,23 @@ class CatalogSyncService:
                     "(홈페이지 등록과 동일 설정)"
                 )
             return
+        self._cycle_n += 1
+        # Periodic full reconcile (~5 min at 2s interval) keeps A/B identical.
+        if self._cycle_n > 1 and self._cycle_n % 150 == 0:
+            self._force_full = True
+            self._push_needed = True
+        force = bool(self._force_full)
+        self._force_full = False
         with self._lock:
             try:
-                # Prefer Postgres table sync when available (incremental)
                 if cfg.get("prefer_table_sync", True) and self._table_sync_available():
-                    self._pull_table(cfg)
-                    if self._push_needed:
-                        self._push_table(cfg)
+                    self._pull_table(cfg, full=force)
+                    if self._push_needed or force:
+                        self._push_table(cfg, full=force)
                         self._push_needed = False
                     return
-                # Fallback: Storage JSON (full or delta)
                 self._pull(cfg)
-                if self._push_needed:
+                if self._push_needed or force:
                     self._push(cfg)
                     self._push_needed = False
             except Exception as e:
@@ -203,12 +232,35 @@ class CatalogSyncService:
     def _sync_key_product(self, row: dict[str, Any]) -> str:
         gid = (row.get("goods_id") or "").strip()
         code = (row.get("search_code") or "").strip()
-        return gid or code or ""
+        if gid:
+            return gid
+        if code:
+            return code
+        # Fallback so untitled rows without codes still sync across PCs
+        title = (row.get("title") or "").strip()
+        created = (row.get("created_at") or "").strip()
+        if title:
+            digest = hashlib.sha1(
+                f"{title}|{created}".encode("utf-8", errors="ignore")
+            ).hexdigest()[:20]
+            return f"t:{digest}"
+        return ""
 
-    def _push_table(self, cfg: dict[str, Any]) -> None:
-        """Upsert changed rows into manager_* tables + bump rev."""
+    def _sync_key_other(self, row: dict[str, Any]) -> str:
+        return (
+            (row.get("mall_id") or "").strip()
+            or (row.get("goods_id") or "").strip()
+            or (row.get("search_code") or "").strip()
+        )
+
+    def _push_table(self, cfg: dict[str, Any], *, full: bool = False) -> None:
+        """Upsert rows into manager_* tables + bump rev.
+
+        full=True exports the entire local catalog (not just delta) so the other
+        PC can catch up when lists have diverged.
+        """
         base, key = self._rest_base()
-        since = (self.store.get_setting("sync_table_since", "") or "").strip()
+        since = "" if full else (self.store.get_setting("sync_table_since", "") or "").strip()
         if since:
             bundle = self.store.export_sync_delta(since)
             mode = "delta"
@@ -226,9 +278,10 @@ class CatalogSyncService:
         def upsert(table: str, rows: list[dict[str, Any]], deleted_keys: list[str]) -> None:
             payload: list[dict[str, Any]] = []
             for row in rows:
-                sk = self._sync_key_product(row) if table == "manager_products" else (
-                    (row.get("mall_id") or row.get("goods_id") or row.get("search_code") or "").strip()
-                )
+                if table == "manager_products":
+                    sk = self._sync_key_product(row)
+                else:
+                    sk = self._sync_key_other(row)
                 if not sk:
                     continue
                 payload.append(
@@ -253,13 +306,12 @@ class CatalogSyncService:
                 )
             if not payload:
                 return
-            # batch 400
             for i in range(0, len(payload), 400):
                 chunk = payload[i : i + 400]
                 body = json.dumps(chunk, ensure_ascii=False).encode("utf-8")
                 url = f"{base}/rest/v1/{table}?on_conflict=sync_key"
                 req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-                with urllib.request.urlopen(req, timeout=90) as resp:
+                with urllib.request.urlopen(req, timeout=120) as resp:
                     resp.read()
 
         deleted = bundle.get("deleted") or {}
@@ -282,9 +334,14 @@ class CatalogSyncService:
 
         self.store.set_setting("sync_table_since", now)
         self._last_remote_rev = rev
-        self.on_log(f"[동기화] 테이블 업로드 완료 rev={rev} ({mode})")
+        n = (
+            len(bundle.get("products") or [])
+            + len(bundle.get("excluded") or [])
+            + len(bundle.get("published") or [])
+        )
+        self.on_log(f"[동기화] 테이블 업로드 완료 rev={rev} ({mode}, {n}건)")
 
-    def _pull_table(self, cfg: dict[str, Any]) -> bool:
+    def _pull_table(self, cfg: dict[str, Any], *, full: bool = False) -> bool:
         base, key = self._rest_base()
         url = f"{base}/rest/v1/manager_sync_meta?select=rev,updated_at&id=eq.1&limit=1"
         req = urllib.request.Request(url, headers=self._headers(key), method="GET")
@@ -296,11 +353,20 @@ class CatalogSyncService:
         local_rev = int(self.store.get_setting("sync_rev", "0") or "0")
         if remote_rev < local_rev:
             self._push_needed = True
-            return False
-        if remote_rev == local_rev and remote_rev == self._last_remote_rev:
+            if not full:
+                return False
+        if (
+            not full
+            and remote_rev == local_rev
+            and remote_rev == self._last_remote_rev
+        ):
             return False
 
-        since = (self.store.get_setting("sync_table_pull_since", "") or "").strip()
+        since = (
+            ""
+            if full
+            else (self.store.get_setting("sync_table_pull_since", "") or "").strip()
+        )
         filt = f"&updated_at=gte.{urllib.parse.quote(since)}" if since else ""
 
         def fetch_table(table: str) -> list[dict[str, Any]]:
@@ -313,7 +379,7 @@ class CatalogSyncService:
                     f"{filt}&order=updated_at.asc&offset={start}&limit={page}"
                 )
                 r = urllib.request.Request(q, headers=self._headers(key), method="GET")
-                with urllib.request.urlopen(r, timeout=60) as resp:
+                with urllib.request.urlopen(r, timeout=90) as resp:
                     chunk = json.loads(resp.read().decode("utf-8"))
                 if not chunk:
                     break
@@ -352,7 +418,7 @@ class CatalogSyncService:
 
         bundle = {
             "schema": 2,
-            "type": "delta" if since else "full",
+            "type": "full" if full or not since else "delta",
             "rev": remote_rev,
             "products": products,
             "excluded": excluded,
@@ -362,19 +428,19 @@ class CatalogSyncService:
         stats = self.store.apply_sync_bundle(bundle)
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
         self.store.set_setting("sync_table_pull_since", now)
-        self.store.set_setting("sync_rev", str(remote_rev))
-        self._last_remote_rev = remote_rev
+        if remote_rev >= local_rev:
+            self.store.set_setting("sync_rev", str(remote_rev))
+            self._last_remote_rev = remote_rev
         n = stats["products"] + stats["excluded"] + stats["published"]
         n += sum(len(v) for v in deleted.values())
-        if n:
-            self.on_log(
-                f"[동기화] 테이블 반영 rev={remote_rev} "
-                f"(상품+{stats['products']} 제외+{stats['excluded']} 등록+{stats['published']})"
-            )
-            if self.on_pulled:
-                self.on_pulled()
-            return True
-        return False
+        mode = "전체" if full or not since else "증분"
+        self.on_log(
+            f"[동기화] 테이블 반영 ({mode}) rev={remote_rev} "
+            f"상품+{stats['products']} 제외+{stats['excluded']} 등록+{stats['published']}"
+        )
+        if n and self.on_pulled:
+            self.on_pulled()
+        return bool(n)
 
     def _rest_base(self) -> tuple[str, str]:
         s = load_cloud_settings()
