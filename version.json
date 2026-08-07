@@ -1,10 +1,13 @@
 {
     "version":  "1.0.16",
-    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.16/WeigouManager.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504878748",
     "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.16/WeigouManager.zip",
-    "notes":  "Fix A/B sync: published mall_id/google_name merge; push on search/publish; recommend auto-republish when missing from homepage",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504878748",
+    "asset_id":  504878748,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/504878748",
                           "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.16/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
-                      ]
+                      ],
+    "notes":  "Fix A/B sync: published mall_id/google_name merge; push on search/publish; recommend auto-republish when missing from homepage"
 }
