@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import mimetypes
 import pathlib
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
-from paths import data_path
+from paths import data_path, get_app_dir, get_resource_path
 
 DEFAULT_MALL_API = "https://shoot-repl.vercel.app/api/catalog"
 DEFAULT_STYLES_API = "https://shoot-repl.vercel.app/api/styles"
@@ -34,9 +35,88 @@ def load_cloud_settings() -> dict[str, Any]:
         return {}
 
 
+def cloud_key_looks_valid(key: str = "") -> bool:
+    """Accept classic JWT service_role or newer sb_secret_* style keys."""
+    k = (key or "").strip()
+    if not k or k.startswith("your_") or "YOUR_" in k:
+        return False
+    if k.startswith("eyJ") and k.count(".") >= 2 and len(k) >= 100:
+        return True
+    if k.startswith("sb_") and len(k) >= 20:
+        return True
+    # Opaque / truncated-looking keys still attempt sync; banner may warn
+    return len(k) >= 40
+
+
 def cloud_enabled() -> bool:
+    """True when URL+key present (sync will still report format/auth errors)."""
     s = load_cloud_settings()
-    return bool(s.get("supabaseUrl") and s.get("serviceRoleKey"))
+    url = (s.get("supabaseUrl") or "").strip()
+    key = (s.get("serviceRoleKey") or "").strip()
+    return bool(url.startswith("http") and key)
+
+
+def cloud_config_issue() -> str:
+    """Human-readable reason sync/cloud cannot run, or empty if OK."""
+    s = load_cloud_settings()
+    url = (s.get("supabaseUrl") or "").strip()
+    key = (s.get("serviceRoleKey") or "").strip()
+    if not url and not key:
+        return "mall_cloud.json 없음 — 배포본 bundled 설정을 확인하세요"
+    if not url.startswith("http"):
+        return "supabaseUrl 이 비어 있거나 잘못되었습니다"
+    if not key:
+        return "serviceRoleKey 가 비어 있습니다"
+    if not cloud_key_looks_valid(key):
+        return (
+            "serviceRoleKey 형식이 올바르지 않습니다 "
+            f"(길이 {len(key)} · Supabase JWT eyJ… 가 필요)"
+        )
+    return ""
+
+
+def ensure_cloud_settings(*, repair_invalid: bool = True) -> bool:
+    """Seed data/mall_cloud.json from release bundled copy when missing/invalid.
+
+    Updates preserve data/ via robocopy /XD, so each release also ships
+    bundled/mall_cloud.json outside data/ for bootstrap.
+    """
+    issue = cloud_config_issue()
+    if not issue:
+        return True
+    if not repair_invalid:
+        return cloud_enabled()
+
+    candidates = [
+        pathlib.Path(get_app_dir()) / "bundled" / "mall_cloud.json",
+        pathlib.Path(get_resource_path("bundled", "mall_cloud.json")),
+    ]
+    dest = _settings_path()
+    local_key_bad = "serviceRoleKey 형식" in (issue or "")
+
+    for src in candidates:
+        try:
+            if not src.is_file():
+                continue
+            try:
+                bundled = json.loads(src.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            b_key = str((bundled or {}).get("serviceRoleKey") or "").strip()
+            # Prefer bundled only if it looks healthier than current
+            if local_key_bad and not cloud_key_looks_valid(b_key):
+                continue
+            if dest.is_file() and not issue:
+                return True
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            if not cloud_config_issue():
+                return True
+            if cloud_enabled():
+                return True
+        except OSError:
+            continue
+    return cloud_enabled()
 
 
 def mall_catalog_api() -> str:

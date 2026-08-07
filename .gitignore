@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 release/
+release-out/
 *.zip
 *.spec.bak
 .DS_Store

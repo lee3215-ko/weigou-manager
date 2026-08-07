@@ -8,7 +8,7 @@ import sys
 
 APP_NAME = "WeigouManager"
 APP_DISPLAY_NAME = "Weigou Product Manager"
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.21"
 EXE_NAME = "WeigouManager.exe"
 RELEASE_ASSET = "WeigouManager.zip"
 UPDATE_VERSION_URL = (

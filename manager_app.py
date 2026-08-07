@@ -31,7 +31,12 @@ LOG_CHANNEL_LABELS = {
 
 from app_role import get_app_role, is_manager_role, role_label
 from auto_collect import walk_list_details
-from catalog_sync import CatalogSyncService, load_sync_settings, save_sync_settings
+from catalog_sync import (
+    CatalogSyncService,
+    ensure_sync_defaults,
+    load_sync_settings,
+    save_sync_settings,
+)
 from collector import collect_page_best, is_cdp_up
 from google_lens import close_ai_browsers, search_product_images, search_products_multi
 from launcher import DEFAULT_PORT, is_running, start_debug
@@ -47,7 +52,10 @@ from customers_ui import (
     format_customer_line,
 )
 from mall_cloud import (
+    cloud_config_issue,
+    cloud_enabled,
     delete_order_remote,
+    ensure_cloud_settings,
     fetch_customers,
     fetch_orders,
     mall_customers_api,
@@ -231,6 +239,11 @@ class ManagerApp(tk.Tk):
         # 자동수집 신규 한도 — 표시값 / 내부값(0=무제한)
         self.collect_limit_var = tk.StringVar(value="100건")
         self.status = tk.StringVar(value="준비됨")
+        self.album_status = tk.StringVar(value="앨범: …")
+        self.sync_status = tk.StringVar(value="목록: 연결 중…")
+        self.sync_banner_var = tk.StringVar(
+            value="클라우드 목록에 자동 연결합니다. 잠시만 기다려 주세요…"
+        )
         self.title_var = EntryField()
         self.google_name_var = EntryField()
         self.name_en_var = EntryField()
@@ -293,10 +306,15 @@ class ManagerApp(tk.Tk):
         self._search_active_id: int | None = None
         self._search_prog: dict | None = None
 
+        # Cloud-first: seed credentials + sync settings before UI (no manual sync click)
+        ensure_cloud_settings(repair_invalid=True)
+        ensure_sync_defaults()
+
         self._sync = CatalogSyncService(
             self.store,
             on_log=lambda m: self._put_log(m, channel=LOG_COLLECT),
             on_pulled=lambda: self.after(0, self._on_catalog_pulled),
+            on_status=lambda st: self.after(0, lambda s=st: self._apply_sync_status(s)),
         )
 
         self._build()
@@ -309,7 +327,8 @@ class ManagerApp(tk.Tk):
         self.after(200, self._poll_log)
         threading.Thread(target=self._status_loop, daemon=True).start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(1200, self._sync.start)
+        # Start sync ASAP — pull shared catalog without user pressing a button
+        self.after(400, self._sync.start)
         self.after(4000, self._start_mall_watch)
         self.after(
             1800,
@@ -1153,7 +1172,7 @@ class ManagerApp(tk.Tk):
 
         tk.Button(
             top,
-            text="목록 동기화",
+            text="동기화 설정",
             command=self._on_sync_settings,
             font=("Malgun Gothic", 10),
             bg="#ebe4da",
@@ -1166,6 +1185,19 @@ class ManagerApp(tk.Tk):
             bg="#ebe4da",
         )
         self.btn_launch.pack(side="right", padx=4)
+
+        # Cloud catalog banner — separate from album CDP connection
+        self._sync_banner = tk.Label(
+            parent,
+            textvariable=self.sync_banner_var,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#fff7ed",
+            fg="#9a3412",
+            anchor="w",
+            padx=12,
+            pady=6,
+        )
+        self._sync_banner.pack(fill="x", padx=12, pady=(0, 4))
         tk.Button(
             top,
             text="선택된 이미지 검색",
@@ -1740,13 +1772,36 @@ class ManagerApp(tk.Tk):
         bottom.pack(fill="x", padx=12, pady=(0, 8))
         status_row = tk.Frame(bottom, bg="#f3efe8")
         status_row.pack(fill="x")
+        self._album_status_lbl = tk.Label(
+            status_row,
+            textvariable=self.album_status,
+            bg="#f3efe8",
+            fg="#b91c1c",
+            font=("Malgun Gothic", 9, "bold"),
+        )
+        self._album_status_lbl.pack(side="left", anchor="w")
+        tk.Label(
+            status_row,
+            text=" | ",
+            bg="#f3efe8",
+            fg="#999",
+            font=("Malgun Gothic", 9),
+        ).pack(side="left")
+        self._sync_status_lbl = tk.Label(
+            status_row,
+            textvariable=self.sync_status,
+            bg="#f3efe8",
+            fg="#9a3412",
+            font=("Malgun Gothic", 9, "bold"),
+        )
+        self._sync_status_lbl.pack(side="left", anchor="w")
         tk.Label(
             status_row,
             textvariable=self.status,
             bg="#f3efe8",
             fg="#2d6a4f",
             font=("Malgun Gothic", 9),
-        ).pack(side="left", anchor="w")
+        ).pack(side="left", anchor="w", padx=(10, 0))
         tk.Button(
             status_row,
             text="로그 관리 열기",
@@ -2019,8 +2074,78 @@ class ManagerApp(tk.Tk):
         except Exception:
             pass
 
+    def _apply_sync_status(self, st: dict | None = None) -> None:
+        """Update sync banner + status chip from CatalogSyncService."""
+        try:
+            st = st or self._sync.get_status()
+        except Exception:
+            st = {"state": "error", "detail": "동기화 상태 확인 실패"}
+        state = str(st.get("state") or "idle")
+        detail = str(st.get("detail") or "")
+        err = str(st.get("last_error") or "")
+        age = st.get("last_ok_age_sec")
+        issue = cloud_config_issue()
+
+        if state == "ok":
+            age_txt = ""
+            if isinstance(age, (int, float)) and age is not None:
+                if age < 5:
+                    age_txt = " · 방금"
+                elif age < 120:
+                    age_txt = f" · {int(age)}초 전"
+                else:
+                    age_txt = f" · {int(age // 60)}분 전"
+            self.sync_status.set(f"목록: 동기화됨{age_txt}")
+            self.sync_banner_var.set(
+                f"클라우드 목록 공유 중{age_txt} — 다른 PC와 자동으로 맞춰집니다. (수동 동기화 불필요)"
+            )
+            try:
+                self._sync_banner.configure(bg="#ecfdf5", fg="#166534")
+                self._sync_status_lbl.configure(fg="#166534")
+            except Exception:
+                pass
+            return
+
+        if state in ("starting", "syncing", "idle"):
+            self.sync_status.set(f"목록: {detail or '연결 중…'}")
+            self.sync_banner_var.set(
+                detail or "클라우드 목록에 자동 연결합니다. 잠시만 기다려 주세요…"
+            )
+            try:
+                self._sync_banner.configure(bg="#fff7ed", fg="#9a3412")
+                self._sync_status_lbl.configure(fg="#9a3412")
+            except Exception:
+                pass
+            return
+
+        if state == "disabled":
+            msg = "목록 동기화가 꺼져 있습니다. [동기화 설정]에서 켜 주세요."
+            self.sync_status.set("목록: 동기화 꺼짐")
+            self.sync_banner_var.set(msg)
+        elif state == "no_cloud":
+            msg = issue or detail or "클라우드 설정 없음"
+            self.sync_status.set("목록: 이 PC만 (동기화 안 됨)")
+            self.sync_banner_var.set(
+                f"⚠ {msg} — 지금 보이는 목록은 이 PC에만 있습니다."
+            )
+        else:
+            msg = err or detail or issue or "동기화 오류"
+            self.sync_status.set("목록: 동기화 실패")
+            self.sync_banner_var.set(
+                f"⚠ {msg[:120]} — 이 PC 목록과 다른 PC가 다를 수 있습니다."
+            )
+        try:
+            self._sync_banner.configure(bg="#fef2f2", fg="#b91c1c")
+            self._sync_status_lbl.configure(fg="#b91c1c")
+        except Exception:
+            pass
+
     def _on_catalog_pulled(self) -> None:
         """Refresh list after remote sync; reload open detail if DB is newer than the form."""
+        try:
+            self._apply_sync_status()
+        except Exception:
+            pass
         cur_id = self.current_id
         cur_pub = self.current_published_id
         mode = self.list_mode.get()
@@ -2061,21 +2186,21 @@ class ManagerApp(tk.Tk):
         return db_ts > self._detail_loaded_at
 
     def _on_sync_settings(self) -> None:
-        from mall_cloud import cloud_enabled, load_cloud_settings
+        from mall_cloud import load_cloud_settings
 
+        ensure_cloud_settings(repair_invalid=True)
         cfg = load_sync_settings()
         cloud = load_cloud_settings()
         win = tk.Toplevel(self)
-        win.title("목록 동기화 설정")
-        win.geometry("520x420")
+        win.title("동기화 설정")
+        win.geometry("540x460")
         win.configure(bg="#f3efe8")
         win.transient(self)
         win.grab_set()
         tk.Label(
             win,
-            text="여러 PC가 같은 상품/제외/등록 목록을 실시간으로 공유합니다.\n"
-            "홈페이지 등록과 같은 Supabase 설정(mall_cloud.json)을 사용합니다.\n"
-            "GitHub 토큰은 필요 없습니다.",
+            text="목록은 클라우드가 본체입니다. 프로그램을 켜면 자동으로 맞춰집니다.\n"
+            "보통은 이 창을 열 필요가 없습니다. (PC 이름·역할만 바꾸면 됩니다)",
             bg="#f3efe8",
             font=("Malgun Gothic", 9),
             justify="left",
@@ -2085,24 +2210,31 @@ class ManagerApp(tk.Tk):
         enabled = tk.BooleanVar(value=bool(cfg.get("enabled", True)))
         tk.Checkbutton(
             win,
-            text="동기화 사용",
+            text="동기화 사용 (권장: 항상 켜기)",
             variable=enabled,
             bg="#f3efe8",
             font=("Malgun Gothic", 10),
         ).pack(anchor="w", padx=16)
 
-        status = (
-            "Supabase 연결됨 — 실시간 동기화 가능"
-            if cloud_enabled()
-            else "Supabase 미설정 — data/mall_cloud.json 을 확인하세요"
-        )
+        issue = cloud_config_issue()
+        if cloud_enabled() and not issue:
+            status = "Supabase 연결됨 — 자동 동기화 동작 중"
+            status_fg = "#166534"
+        elif cloud_enabled() and issue:
+            status = f"설정 문제: {issue}"
+            status_fg = "#b91c1c"
+        else:
+            status = issue or "Supabase 미설정 — bundled/mall_cloud.json 확인"
+            status_fg = "#b91c1c"
         tk.Label(
             win,
             text=status,
             bg="#f3efe8",
-            fg="#166534" if cloud_enabled() else "#b91c1c",
+            fg=status_fg,
             font=("Malgun Gothic", 9, "bold"),
             anchor="w",
+            wraplength=500,
+            justify="left",
         ).pack(fill="x", padx=16, pady=(4, 2))
         url = (cloud.get("supabaseUrl") or "").strip()
         if url:
@@ -2391,11 +2523,14 @@ class ManagerApp(tk.Tk):
                 running = is_running()
                 cdp = is_cdp_up(DEFAULT_PORT)
                 if cdp:
-                    text = "연결됨 · 디버그 포트 OK"
+                    album = "앨범: 연결됨"
+                    album_fg = "#166534"
                 elif running:
-                    text = "앱 실행 중 · 디버그 포트 없음 → [디버그 실행] 필요"
+                    album = "앨범: 실행중·디버그 없음"
+                    album_fg = "#b45309"
                 else:
-                    text = "앱 미실행"
+                    album = "앨범: 미실행"
+                    album_fg = "#b91c1c"
                 try:
                     ex_n = len(self.store.list_excluded())
                     pub_n = len(self.store.list_published())
@@ -2407,29 +2542,32 @@ class ManagerApp(tk.Tk):
                 jobs = self._jobs_status_text()
                 job_bit = f"  |  {jobs}" if jobs else ""
                 if mode == "excluded":
-                    self.after(
-                        0,
-                        lambda t=text, e=ex_n, j=job_bit: self.status.set(
-                            f"{t}  |  제외 목록 {e}개{j}"
-                        ),
-                    )
+                    counts = f"제외 목록 {ex_n}개{job_bit}"
                 elif mode == "published":
-                    self.after(
-                        0,
-                        lambda t=text, p=pub_n, j=job_bit: self.status.set(
-                            f"{t}  |  등록 목록 {p}개{j}"
-                        ),
-                    )
+                    counts = f"등록 목록 {pub_n}개{job_bit}"
                 else:
-                    self.after(
-                        0,
-                        lambda t=text, n=n, e=ex_n, p=pub_n, j=job_bit: self.status.set(
-                            f"{t}  |  상품 {n}개  ·  등록 {p}개  ·  제외 {e}개{j}"
-                        ),
-                    )
+                    counts = f"상품 {n}개  ·  등록 {pub_n}개  ·  제외 {ex_n}개{job_bit}"
+
+                def _apply(
+                    a=album,
+                    af=album_fg,
+                    c=counts,
+                ) -> None:
+                    self.album_status.set(a)
+                    try:
+                        self._album_status_lbl.configure(fg=af)
+                    except Exception:
+                        pass
+                    self.status.set(c)
+                    try:
+                        self._apply_sync_status()
+                    except Exception:
+                        pass
+
+                self.after(0, _apply)
             except Exception:
                 pass
-            self._stop.wait(3.0)
+            self._stop.wait(2.0)
 
     def _job_start(self, name: str) -> bool:
         """Start a named job. Same name cannot overlap; different jobs can run together.

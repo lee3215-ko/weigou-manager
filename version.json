@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.18",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/505016944",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.18/WeigouManager.zip",
-    "notes":  "전체 목록 맞추기(A/B 상품 수 합집합 동기화) + 업데이트 후 자동 재실행 강화",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/505016944",
-    "asset_id":  505016944,
+    "version":  "1.0.21",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.21/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.21/WeigouManager.zip",
+    "notes":  "목록 클라우드 자동동기화: 앨범/목록 상태 분리, 시작 시 자동 맞춤, bundled mall_cloud 배포",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/505016944",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.18/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.21/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }

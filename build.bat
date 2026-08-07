@@ -6,21 +6,47 @@ if not exist ".venv\Scripts\python.exe" (
   python -m venv .venv
 )
 
-call .venv\Scripts\activate.bat
-python -m pip install -q --upgrade pip
+call ".venv\Scripts\activate.bat"
+REM skip pip self-upgrade (often locks broken ~ip leftovers)
 pip install -q -r requirements.txt
+if errorlevel 1 exit /b 1
 pip install -q pyinstaller pillow certifi
-
-pyinstaller --noconfirm --clean build.spec
 if errorlevel 1 exit /b 1
 
-set RELEASE=release\WeigouManager
-if exist release rmdir /s /q release
+set "PYI_WORK=%TEMP%\weigou-pyi-build"
+set "PYI_DIST=%TEMP%\weigou-pyi-dist"
+if exist "%PYI_WORK%" rmdir /s /q "%PYI_WORK%" 2>nul
+if exist "%PYI_DIST%" rmdir /s /q "%PYI_DIST%" 2>nul
+
+pyinstaller --noconfirm --workpath "%PYI_WORK%" --distpath "%PYI_DIST%" build.spec
+if errorlevel 1 exit /b 1
+
+REM Use release-out (not release/) to avoid locks from a running installed copy
+set RELEASE=release-out\WeigouManager
+if exist release-out rmdir /s /q release-out 2>nul
 mkdir "%RELEASE%"
-xcopy /E /I /Y "dist\WeigouManager\*" "%RELEASE%\" >nul
+xcopy /E /I /Y "%PYI_DIST%\WeigouManager\*" "%RELEASE%\" >nul
+if errorlevel 1 exit /b 1
 
 if not exist "%RELEASE%\data" mkdir "%RELEASE%\data"
+if not exist "%RELEASE%\bundled" mkdir "%RELEASE%\bundled"
 if exist "data\sync_settings.example.json" copy /Y "data\sync_settings.example.json" "%RELEASE%\data\sync_settings.example.json" >nul
+REM Cloud credentials: fresh install seed + update bootstrap (robocopy keeps data/)
+if exist "data\mall_cloud.json" (
+  copy /Y "data\mall_cloud.json" "%RELEASE%\data\mall_cloud.json" >nul
+  copy /Y "data\mall_cloud.json" "%RELEASE%\bundled\mall_cloud.json" >nul
+)
+if exist "data\mall_cloud.example.json" copy /Y "data\mall_cloud.example.json" "%RELEASE%\data\mall_cloud.example.json" >nul
+if not exist "%RELEASE%\data\sync_settings.json" (
+  >"%RELEASE%\data\sync_settings.json" echo {
+  >>"%RELEASE%\data\sync_settings.json" echo   "enabled": true,
+  >>"%RELEASE%\data\sync_settings.json" echo   "backend": "supabase",
+  >>"%RELEASE%\data\sync_settings.json" echo   "interval_sec": 2,
+  >>"%RELEASE%\data\sync_settings.json" echo   "device_name": "",
+  >>"%RELEASE%\data\sync_settings.json" echo   "role": "full",
+  >>"%RELEASE%\data\sync_settings.json" echo   "prefer_table_sync": true
+  >>"%RELEASE%\data\sync_settings.json" echo }
+)
 
 echo @echo off> "%RELEASE%\run.bat"
 echo cd /d "%%~dp0">> "%RELEASE%\run.bat"

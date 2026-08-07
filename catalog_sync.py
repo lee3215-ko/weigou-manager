@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
-from mall_cloud import cloud_enabled, load_cloud_settings
+from mall_cloud import cloud_config_issue, cloud_enabled, ensure_cloud_settings, load_cloud_settings
 from paths import data_path
 from product_store import ProductStore
 
@@ -71,11 +71,43 @@ def save_sync_settings(cfg: dict[str, Any]) -> None:
     path.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-class CatalogSyncService:
-    """Background pull/push of the shared catalog via Supabase Storage.
+def ensure_sync_defaults() -> dict[str, Any]:
+    """Auto-enable sync and fill device name — no manual setup required."""
+    import socket
 
+    ensure_cloud_settings(repair_invalid=True)
+    cfg = load_sync_settings()
+    changed = False
+    if not cfg.get("enabled", True):
+        cfg["enabled"] = True
+        changed = True
+    name = str(cfg.get("device_name") or "").strip()
+    if not name:
+        try:
+            name = socket.gethostname().strip() or "PC"
+        except Exception:
+            name = "PC"
+        cfg["device_name"] = name
+        changed = True
+    try:
+        interval = float(cfg.get("interval_sec") or 2)
+    except Exception:
+        interval = 2
+    if interval > 5:
+        cfg["interval_sec"] = 2
+        changed = True
+    if changed or not pathlib.Path(data_path("sync_settings.json")).is_file():
+        save_sync_settings(cfg)
+    return cfg
+
+
+class CatalogSyncService:
+    """Background pull/push of the shared catalog via Supabase.
+
+    Cloud is the shared catalog. Local SQLite is a cache.
     - Local change → push almost immediately (debounced ~0.4s)
     - Remote change → pull every few seconds (default 2s)
+    - Startup → full reconcile (pull then push) without user action
     """
 
     def __init__(
@@ -84,10 +116,12 @@ class CatalogSyncService:
         *,
         on_log: ProgressCb | None = None,
         on_pulled: Callable[[], None] | None = None,
+        on_status: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.store = store
         self.on_log = on_log or (lambda _m: None)
         self.on_pulled = on_pulled
+        self.on_status = on_status
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -100,12 +134,49 @@ class CatalogSyncService:
         self._bucket_ready = False
         self._last_err_log = 0.0
         self._warned_cloud = False
+        self._status = "idle"
+        self._status_detail = "시작 대기"
+        self._last_ok_at = 0.0
+        self._last_error = ""
+        self._ever_ok = False
+        self._status_lock = threading.Lock()
+
+    def get_status(self) -> dict[str, Any]:
+        with self._status_lock:
+            age = (time.time() - self._last_ok_at) if self._last_ok_at else None
+            return {
+                "state": self._status,
+                "detail": self._status_detail,
+                "last_ok_at": self._last_ok_at,
+                "last_ok_age_sec": age,
+                "last_error": self._last_error,
+                "ever_ok": self._ever_ok,
+                "remote_rev": self._last_remote_rev,
+            }
+
+    def _set_status(self, state: str, detail: str = "", *, error: str = "") -> None:
+        with self._status_lock:
+            self._status = state
+            self._status_detail = detail or state
+            if error:
+                self._last_error = error
+            if state == "ok":
+                self._last_ok_at = time.time()
+                self._ever_ok = True
+                self._last_error = ""
+        if self.on_status:
+            try:
+                self.on_status(self.get_status())
+            except Exception:
+                pass
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        ensure_sync_defaults()
         self._stop.clear()
         self._wake.clear()
+        self._set_status("starting", "클라우드 목록 연결 중…")
         self._thread = threading.Thread(target=self._loop, name="catalog-sync", daemon=True)
         self._thread.start()
 
@@ -141,9 +212,10 @@ class CatalogSyncService:
         threading.Thread(target=self._cycle, daemon=True).start()
 
     def _loop(self) -> None:
-        # First cycle: always full reconcile once after launch.
+        # First cycle: always full reconcile once after launch (pull then push).
         self._force_full = True
         self._push_needed = True
+        self._set_status("syncing", "시작 시 전체 목록 맞추는 중…")
         self._cycle()
         while not self._stop.is_set():
             woken = self._wake.wait(timeout=self._interval())
@@ -171,15 +243,25 @@ class CatalogSyncService:
     def _cycle(self) -> None:
         cfg = load_sync_settings()
         if not cfg.get("enabled", True):
+            self._set_status("disabled", "동기화 꺼짐 — 설정에서 켜 주세요")
             return
+        # Re-try bootstrap each cycle until cloud works (bundled may appear after update)
+        if not cloud_enabled():
+            ensure_cloud_settings(repair_invalid=True)
+        issue = cloud_config_issue()
         if not cloud_enabled():
             if not self._warned_cloud:
                 self._warned_cloud = True
                 self.on_log(
-                    "[동기화] mall_cloud.json 에 supabaseUrl / serviceRoleKey 가 필요합니다. "
-                    "(홈페이지 등록과 동일 설정)"
+                    f"[동기화] 클라우드 설정 필요: {issue or 'mall_cloud.json'}"
                 )
+            self._set_status("no_cloud", issue or "클라우드 설정 없음", error=issue)
             return
+        if issue:
+            # Key present but looks wrong — still try, surface warning
+            self._set_status("syncing", f"연결 시도 중… ({issue})")
+        else:
+            self._set_status("syncing", "목록 동기화 중…")
         self._cycle_n += 1
         # Periodic full reconcile (~5 min at 2s interval) keeps A/B identical.
         if self._cycle_n > 1 and self._cycle_n % 150 == 0:
@@ -194,13 +276,17 @@ class CatalogSyncService:
                     if self._push_needed or force:
                         self._push_table(cfg, full=force)
                         self._push_needed = False
+                    self._set_status("ok", f"목록 동기화됨 · rev {self._last_remote_rev}")
                     return
                 self._pull(cfg)
                 if self._push_needed or force:
                     self._push(cfg)
                     self._push_needed = False
+                self._set_status("ok", f"목록 동기화됨 · rev {self._last_remote_rev}")
             except Exception as e:
+                err = str(e)
                 self._log_err_throttled(f"[동기화] 오류: {e}")
+                self._set_status("error", f"동기화 실패: {err[:80]}", error=err)
 
     def _table_sync_available(self) -> bool:
         if getattr(self, "_table_sync_ok", None) is False:

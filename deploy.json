@@ -10,7 +10,7 @@
   },
   "build": {
     "script": "build.bat",
-    "dist_dir": "release/WeigouManager"
+    "dist_dir": "release-out/WeigouManager"
   },
   "git_add": [
     ".gitignore",
@@ -54,6 +54,7 @@
     "shared",
     "data/sync_settings.example.json",
     "data/mall_cloud.example.json",
+    "README.md",
     ".cursor/rules"
   ]
 }
