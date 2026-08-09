@@ -6,9 +6,10 @@ import json
 import pathlib
 import re
 import shutil
+import time
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from price_codec import (
     DEFAULT_PRICE_TEXT,
@@ -17,7 +18,7 @@ from price_codec import (
     is_text_price_label,
 )
 from product_attrs import _detect_brand, extract_attrs
-from product_store import Product
+from product_store import Product, ProductStore
 from image_enhance import enhance_image_file
 from mall_cloud import (
     _supabase_rest,
@@ -28,6 +29,8 @@ from mall_cloud import (
     request_json,
     upload_file,
 )
+
+ProgressCb = Callable[[str], None]
 
 MALL_API = "http://127.0.0.1:3000/api/catalog"
 PRODUCT_BUCKET = "product-images"
@@ -93,6 +96,13 @@ def _copy_images(product: Product, folder_key: str) -> list[str]:
             urls.append(upload_file(PRODUCT_BUCKET, object_path, enhanced))
         else:
             urls.append(f"/uploads/{folder_key}/{final_name}")
+    if urls:
+        return urls
+    # Reconcile / manager PC: local files may be absent — reuse stored public URLs.
+    for u in list(getattr(product, "image_urls", None) or []):
+        s = str(u or "").strip()
+        if s.startswith("http://") or s.startswith("https://"):
+            urls.append(s)
     return urls
 
 
@@ -284,19 +294,61 @@ def _api_url(extra_query: str) -> str:
     return f"{base}{sep}{extra}"
 
 
-def _fetch_live_catalog() -> list[dict[str, Any]]:
-    """Full remote catalog (all=1). Paginated GET is NOT enough for recommend/delete."""
+def _fetch_live_catalog(*, allow_local: bool = True) -> list[dict[str, Any]]:
+    """Full remote catalog. Prefer API all=1, then Supabase rows, then local mirror."""
     try:
-        data = get_json(_api_url("all=1"), timeout=180)
+        data = get_json(_api_url("all=1"), timeout=240)
         products = data.get("products")
         if isinstance(products, list) and products:
             return [p for p in products if isinstance(p, dict)]
     except Exception:
         pass
-    return _load_catalog()
+    # Direct Supabase (when API dump is too large / restricted)
+    try:
+        out: list[dict[str, Any]] = []
+        start = 0
+        page = 1000
+        while True:
+            rows = _supabase_rest(
+                f"products?select=id,search_code,created_at,payload"
+                f"&order=created_at.desc&offset={start}&limit={page}",
+                method="GET",
+                timeout=120,
+            )
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                payload = row.get("payload")
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        payload = None
+                if not isinstance(payload, dict):
+                    continue
+                item = dict(payload)
+                item["id"] = str(row.get("id") or item.get("id") or "").strip()
+                if row.get("created_at") and not item.get("createdAt"):
+                    item["createdAt"] = row["created_at"]
+                if item.get("id"):
+                    out.append(item)
+            if len(rows) < page:
+                break
+            start += page
+        if out:
+            return out
+    except Exception:
+        pass
+    if allow_local:
+        return _load_catalog()
+    return []
 
 
-def _fetch_product_by_id(mall_id: str) -> dict[str, Any] | None:
+def _fetch_product_by_id(
+    mall_id: str, *, remote_only: bool = False
+) -> dict[str, Any] | None:
     """Fetch one homepage product by id (reliable; ignores pagination)."""
     mid = (mall_id or "").strip()
     if not mid:
@@ -307,10 +359,26 @@ def _fetch_product_by_id(mall_id: str) -> dict[str, Any] | None:
         if isinstance(product, dict) and product.get("id"):
             return dict(product)
     except Exception:
-        pass
+        if remote_only:
+            return None
+    if remote_only:
+        return None
     for row in _load_catalog():
         if str(row.get("id") or "").strip() == mid:
             return dict(row)
+    return None
+
+
+def _wait_live_product(mall_id: str, *, attempts: int = 6, delay: float = 0.7) -> dict[str, Any] | None:
+    mid = (mall_id or "").strip()
+    if not mid:
+        return None
+    for i in range(max(1, attempts)):
+        hit = _fetch_product_by_id(mid, remote_only=True)
+        if hit:
+            return hit
+        if i + 1 < attempts:
+            time.sleep(delay)
     return None
 
 
@@ -506,6 +574,7 @@ def publish_product(
     push_api: bool = True,
     mall_id: str | None = None,
     recommended: bool | None = None,
+    verify_live: bool = True,
 ) -> dict[str, Any]:
     item = build_mall_product(
         product,
@@ -514,29 +583,50 @@ def publish_product(
         category=category,
         mall_id=mall_id,
     )
+    now = datetime.now(timezone.utc).isoformat()
+    force_id = (mall_id or "").strip()
+    existing_remote = (
+        _fetch_product_by_id(str(item.get("id") or ""), remote_only=True)
+        if force_id or cloud_enabled()
+        else None
+    )
+    # New publishes get "now" so they appear on the newest homepage page.
+    # Re-publishes keep prior createdAt when the live row already exists.
+    if existing_remote and existing_remote.get("createdAt"):
+        item["createdAt"] = existing_remote.get("createdAt")
+    else:
+        item["createdAt"] = now
     if recommended is not None:
         item["recommended"] = bool(recommended)
         if recommended:
-            item["recommendedAt"] = datetime.now(timezone.utc).isoformat()
+            item["recommendedAt"] = now
         else:
             item.pop("recommendedAt", None)
     else:
         # Preserve existing homepage recommended flag when re-publishing.
-        existing = _fetch_product_by_id(str(item.get("id") or ""))
-        if existing and existing.get("recommended"):
+        if existing_remote and existing_remote.get("recommended"):
             item["recommended"] = True
-            if existing.get("recommendedAt"):
-                item["recommendedAt"] = existing.get("recommendedAt")
+            if existing_remote.get("recommendedAt"):
+                item["recommendedAt"] = existing_remote.get("recommendedAt")
     out = _upsert_catalog_items([item])
     api_msg = _post_api(item) if push_api else "skipped"
     if push_api and cloud_enabled() and _api_failed(api_msg):
         raise RuntimeError(f"홈페이지 API 등록 실패: {api_msg}")
+    mid = str(item.get("id") or "").strip()
+    if push_api and verify_live and cloud_enabled():
+        live = _wait_live_product(mid)
+        if not live:
+            raise RuntimeError(
+                "홈페이지에 상품이 확인되지 않아 등록 목록으로 옮기지 않습니다 "
+                f"(id={mid}). 잠시 후 다시 시도하세요."
+            )
     return {
         "product": item,
         "catalogCount": len(out),
         "catalogPath": str(catalog_path()),
         "api": api_msg,
         "priceLabel": item.get("priceNote", ""),
+        "verified": bool(push_api and cloud_enabled()),
     }
 
 
@@ -587,6 +677,18 @@ def publish_products(
                     r["error"] = f"홈페이지 API 실패: {api_msg}"
                     r["api"] = api_msg
             return results
+        if cloud_enabled():
+            for r in results:
+                if not r.get("ok"):
+                    continue
+                mid = str((r.get("product") or {}).get("id") or "").strip()
+                if not mid:
+                    r["ok"] = False
+                    r["error"] = "mall_id 없음"
+                    continue
+                if not _wait_live_product(mid):
+                    r["ok"] = False
+                    r["error"] = f"홈페이지 미확인: {mid}"
     for r in results:
         if r.get("ok"):
             r["catalogCount"] = len(out)
@@ -599,14 +701,17 @@ def _api_failed(msg: str) -> bool:
     m = (msg or "").strip()
     if not m:
         return True
-    low = m.lower()
-    if low.startswith("api ok"):
+    compact = m.lower().replace(" ", "")
+    if "unauthorized" in compact:
+        return True
+    if compact.startswith("api오류") or compact.startswith("api미연결"):
+        return True
+    if compact.startswith("apiok"):
+        # upsertProducts can return ok:true with count:0 (all rows filtered)
+        if '"count":0' in compact or "count:0" in compact:
+            return True
         return False
-    return (
-        low.startswith("api 오류")
-        or low.startswith("api 미연결")
-        or "unauthorized" in low
-    )
+    return True
 
 
 def _post_api(item: dict[str, Any]) -> str:
@@ -615,7 +720,236 @@ def _post_api(item: dict[str, Any]) -> str:
 
 def _post_api_many(items: list[dict[str, Any]]) -> str:
     api = mall_catalog_api() if cloud_enabled() else MALL_API
-    return post_json(api, {"products": items}, timeout=120)
+    return post_json(api, {"products": items}, timeout=180)
+
+
+def _dup_keys(row: dict[str, Any]) -> list[str]:
+    """Keys used to detect homepage duplicates.
+
+    Prefer weigou goods id. 搜索码 alone is too weak (many distinct items can
+    share a NO) — only treat as duplicate when code + name match.
+    """
+    keys: list[str] = []
+    gid = str(row.get("weigouId") or row.get("goodsId") or "").strip()
+    code = str(row.get("searchCode") or row.get("skuNo") or "").strip()
+    name = str(row.get("name") or "").strip().lower()
+    if gid:
+        keys.append(f"gid:{gid}")
+    if code and len(code) >= 3 and name:
+        keys.append(f"code:{code}|name:{name}")
+    return keys
+
+
+def _dup_rank(row: dict[str, Any]) -> tuple:
+    imgs = row.get("images") if isinstance(row.get("images"), list) else []
+    return (
+        1 if row.get("recommended") else 0,
+        len(imgs),
+        1 if row.get("image") else 0,
+        str(row.get("createdAt") or ""),
+        str(row.get("id") or ""),
+    )
+
+
+def dedupe_homepage_catalog(
+    *,
+    push_api: bool = True,
+    on_log: ProgressCb | None = None,
+) -> dict[str, Any]:
+    """Remove duplicate live products (same weigouId / 搜索码). Keep best row."""
+    log = on_log or (lambda _m: None)
+    products = _fetch_live_catalog(allow_local=False)
+    if not products:
+        log("[정리] 홈페이지 상품을 불러오지 못했습니다")
+        return {"scanned": 0, "deleted": 0, "groups": 0, "ids": []}
+
+    id_to_row: dict[str, dict[str, Any]] = {}
+    for row in products:
+        rid = str(row.get("id") or "").strip()
+        if rid:
+            id_to_row[rid] = row
+
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    key_owner: dict[str, str] = {}
+    for rid, row in id_to_row.items():
+        for key in _dup_keys(row):
+            prev = key_owner.get(key)
+            if prev:
+                union(prev, rid)
+            else:
+                key_owner[key] = rid
+
+    components: dict[str, list[str]] = {}
+    for rid in id_to_row:
+        components.setdefault(find(rid), []).append(rid)
+
+    drop_ids: list[str] = []
+    groups = 0
+    for members in components.values():
+        if len(members) <= 1:
+            continue
+        groups += 1
+        ranked = sorted(
+            (id_to_row[m] for m in members),
+            key=_dup_rank,
+            reverse=True,
+        )
+        for row in ranked[1:]:
+            drop_ids.append(str(row.get("id") or ""))
+
+    ids = [i for i in dict.fromkeys(drop_ids) if i]
+    if not ids:
+        log(f"[정리] 홈페이지 중복 없음 (스캔 {len(products)}개)")
+        return {"scanned": len(products), "deleted": 0, "groups": 0, "ids": []}
+
+    log(f"[정리] 홈페이지 중복 {len(ids)}개 삭제 예정 (그룹 {groups} · 스캔 {len(products)}개)")
+    result = delete_mall_products(ids, push_api=push_api)
+    log(f"[정리] 홈페이지 중복 삭제 완료 {result.get('deleted') or 0}개")
+    return {
+        "scanned": len(products),
+        "deleted": int(result.get("deleted") or 0),
+        "groups": groups,
+        "ids": ids,
+        "api": result.get("api"),
+    }
+
+
+def reconcile_published_to_homepage(
+    store: ProductStore,
+    *,
+    on_log: ProgressCb | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    dedupe_first: bool = True,
+) -> dict[str, Any]:
+    """Ensure every local 「등록」 row exists on the live homepage; dedupe site first."""
+    log = on_log or (lambda _m: None)
+    stats: dict[str, Any] = {
+        "deduped": 0,
+        "ok": 0,
+        "fixed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+    local_dupes = 0
+    try:
+        local_dupes = int(store.dedupe_published() or 0)
+    except Exception:
+        local_dupes = 0
+    if local_dupes:
+        log(f"[정리] 로컬 등록 중복 {local_dupes}개 제거")
+
+    if dedupe_first and cloud_enabled():
+        try:
+            d = dedupe_homepage_catalog(push_api=True, on_log=log)
+            stats["deduped"] = int(d.get("deleted") or 0)
+        except Exception as e:  # noqa: BLE001
+            log(f"[정리] 홈페이지 중복 정리 실패: {e}")
+            stats["errors"].append(str(e))
+
+    items = store.list_published()
+    total = len(items)
+    log(f"[맞추기] 로컬 등록 {total}개 → 홈페이지 확인/재등록 시작")
+
+    live_rows = _fetch_live_catalog(allow_local=False)
+    by_id: dict[str, dict[str, Any]] = {}
+    by_code: dict[str, dict[str, Any]] = {}
+    by_gid: dict[str, dict[str, Any]] = {}
+    for row in live_rows:
+        rid = str(row.get("id") or "").strip()
+        if rid:
+            by_id[rid] = row
+        code = str(row.get("searchCode") or row.get("skuNo") or "").strip()
+        if code and code not in by_code:
+            by_code[code] = row
+        gid = str(row.get("weigouId") or row.get("goodsId") or "").strip()
+        if gid and gid not in by_gid:
+            by_gid[gid] = row
+    log(f"[맞추기] 홈페이지 현재 {len(by_id)}개 로드")
+
+    for i, item in enumerate(items, start=1):
+        name = (item.google_name or item.title or f"#{item.id}").strip()[:40]
+        if on_progress:
+            on_progress(i - 1, total, f"[{i}/{total}] {name}")
+        try:
+            mid = (item.mall_id or "").strip()
+            code = (item.search_code or "").strip()
+            gid = (item.goods_id or "").strip()
+            live = None
+            if mid and mid in by_id:
+                live = by_id[mid]
+            elif code and code in by_code:
+                live = by_code[code]
+            elif gid and gid in by_gid:
+                live = by_gid[gid]
+            if live:
+                new_mid = str(live.get("id") or mid or "").strip()
+                if new_mid and new_mid != (item.mall_id or "").strip():
+                    store.update_published(item.id, mall_id=new_mid)
+                stats["ok"] += 1
+                continue
+
+            product = store.published_to_product(item)
+            if not (product.sku_no or "").strip():
+                store.update_published(item.id, sku_no=DEFAULT_PRICE_TEXT)
+                item = store.get_published(item.id) or item
+                product = store.published_to_product(item)
+            colors = [c.strip() for c in (item.colors or "").split(",") if c.strip()]
+            sizes = [s.strip() for s in (item.sizes or "").split(",") if s.strip()]
+            use_mid = mid or None
+            result = publish_product(
+                product,
+                colors=colors or None,
+                sizes=sizes or None,
+                category=item.category or None,
+                push_api=True,
+                mall_id=use_mid,
+                recommended=True if item.recommended else None,
+                verify_live=True,
+            )
+            new_mall = str((result.get("product") or {}).get("id") or use_mid or "")
+            store.update_published(
+                item.id,
+                mall_id=new_mall,
+                note=result.get("priceLabel") or item.note,
+            )
+            # Keep indexes fresh so later local dupes match the new live row
+            pub = result.get("product") or {}
+            if isinstance(pub, dict) and new_mall:
+                by_id[new_mall] = pub
+                c2 = str(pub.get("searchCode") or pub.get("skuNo") or code).strip()
+                if c2:
+                    by_code[c2] = pub
+                g2 = str(pub.get("weigouId") or gid).strip()
+                if g2:
+                    by_gid[g2] = pub
+            stats["fixed"] += 1
+            log(f"[맞추기] 재등록 완료 등록#{item.id} → {new_mall}")
+        except Exception as e:  # noqa: BLE001
+            stats["failed"] += 1
+            err = f"등록#{item.id}: {e}"
+            stats["errors"].append(err)
+            log(f"[맞추기] 실패 {err}")
+    if on_progress:
+        on_progress(total, total, "완료")
+    log(
+        f"[맞추기] 끝 - 이미있음 {stats['ok']} / 재등록 {stats['fixed']} / "
+        f"실패 {stats['failed']} / 중복삭제 {stats['deduped']}"
+    )
+    return stats
 
 
 def preview_price(sku_no: str) -> str:

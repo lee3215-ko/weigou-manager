@@ -71,6 +71,29 @@ def save_sync_settings(cfg: dict[str, Any]) -> None:
     path.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _http_error_detail(exc: BaseException) -> str:
+    """Turn urllib/HTTP failures into a short Korean message."""
+    if isinstance(exc, urllib.error.HTTPError):
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        low = raw.lower()
+        if exc.code == 402 or "quota" in low or "restricted" in low:
+            return (
+                "Supabase 할당량 초과(402) — 대시보드에서 요금제/용량을 복구한 뒤 "
+                "다시 동기화하세요 (egress·storage 제한)"
+            )
+        if exc.code in (401, 403):
+            return f"Supabase 인증 실패({exc.code}) — serviceRoleKey 를 확인하세요"
+        if exc.code == 404:
+            return "Supabase 리소스 없음(404)"
+        snippet = raw.replace("\n", " ").strip()[:120]
+        return f"HTTP {exc.code}" + (f": {snippet}" if snippet else "")
+    return str(exc)[:160]
+
+
 def ensure_sync_defaults() -> dict[str, Any]:
     """Auto-enable sync and fill device name — no manual setup required."""
     import socket
@@ -134,6 +157,8 @@ class CatalogSyncService:
         self._bucket_ready = False
         self._last_err_log = 0.0
         self._warned_cloud = False
+        self._cloud_restricted = ""  # set when Supabase returns 402 quota lock
+        self._cloud_restricted_at = 0.0
         self._status = "idle"
         self._status_detail = "시작 대기"
         self._last_ok_at = 0.0
@@ -271,22 +296,35 @@ class CatalogSyncService:
         self._force_full = False
         with self._lock:
             try:
-                if cfg.get("prefer_table_sync", True) and self._table_sync_available():
+                # Quota lock: skip hammering APIs, but retry every ~10 min.
+                if self._cloud_restricted:
+                    if time.time() - self._cloud_restricted_at < 600:
+                        raise RuntimeError(self._cloud_restricted)
+                    self._cloud_restricted = ""
+                    self._table_sync_ok = None
+                prefer_table = bool(cfg.get("prefer_table_sync", True))
+                table_ok = prefer_table and self._table_sync_available()
+                if table_ok:
                     self._pull_table(cfg, full=force)
                     if self._push_needed or force:
                         self._push_table(cfg, full=force)
                         self._push_needed = False
                     self._set_status("ok", f"목록 동기화됨 · rev {self._last_remote_rev}")
                     return
+                if self._cloud_restricted:
+                    raise RuntimeError(self._cloud_restricted)
                 self._pull(cfg)
                 if self._push_needed or force:
                     self._push(cfg)
                     self._push_needed = False
                 self._set_status("ok", f"목록 동기화됨 · rev {self._last_remote_rev}")
             except Exception as e:
-                err = str(e)
-                self._log_err_throttled(f"[동기화] 오류: {e}")
-                self._set_status("error", f"동기화 실패: {err[:80]}", error=err)
+                err = _http_error_detail(e) if isinstance(e, urllib.error.HTTPError) else str(e)
+                if "할당량" in err or "402" in err:
+                    self._cloud_restricted = err
+                    self._cloud_restricted_at = time.time()
+                self._log_err_throttled(f"[동기화] 오류: {err}")
+                self._set_status("error", f"동기화 실패: {err[:90]}", error=err)
 
     def _table_sync_available(self) -> bool:
         if getattr(self, "_table_sync_ok", None) is False:
@@ -303,8 +341,16 @@ class CatalogSyncService:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp.read()
             self._table_sync_ok = True
+            self._cloud_restricted = ""
             return True
         except urllib.error.HTTPError as e:
+            detail = _http_error_detail(e)
+            if e.code == 402 or "할당량" in detail:
+                # Do not fall back to storage — same project is locked.
+                self._cloud_restricted = detail
+                self._cloud_restricted_at = time.time()
+                self._table_sync_ok = None  # retry after quota restored
+                return False
             if e.code == 404:
                 self._table_sync_ok = False
                 return False
@@ -550,6 +596,28 @@ class CatalogSyncService:
     def _ensure_bucket(self, base: str, key: str) -> None:
         if self._bucket_ready:
             return
+        if self._cloud_restricted:
+            raise RuntimeError(self._cloud_restricted)
+        # Prefer GET — avoid noisy create failures when project is quota-locked.
+        get_url = f"{base}/storage/v1/bucket/{SYNC_BUCKET}"
+        get_req = urllib.request.Request(
+            get_url, headers=self._headers(key), method="GET"
+        )
+        try:
+            with urllib.request.urlopen(get_req, timeout=20) as resp:
+                resp.read()
+            self._bucket_ready = True
+            self._cloud_restricted = ""
+            return
+        except urllib.error.HTTPError as e:
+            detail = _http_error_detail(e)
+            if e.code == 402 or "할당량" in detail:
+                self._cloud_restricted = detail
+                raise RuntimeError(detail) from e
+            if e.code != 404:
+                # Auth/other errors: surface clearly (not "create failed")
+                raise RuntimeError(f"동기화 버킷 확인 실패: {detail}") from e
+
         url = f"{base}/storage/v1/bucket"
         body = json.dumps(
             {
@@ -572,18 +640,17 @@ class CatalogSyncService:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 resp.read()
             self._bucket_ready = True
+            self._cloud_restricted = ""
         except urllib.error.HTTPError as e:
-            raw = ""
-            try:
-                raw = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
+            detail = _http_error_detail(e)
+            if e.code == 402 or "할당량" in detail:
+                self._cloud_restricted = detail
+                raise RuntimeError(detail) from e
             # 409 / Duplicate / already exists → OK
-            low = raw.lower()
-            if e.code in (200, 201, 409) or "exist" in low or "duplicate" in low:
+            if e.code in (200, 201, 409) or "exist" in detail.lower() or "duplicate" in detail.lower():
                 self._bucket_ready = True
                 return
-            raise RuntimeError(f"동기화 버킷 생성 실패 ({e.code}): {raw[:200]}") from e
+            raise RuntimeError(f"동기화 버킷 생성 실패: {detail}") from e
 
     def _object_url(self, base: str) -> str:
         return f"{base}/storage/v1/object/{SYNC_BUCKET}/{SYNC_OBJECT}"

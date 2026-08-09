@@ -70,6 +70,7 @@ from mall_publish import (
     delete_mall_products,
     preview_price,
     publish_product,
+    reconcile_published_to_homepage,
     resolve_mall_id,
     set_products_recommended,
 )
@@ -330,6 +331,8 @@ class ManagerApp(tk.Tk):
         # Start sync ASAP — pull shared catalog without user pressing a button
         self.after(400, self._sync.start)
         self.after(4000, self._start_mall_watch)
+        # Once per install/version: push missing 「등록」 to homepage + dedupe live catalog
+        self.after(12000, self._maybe_auto_reconcile_homepage)
         self.after(
             1800,
             lambda: schedule_update_check(
@@ -1638,6 +1641,19 @@ class ManagerApp(tk.Tk):
             padx=10,
         )
         self.btn_republish.pack(side="left", padx=6)
+        self.btn_reconcile_site = tk.Button(
+            btn_row,
+            text="사이트 전체 맞추기",
+            command=self._on_reconcile_homepage,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#1f4e79",
+            fg="white",
+            activebackground="#163a5c",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+        )
+        self.btn_reconcile_site.pack(side="left", padx=6)
         self.btn_recommend = tk.Button(
             btn_row,
             text="추천상품으로 재등록하기",
@@ -1700,6 +1716,7 @@ class ManagerApp(tk.Tk):
         self.btn_unexclude.pack_forget()
         self.btn_unpublish.pack_forget()
         self.btn_republish.pack_forget()
+        self.btn_reconcile_site.pack_forget()
         self.btn_recommend.pack_forget()
         self.btn_unrecommend.pack_forget()
         self.btn_ai_select.pack_forget()
@@ -2800,6 +2817,7 @@ class ManagerApp(tk.Tk):
         self.btn_unexclude.pack_forget()
         self.btn_unpublish.pack_forget()
         self.btn_republish.pack_forget()
+        self.btn_reconcile_site.pack_forget()
         self.btn_recommend.pack_forget()
         self.btn_unrecommend.pack_forget()
         self.btn_ai_select.pack_forget()
@@ -2812,6 +2830,7 @@ class ManagerApp(tk.Tk):
             self.list_hint.configure(text="Ctrl·Shift 클릭으로 여러 개 선택 → 제외 해제")
         elif mode == "published":
             self.btn_republish.pack(side="left", padx=6)
+            self.btn_reconcile_site.pack(side="left", padx=6)
             self.btn_recommend.pack(side="left", padx=6)
             self.btn_unrecommend.pack(side="left", padx=6)
             self.btn_unpublish.pack(side="left", padx=6)
@@ -4786,6 +4805,104 @@ class ManagerApp(tk.Tk):
             messagebox.showwarning("선택", "재등록할 상품을 선택하세요.")
             return
         self._republish_ids(ids, confirm=True)
+
+    def _maybe_auto_reconcile_homepage(self) -> None:
+        """Run site reconcile once after upgrade so existing 「등록」 land on homepage."""
+        flag = f"homepage_reconcile_done_v{APP_VERSION}"
+        try:
+            if (self.store.get_setting(flag, "") or "").strip() == "1":
+                return
+        except Exception:
+            return
+        if not cloud_enabled():
+            return
+        self._put_log(
+            "[맞추기] 업데이트 후 자동: 등록 목록 ↔ 홈페이지 확인/중복정리 시작",
+            channel=LOG_MALL,
+        )
+        self._run_reconcile_homepage(confirm=False, mark_flag=flag)
+
+    def _on_reconcile_homepage(self) -> None:
+        self._run_reconcile_homepage(confirm=True, mark_flag="")
+
+    def _run_reconcile_homepage(self, *, confirm: bool, mark_flag: str) -> None:
+        if confirm and not messagebox.askyesno(
+            "사이트 전체 맞추기",
+            "로컬 「등록」 목록을 홈페이지와 맞춥니다.\n\n"
+            "· 홈페이지에 없는 등록 상품 → 재등록\n"
+            "· 홈페이지 중복 상품 → 하나만 남기고 삭제\n\n"
+            "시간이 걸릴 수 있습니다. 진행할까요?",
+        ):
+            return
+        if not self._job_start("publish"):
+            self._warn_job_busy("publish")
+            return
+        total = 0
+        try:
+            total = int(self.store.count_published() or 0)
+        except Exception:
+            total = 0
+        prog = self._open_publish_progress(
+            max(total, 1), action="사이트맞추기중"
+        )
+        self.status.set("사이트 전체 맞추기 중…")
+
+        def work() -> None:
+            try:
+                stats = reconcile_published_to_homepage(
+                    self.store,
+                    on_log=lambda m: self._put_log(m, channel=LOG_MALL),
+                    on_progress=lambda done, tot, msg: self.after(
+                        0, lambda: self._reconcile_progress(prog, done, tot, msg)
+                    ),
+                    dedupe_first=True,
+                )
+                if mark_flag:
+                    try:
+                        self.store.set_setting(mark_flag, "1")
+                    except Exception:
+                        pass
+                self._mark_catalog_dirty(push_now=True)
+                summary = (
+                    f"이미있음 {stats.get('ok', 0)} · "
+                    f"재등록 {stats.get('fixed', 0)} · "
+                    f"실패 {stats.get('failed', 0)} · "
+                    f"중복삭제 {stats.get('deduped', 0)}"
+                )
+                prog["finish"](
+                    summary,
+                    int(stats.get("fixed") or 0),
+                    int(stats.get("failed") or 0),
+                )
+
+                def done_ui() -> None:
+                    self._job_end("publish")
+                    self.refresh_list(reload_detail=False, quiet=True)
+                    self.status.set(f"사이트 맞추기 완료 — {summary}")
+                    if confirm or int(stats.get("fixed") or 0) or int(
+                        stats.get("deduped") or 0
+                    ):
+                        messagebox.showinfo("사이트 전체 맞추기", summary)
+
+                self.after(0, done_ui)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                prog["finish"](f"실패: {err}", 0, 1)
+
+                def fail() -> None:
+                    self._job_end("publish")
+                    self._put_log(f"[맞추기] 오류: {err}", channel=LOG_MALL)
+                    messagebox.showerror("사이트 전체 맞추기", err)
+
+                self.after(0, fail)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _reconcile_progress(self, prog: dict, done: int, total: int, msg: str) -> None:
+        try:
+            prog["progress"](done, msg, 0, 0)
+        except Exception:
+            pass
 
     def _republish_ids(self, ids: list[int], *, confirm: bool = True) -> None:
         """Re-push given published ids to the homepage."""

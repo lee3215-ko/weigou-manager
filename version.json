@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.22",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/505230198",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.22/WeigouManager.zip",
-    "notes":  "최신 빌드 재배포 (전체 동기화·업데이트 재실행 포함)",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/505230198",
-    "asset_id":  505230198,
+    "version":  "1.0.23",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.23/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.23/WeigouManager.zip",
+    "notes":  "홈페이지 확인 후에만 등록 이동 · 사이트 전체 맞추기(누락 재등록) · 홈페이지 중복 정리",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/505230198",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.22/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.23/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }
