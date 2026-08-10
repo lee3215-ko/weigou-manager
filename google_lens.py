@@ -160,20 +160,39 @@ def _collect_page_texts(page, *, max_lines: int = 200) -> list[str]:
     return out
 
 
-def _build_ai_prompt(*, size: str = "", hint: str = "", color: str = "") -> str:
+def _build_ai_prompt(
+    *, size: str = "", hint: str = "", color: str = "", brand: str = ""
+) -> str:
     """Short prompt after image paste (matches manual Google AI usage)."""
+    brand_s = (brand or "").strip()
     size_s = (size or "").strip()
-    if size_s:
-        return f"사이즈 {size_s}\n제품명, 컬러를 알려줘"
-    return "제품명, 컬러를 알려줘"
+    lines: list[str] = []
+    if brand_s and size_s:
+        lines.append(f"{brand_s} 제품인데 사이즈 {size_s}")
+    elif brand_s:
+        lines.append(f"{brand_s} 제품인데")
+    elif size_s:
+        lines.append(f"사이즈 {size_s}")
+    lines.append("제품명과 컬러를 알려줘")
+    return "\n".join(lines)
 
 
-def _build_multi_ai_prompt(*, size: str = "", count: int = 0) -> str:
+def _build_multi_ai_prompt(
+    *, size: str = "", count: int = 0, brand: str = ""
+) -> str:
     """Prompt when several product images are pasted together."""
+    brand_s = (brand or "").strip()
     size_s = (size or "").strip()
-    base = "각 제품의 제품명과 컬러를 알려줘"
-    if size_s:
-        return f"{base} 사이즈 {size_s}"
+    head = ""
+    if brand_s and size_s:
+        head = f"{brand_s} 제품인데 사이즈 {size_s}. "
+    elif brand_s:
+        head = f"{brand_s} 제품인데. "
+    elif size_s:
+        head = f"사이즈 {size_s}. "
+    base = f"{head}각 제품의 제품명과 컬러를 알려줘".strip()
+    if count > 1 and not brand_s:
+        return f"{base} (이미지 {count}장 순서대로)"
     if count > 1:
         return f"{base} (이미지 {count}장 순서대로)"
     return base
@@ -1177,6 +1196,7 @@ def _google_ai_mode_search(
     size: str = "",
     hint: str = "",
     color: str = "",
+    brand: str = "",
     headless: bool = False,
     multi: bool = False,
 ) -> list[str]:
@@ -1186,9 +1206,9 @@ def _google_ai_mode_search(
     if not paths:
         return []
     if multi or len(paths) > 1:
-        prompt = _build_multi_ai_prompt(size=size, count=len(paths))
+        prompt = _build_multi_ai_prompt(size=size, count=len(paths), brand=brand)
     else:
-        prompt = _build_ai_prompt(size=size, hint=hint, color=color)
+        prompt = _build_ai_prompt(size=size, hint=hint, color=color, brand=brand)
     session = _AI_SESSION_HEADLESS if headless else _AI_SESSION_HEADED
     return session.search(paths, prompt, headless=headless)
 
@@ -1382,6 +1402,7 @@ def search_image(
     hint: str = "",
     size: str = "",
     color: str = "",
+    brand: str = "",
     headless: bool = False,
 ) -> LensResult:
     path = Path(image_path) if image_path else None
@@ -1397,6 +1418,7 @@ def search_image(
                 size=size,
                 hint=hint,
                 color=color,
+                brand=brand,
                 headless=headless,
             )
             source = "google-ai"
@@ -1414,6 +1436,7 @@ def search_image(
                     size=size,
                     hint=hint,
                     color=color,
+                    brand=brand,
                     headless=headless,
                 )
                 source = "google-ai-url"
@@ -1491,6 +1514,7 @@ def search_product_images(
     hint: str = "",
     size: str = "",
     color: str = "",
+    brand: str = "",
     headless: bool = False,
 ) -> LensResult:
     paths = [p for p in image_paths if Path(p).exists()]
@@ -1504,6 +1528,7 @@ def search_product_images(
             hint=hint,
             size=size,
             color=color,
+            brand=brand,
             headless=headless,
         )
         if r.product_name:
@@ -1522,6 +1547,7 @@ def search_product_images(
             hint=hint,
             size=size,
             color=color,
+            brand=brand,
             headless=headless,
         )
     return last
@@ -1534,15 +1560,21 @@ def search_products_multi(
 ) -> list[LensResult]:
     """Paste many product images at once, parse per-image 제품명/컬러.
 
-    Each job: { "path": str, "size": str, "hint": str }
+    Each job: { "path": str, "size": str, "hint": str, "brand": str }
     Returns one LensResult per job (same order).
     """
-    prepared: list[tuple[int, Path, str, str]] = []
+    prepared: list[tuple[int, Path, str, str, str]] = []
     for i, job in enumerate(jobs):
         p = Path(job.get("path") or "")
         if p.exists():
             prepared.append(
-                (i, p, (job.get("size") or "").strip(), (job.get("hint") or "").strip())
+                (
+                    i,
+                    p,
+                    (job.get("size") or "").strip(),
+                    (job.get("hint") or "").strip(),
+                    (job.get("brand") or "").strip(),
+                )
             )
 
     out: list[LensResult] = [
@@ -1551,16 +1583,23 @@ def search_products_multi(
     if not prepared:
         return out
 
-    size_vals = [s for _i, _p, s, _h in prepared if s]
+    size_vals = [s for _i, _p, s, _h, _b in prepared if s]
     size_prompt = ""
     if size_vals:
         uniq = list(dict.fromkeys(size_vals))
         size_prompt = uniq[0] if len(uniq) == 1 else ", ".join(uniq[:3])
 
+    brand_vals = [b for _i, _p, _s, _h, b in prepared if b]
+    brand_prompt = ""
+    if brand_vals:
+        uniq_b = list(dict.fromkeys(brand_vals))
+        brand_prompt = uniq_b[0] if len(uniq_b) == 1 else ", ".join(uniq_b[:4])
+
     try:
         lines = _google_ai_mode_search(
-            [p for _i, p, _s, _h in prepared],
+            [p for _i, p, _s, _h, _b in prepared],
             size=size_prompt,
+            brand=brand_prompt,
             headless=headless,
             multi=True,
         )
@@ -1576,12 +1615,12 @@ def search_products_multi(
 
     if not lines:
         err = LensResult(error="검색 결과를 받지 못했습니다.", source="google-ai")
-        for job_i, _p, _s, _h in prepared:
+        for job_i, _p, _s, _h, _b in prepared:
             out[job_i] = err
         return out
 
     parsed = parse_multi_image_answers(lines, len(prepared))
-    for j, (job_i, _path, _size, hint) in enumerate(prepared):
+    for j, (job_i, _path, _size, hint, _brand) in enumerate(prepared):
         item = (
             parsed[j]
             if j < len(parsed)

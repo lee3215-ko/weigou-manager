@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.23",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/507161988",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.23/WeigouManager.zip",
-    "notes":  "홈페이지 확인 후에만 등록 이동 · 사이트 전체 맞추기(누락 재등록) · 홈페이지 중복 정리",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/507161988",
-    "asset_id":  507161988,
+    "version":  "1.0.24",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.24/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.24/WeigouManager.zip",
+    "notes":  "이미지 검색 시 브랜드+사이즈 포함 질문 (예: 샤넬 제품인데 사이즈 … / 제품명과 컬러를 알려줘)",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/507161988",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.23/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.24/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }

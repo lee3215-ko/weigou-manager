@@ -5860,6 +5860,29 @@ class ManagerApp(tk.Tk):
             return gallery[index]
         return ""
 
+    def _product_brand_for_search(self, product: Product) -> str:
+        """Brand label for Google AI prompt (e.g. 샤넬)."""
+        try:
+            attrs = extract_attrs(
+                product.title or "",
+                product.tags or "",
+                product.description or "",
+                google_name=product.google_name or "",
+                name_en=product.name_en or "",
+            )
+            name = (attrs.brand_name or "").strip()
+            if name and name not in ("미확인", "unknown"):
+                return name
+        except Exception:
+            pass
+        # Fallback: first tag token often holds the brand from Weigou
+        tags = (product.tags or "").strip()
+        if tags:
+            first = re.split(r"[,|/·\s]+", tags)[0].strip()
+            if first and len(first) <= 20:
+                return first
+        return ""
+
     def _run_google_for(
         self,
         product: Product,
@@ -5875,6 +5898,7 @@ class ManagerApp(tk.Tk):
         if not color:
             color = product.colors.strip()
         hint = " ".join(x for x in (product.title, product.tags, product.description) if x)
+        brand = self._product_brand_for_search(product)
         gallery = self._gallery_image_paths(product)
         if image_index < 0:
             image_index = 0
@@ -5886,10 +5910,20 @@ class ManagerApp(tk.Tk):
         pick_img = gallery[image_index] if gallery else ""
         paths = [pick_img] if pick_img else []
         nth_label = f"{image_index + 1}번째"
+        prompt_preview = (
+            f"{brand} 제품인데 사이즈 {size}"
+            if brand and size
+            else (f"{brand} 제품인데" if brand else (f"사이즈 {size}" if size else ""))
+        )
         self._put_log(
-            f"구글 검색({nth_label}): 이미지 복사붙여넣기 → 「사이즈 … / 제품명, 컬러를 알려줘」"
+            f"구글 검색({nth_label}): 이미지 복사붙여넣기 → "
+            + (
+                f"「{prompt_preview} / 제품명과 컬러를 알려줘」"
+                if prompt_preview
+                else "「제품명과 컬러를 알려줘」"
+            )
             + (f" · {pathlib.Path(pick_img).name}" if pick_img else " · 이미지 없음!")
-            + (f" · {size}" if size else ""),
+            + (f" · {size}" if size and not prompt_preview else ""),
             channel=LOG_SEARCH,
         )
 
@@ -5903,6 +5937,7 @@ class ManagerApp(tk.Tk):
             hint=hint,
             size=size,
             color="",  # 컬러는 질문에 넣지 않음 — 검색 결과로 받음
+            brand=brand,
             headless=headless,
         )
         if result.error and not result.product_name:
@@ -6076,7 +6111,8 @@ class ManagerApp(tk.Tk):
             if not size:
                 size = p.sizes.strip()
             hint = " ".join(x for x in (p.title, p.tags, p.description) if x)
-            jobs.append({"path": img, "size": size, "hint": hint})
+            brand = self._product_brand_for_search(p)
+            jobs.append({"path": img, "size": size, "hint": hint, "brand": brand})
             ready.append(p)
         if not jobs:
             detail = "\n".join(skipped[:8])
@@ -6087,9 +6123,18 @@ class ManagerApp(tk.Tk):
                 + (f"\n{detail}" if detail else ""),
             )
 
+        brands = [str(j.get("brand") or "").strip() for j in jobs if j.get("brand")]
+        brand_bit = ""
+        if brands:
+            uniq = list(dict.fromkeys(brands))
+            brand_bit = uniq[0] if len(uniq) == 1 else ", ".join(uniq[:4])
         self._put_log(
             f"구글 다중 검색({nth}번째 이미지): {len(jobs)}장 붙여넣기 → "
-            f"「각 제품의 제품명과 컬러를 알려줘」",
+            + (
+                f"「{brand_bit} 제품인데 / 각 제품의 제품명과 컬러를 알려줘」"
+                if brand_bit
+                else "「각 제품의 제품명과 컬러를 알려줘」"
+            ),
             channel=LOG_SEARCH,
         )
         if skipped:
