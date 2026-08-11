@@ -1,9 +1,12 @@
 {
     "version":  "1.0.26",
-    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.26/WeigouManager.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/509904180",
     "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.26/WeigouManager.zip",
     "notes":  "Recommend button assigns bag/clothes/accessory homepage slots from product category.",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/509904180",
+    "asset_id":  509904180,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/509904180",
                           "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.26/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
