@@ -535,11 +535,13 @@ def set_products_recommended(
             missing.append(mid)
             continue
         row = dict(row)
-        row["recommended"] = bool(recommended)
+        _apply_recommend_flags(
+            row,
+            recommended=bool(recommended),
+            category=str(row.get("category") or ""),
+        )
         if recommended:
             row["recommendedAt"] = now
-        else:
-            row.pop("recommendedAt", None)
         updated.append(row)
 
     if updated:
@@ -576,6 +578,48 @@ def site_category(category: str | None) -> str:
     if c in {"상의", "하의", "자켓"}:
         return "여성옷"
     return c
+
+
+RECOMMEND_SLOT_LABELS = {
+    "bag": "가방 추천상품",
+    "clothes": "옷 추천상품",
+    "accessory": "악세사리 추천상품",
+}
+
+
+def recommend_slots_for_category(category: str | None) -> list[str]:
+    """Homepage marquee slot(s) for a program/site category."""
+    c = site_category(category)
+    if c == "가방":
+        return ["bag"]
+    if c in {"여성옷", "남성옷"}:
+        return ["clothes"]
+    # 신발·선글라스·벨트·악세사리 → 악세사리 추천 칸
+    return ["accessory"]
+
+
+def recommend_slot_label(category: str | None) -> str:
+    slots = recommend_slots_for_category(category)
+    return RECOMMEND_SLOT_LABELS.get(slots[0] if slots else "", "추천상품")
+
+
+def _apply_recommend_flags(row: dict[str, Any], *, recommended: bool, category: str | None = None) -> None:
+    """Set homepage recommend flag + the matching 가방/옷/악세사리 slot."""
+    cat = category if category is not None else str(row.get("category") or "")
+    if recommended:
+        slots = recommend_slots_for_category(cat)
+        row["recommended"] = True
+        row["recommendSlots"] = slots
+        row["recommendedBag"] = "bag" in slots
+        row["recommendedClothes"] = "clothes" in slots
+        row["recommendedAccessory"] = "accessory" in slots
+    else:
+        row["recommended"] = False
+        row["recommendSlots"] = []
+        row["recommendedBag"] = False
+        row["recommendedClothes"] = False
+        row["recommendedAccessory"] = False
+        row.pop("recommendedAt", None)
 
 
 def _csv_list(value: str) -> list[str]:
@@ -627,14 +671,14 @@ def _apply_published_to_live(item: PublishedItem, live: dict[str, Any]) -> tuple
         changed.append("sizes")
 
     rec = bool(item.recommended)
-    if bool(patched.get("recommended")) != rec:
-        patched["recommended"] = rec
+    want_slots = recommend_slots_for_category(item.category) if rec else []
+    got_slots = [str(s) for s in (patched.get("recommendSlots") or [])]
+    if bool(patched.get("recommended")) != rec or got_slots != want_slots:
+        _apply_recommend_flags(patched, recommended=rec, category=item.category)
         if rec:
             patched["recommendedAt"] = patched.get("recommendedAt") or datetime.now(
                 timezone.utc
             ).isoformat()
-        else:
-            patched.pop("recommendedAt", None)
         changed.append("recommended")
 
     price_code = effective_price_code(item.sku_no)
@@ -758,17 +802,23 @@ def publish_product(
     else:
         item["createdAt"] = now
     if recommended is not None:
-        item["recommended"] = bool(recommended)
+        _apply_recommend_flags(
+            item, recommended=bool(recommended), category=str(item.get("category") or "")
+        )
         if recommended:
             item["recommendedAt"] = now
-        else:
-            item.pop("recommendedAt", None)
     else:
         # Preserve existing homepage recommended flag when re-publishing.
         if existing_remote and existing_remote.get("recommended"):
-            item["recommended"] = True
+            _apply_recommend_flags(
+                item,
+                recommended=True,
+                category=str(item.get("category") or existing_remote.get("category") or ""),
+            )
             if existing_remote.get("recommendedAt"):
                 item["recommendedAt"] = existing_remote.get("recommendedAt")
+            elif existing_remote.get("recommendSlots"):
+                item["recommendSlots"] = list(existing_remote.get("recommendSlots") or [])
     out = _upsert_catalog_items([item])
     api_msg = _post_api(item) if push_api else "skipped"
     if push_api and cloud_enabled() and _api_failed(api_msg):

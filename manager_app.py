@@ -71,6 +71,8 @@ from mall_publish import (
     preview_price,
     publish_product,
     push_published_metadata,
+    recommend_slot_label,
+    recommend_slots_for_category,
     reconcile_published_to_homepage,
     resolve_mall_id,
     set_products_recommended,
@@ -3123,7 +3125,14 @@ class ManagerApp(tk.Tk):
                     search_code=item.search_code, goods_id=item.goods_id
                 )
                 color = f" · {item.colors}" if item.colors else ""
-                rec = "[추천]" if item.recommended else "[등록]"
+                if item.recommended:
+                    slot = recommend_slots_for_category(item.category)
+                    slot_ko = {"bag": "가방", "clothes": "옷", "accessory": "악세사리"}.get(
+                        slot[0] if slot else "", ""
+                    )
+                    rec = f"[추천·{slot_ko}]" if slot_ko else "[추천]"
+                else:
+                    rec = "[등록]"
                 self.listbox.insert(tk.END, f"{rec}[{cat}] #{ref} {name}{color}")
             if rec_only:
                 self.list_hint.configure(
@@ -5173,18 +5182,25 @@ class ManagerApp(tk.Tk):
             return
 
         if want:
+            from collections import Counter
+
+            counts = Counter(recommend_slot_label(p.category) for p in selected)
+            detail = "\n".join(f"· {name}  {n}개" for name, n in counts.items())
             if not messagebox.askyesno(
                 "추천상품으로 재등록하기",
-                f"선택한 {len(selected)}개를 홈페이지\n"
-                "「추천 상품」캐러셀에 올릴까요?\n\n"
-                "이미지 카드에「추천」태그가 붙습니다.",
+                f"선택한 {len(selected)}개를 분류에 맞는\n"
+                "홈 추천 칸에 올릴까요?\n\n"
+                f"{detail}\n\n"
+                "가방 → 가방 추천상품\n"
+                "여성옷/남성옷 → 옷 추천상품\n"
+                "그 외 → 악세사리 추천상품",
             ):
                 self._job_end("publish")
                 return
         else:
             if not messagebox.askyesno(
                 "추천상품 해제",
-                f"선택한 {len(selected)}개를 홈「추천 상품」에서\n"
+                f"선택한 {len(selected)}개를 홈 추천 칸에서\n"
                 "해제할까요?\n\n"
                 "상품 등록 자체는 유지됩니다.",
             ):
