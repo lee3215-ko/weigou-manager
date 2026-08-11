@@ -70,6 +70,7 @@ from mall_publish import (
     delete_mall_products,
     preview_price,
     publish_product,
+    push_published_metadata,
     reconcile_published_to_homepage,
     resolve_mall_id,
     set_products_recommended,
@@ -333,6 +334,8 @@ class ManagerApp(tk.Tk):
         self.after(4000, self._start_mall_watch)
         # Once per install/version: push missing 「등록」 to homepage + dedupe live catalog
         self.after(12000, self._maybe_auto_reconcile_homepage)
+        # Every launch: copy 등록 필드(카테고리 등) onto homepage so they cannot drift
+        self.after(8000, self._maybe_sync_homepage_metadata)
         self.after(
             1800,
             lambda: schedule_update_check(
@@ -1513,6 +1516,7 @@ class ManagerApp(tk.Tk):
             width=16,
         )
         self.category_box.pack(side="left")
+        self.category_box.bind("<<ComboboxSelected>>", self._on_category_chosen)
         tk.Button(
             cat_row,
             text="자동인식",
@@ -4090,19 +4094,15 @@ class ManagerApp(tk.Tk):
             self.refresh_list(reload_detail=True)
 
             if mode == "published" and republish_ids:
-                if messagebox.askyesno(
-                    "재등록",
-                    f"{n}개 상품 카테고리를 「{cat}」로 변경했습니다.\n\n"
-                    "홈페이지에도 반영하려면 재등록이 필요합니다.\n"
-                    f"지금 {n}개를 재등록할까요?",
-                ):
-                    self._republish_ids(republish_ids, confirm=False)
-                else:
-                    messagebox.showinfo(
-                        "완료",
-                        f"{n}개 상품 카테고리를 「{cat}」로 변경했습니다.\n"
-                        "나중에 [재등록]으로 홈페이지에 반영할 수 있습니다.",
-                    )
+                self._push_published_meta_async(
+                    republish_ids,
+                    log_msg=f"같은 태그 {n}개 카테고리 「{cat}」 → 홈페이지 반영",
+                )
+                messagebox.showinfo(
+                    "완료",
+                    f"{n}개 상품 카테고리를 「{cat}」로 바꿨고\n"
+                    "홈페이지에도 같이 반영합니다.",
+                )
             else:
                 messagebox.showinfo(
                     "완료", f"{n}개 상품 카테고리를 「{cat}」로 변경했습니다."
@@ -4806,6 +4806,71 @@ class ManagerApp(tk.Tk):
             return
         self._republish_ids(ids, confirm=True)
 
+    def _on_category_chosen(self, _evt=None) -> None:
+        """Changing 등록 카테고리 immediately updates the homepage row."""
+        if self._form_loading:
+            return
+        if self.list_mode.get() != "published":
+            self._soft_save_current(force=True)
+            return
+        prev_id = self.current_published_id
+        self._soft_save_current(force=True)
+        if prev_id is not None:
+            self._push_published_meta_async(
+                [prev_id],
+                log_msg="카테고리 변경 → 홈페이지 반영",
+            )
+
+    def _push_published_meta_async(
+        self, ids: list[int], *, log_msg: str = ""
+    ) -> None:
+        ids = [int(i) for i in ids if i]
+        if not ids or not cloud_enabled():
+            return
+        if log_msg:
+            self._append(log_msg, channel=LOG_MALL)
+
+        def work() -> None:
+            try:
+                stats = push_published_metadata(
+                    self.store,
+                    ids,
+                    on_log=lambda m: self._put_log(m, channel=LOG_MALL),
+                )
+                self._put_log(
+                    f"[맞추기] 필드 반영 완료 patched={stats.get('patched', 0)} "
+                    f"ok={stats.get('ok', 0)} missing={stats.get('missing', 0)}",
+                    channel=LOG_MALL,
+                )
+                self._mark_catalog_dirty(push_now=True)
+            except Exception as e:  # noqa: BLE001
+                self._put_log(f"[맞추기] 필드 반영 실패: {e}", channel=LOG_MALL)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _maybe_sync_homepage_metadata(self) -> None:
+        """Background: keep homepage fields identical to 「등록」 on every launch."""
+        if not cloud_enabled():
+            return
+
+        def work() -> None:
+            try:
+                stats = push_published_metadata(
+                    self.store,
+                    on_log=lambda m: self._put_log(m, channel=LOG_MALL),
+                )
+                n = int(stats.get("patched") or 0)
+                if n:
+                    self._put_log(
+                        f"[맞추기] 시작 시 홈페이지 필드 {n}건을 등록 목록에 맞춤",
+                        channel=LOG_MALL,
+                    )
+                    self._mark_catalog_dirty(push_now=True)
+            except Exception as e:  # noqa: BLE001
+                self._put_log(f"[맞추기] 시작 시 필드 동기화 실패: {e}", channel=LOG_MALL)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _maybe_auto_reconcile_homepage(self) -> None:
         """Run site reconcile once after upgrade so existing 「등록」 land on homepage."""
         flag = f"homepage_reconcile_done_v{APP_VERSION}"
@@ -4829,6 +4894,7 @@ class ManagerApp(tk.Tk):
         if confirm and not messagebox.askyesno(
             "사이트 전체 맞추기",
             "로컬 「등록」 목록을 홈페이지와 맞춥니다.\n\n"
+            "· 카테고리/이름/추천이 다르면 프로그램 값으로 수정\n"
             "· 홈페이지에 없는 등록 상품 → 재등록\n"
             "· 홈페이지 중복 상품 → 하나만 남기고 삭제\n\n"
             "시간이 걸릴 수 있습니다. 진행할까요?",
@@ -4864,7 +4930,8 @@ class ManagerApp(tk.Tk):
                         pass
                 self._mark_catalog_dirty(push_now=True)
                 summary = (
-                    f"이미있음 {stats.get('ok', 0)} · "
+                    f"이미같음 {stats.get('ok', 0)} · "
+                    f"필드수정 {stats.get('patched', 0)} · "
                     f"재등록 {stats.get('fixed', 0)} · "
                     f"실패 {stats.get('failed', 0)} · "
                     f"중복삭제 {stats.get('deduped', 0)}"

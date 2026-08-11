@@ -1410,14 +1410,15 @@ class ProductStore:
         ids = self.list_published_ids_by_exact_tag(tag)
         if not ids:
             return []
+        now = dt.datetime.now().isoformat(timespec="seconds")
         with self._connect() as con:
             con.execute(
                 f"""
                 UPDATE published
-                SET category=?
+                SET category=?, updated_at=?
                 WHERE id IN ({",".join("?" * len(ids))})
                 """,
-                (cat, *ids),
+                (cat, now, *ids),
             )
         return ids
 

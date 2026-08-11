@@ -18,7 +18,7 @@ from price_codec import (
     is_text_price_label,
 )
 from product_attrs import _detect_brand, extract_attrs
-from product_store import Product, ProductStore
+from product_store import Product, ProductStore, PublishedItem
 from image_enhance import enhance_image_file
 from mall_cloud import (
     _supabase_rest,
@@ -188,7 +188,10 @@ def build_mall_product(
     raw_colors = colors if colors is not None and len(colors) > 0 else (attrs.colors or ["블랙"])
     use_colors = normalize_colors(raw_colors) or ["블랙"]
     use_sizes = sizes if sizes is not None and len(sizes) > 0 else (attrs.sizes or ["FREE"])
-    use_category = category if category else attrs.category
+    # Program-stored category always wins. Guessing from title/tags caused
+    # 데님 가방 → 여성옷/악세사리 on the homepage while the app showed 가방.
+    stored_cat = (category or getattr(product, "category", None) or "").strip()
+    use_category = stored_cat or attrs.category
     brand_name = (attrs.brand_name or "").strip()
     brand_id = (attrs.brand_id or "").strip()
     # Last resort: brand word inside product name only (never invent Chanel)
@@ -565,6 +568,164 @@ def set_products_recommended(
     }
 
 
+def site_category(category: str | None) -> str:
+    """Map program category to the value stored on the homepage."""
+    c = (category or "").strip()
+    if c == "기타":
+        return "악세사리"
+    if c in {"상의", "하의", "자켓"}:
+        return "여성옷"
+    return c
+
+
+def _csv_list(value: str) -> list[str]:
+    return [p.strip() for p in (value or "").split(",") if p.strip()]
+
+
+def _apply_published_to_live(item: PublishedItem, live: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Copy program 「등록」 fields onto an existing homepage row (images kept)."""
+    patched = dict(live)
+    changed: list[str] = []
+    cat = site_category(item.category)
+    live_cat = site_category(str(patched.get("category") or ""))
+    if cat and cat != live_cat:
+        patched["category"] = cat
+        desc = str(patched.get("description") or "")
+        if re.search(r"카테고리:\s*.+", desc):
+            patched["description"] = re.sub(
+                r"카테고리:\s*.+", f"카테고리: {cat}", desc, count=1
+            )
+        else:
+            patched["description"] = (desc + f"\n카테고리: {cat}").strip()
+        changed.append("category")
+
+    name = (item.google_name or "").strip()
+    if name and (patched.get("name") or "").strip() != name:
+        patched["name"] = name
+        changed.append("name")
+    name_en = (item.name_en or "").strip()
+    if name_en and (patched.get("nameEn") or "").strip() != name_en:
+        patched["nameEn"] = name_en
+        changed.append("nameEn")
+
+    code = (item.search_code or "").strip()
+    if code:
+        if (patched.get("searchCode") or "").strip() != code:
+            patched["searchCode"] = code
+            changed.append("searchCode")
+        if (patched.get("skuNo") or "").strip() != code:
+            patched["skuNo"] = code
+            changed.append("skuNo")
+
+    colors = _csv_list(item.colors)
+    if colors and list(patched.get("colors") or []) != colors:
+        patched["colors"] = colors
+        changed.append("colors")
+    sizes = _csv_list(item.sizes)
+    if sizes and list(patched.get("sizes") or []) != sizes:
+        patched["sizes"] = sizes
+        changed.append("sizes")
+
+    rec = bool(item.recommended)
+    if bool(patched.get("recommended")) != rec:
+        patched["recommended"] = rec
+        if rec:
+            patched["recommendedAt"] = patched.get("recommendedAt") or datetime.now(
+                timezone.utc
+            ).isoformat()
+        else:
+            patched.pop("recommendedAt", None)
+        changed.append("recommended")
+
+    price_code = effective_price_code(item.sku_no)
+    if price_code:
+        info = decode_price_code(price_code)
+        if info:
+            if patched.get("price") != info.sell or patched.get("priceCode") != price_code:
+                patched["price"] = info.sell
+                patched["originalPrice"] = info.cost * 2
+                patched["costPrice"] = info.cost
+                patched["priceCode"] = price_code
+                patched.pop("priceText", None)
+                changed.append("price")
+        elif is_text_price_label(price_code) or price_code == DEFAULT_PRICE_TEXT:
+            if (patched.get("priceText") or "").strip() != price_code:
+                patched["price"] = 0
+                patched["priceText"] = price_code
+                patched["priceCode"] = price_code
+                changed.append("price")
+    return patched, changed
+
+
+def push_published_metadata(
+    store: ProductStore,
+    published_ids: list[int] | None = None,
+    *,
+    live_rows: list[dict[str, Any]] | None = None,
+    on_log: ProgressCb | None = None,
+) -> dict[str, Any]:
+    """Push category/name/recommend/price from 「등록」 onto matching homepage rows."""
+    log = on_log or (lambda _m: None)
+    if published_ids is None:
+        items = store.list_published()
+    else:
+        items = [store.get_published(i) for i in published_ids]
+        items = [x for x in items if x is not None]
+    if not items:
+        return {"patched": 0, "missing": 0, "ok": 0}
+
+    rows = live_rows if live_rows is not None else _fetch_live_catalog(allow_local=False)
+    by_id: dict[str, dict[str, Any]] = {}
+    by_code: dict[str, dict[str, Any]] = {}
+    by_gid: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        rid = str(row.get("id") or "").strip()
+        if rid:
+            by_id[rid] = row
+        code = str(row.get("searchCode") or row.get("skuNo") or "").strip()
+        if code and code not in by_code:
+            by_code[code] = row
+        gid = str(row.get("weigouId") or row.get("goodsId") or "").strip()
+        if gid and gid not in by_gid:
+            by_gid[gid] = row
+
+    patched: list[dict[str, Any]] = []
+    missing = 0
+    ok = 0
+    for item in items:
+        mid = (item.mall_id or "").strip()
+        code = (item.search_code or "").strip()
+        gid = (item.goods_id or "").strip()
+        live = by_id.get(mid) or by_code.get(code) or by_gid.get(gid)
+        if not live:
+            missing += 1
+            continue
+        new_row, changed = _apply_published_to_live(item, live)
+        if not changed:
+            ok += 1
+            continue
+        patched.append(new_row)
+        log(
+            f"[맞추기] 필드 수정 {item.search_code or item.id} "
+            f"({', '.join(changed)})"
+        )
+
+    api_msg = "skipped"
+    if patched:
+        for i in range(0, len(patched), 80):
+            chunk = patched[i : i + 80]
+            api_msg = _post_api_many(chunk)
+            if cloud_enabled() and _api_failed(api_msg):
+                raise RuntimeError(f"홈페이지 필드 반영 실패: {api_msg}")
+        log(f"[맞추기] 홈페이지 필드 반영 {len(patched)}건")
+    return {
+        "patched": len(patched),
+        "missing": missing,
+        "ok": ok,
+        "api": api_msg,
+    }
+
+
 def publish_product(
     product: Product,
     *,
@@ -839,6 +1000,7 @@ def reconcile_published_to_homepage(
     stats: dict[str, Any] = {
         "deduped": 0,
         "ok": 0,
+        "patched": 0,
         "fixed": 0,
         "failed": 0,
         "skipped": 0,
@@ -899,7 +1061,19 @@ def reconcile_published_to_homepage(
                 new_mid = str(live.get("id") or mid or "").strip()
                 if new_mid and new_mid != (item.mall_id or "").strip():
                     store.update_published(item.id, mall_id=new_mid)
-                stats["ok"] += 1
+                patched_row, changed = _apply_published_to_live(item, live)
+                if changed:
+                    api_msg = _post_api_many([patched_row])
+                    if cloud_enabled() and _api_failed(api_msg):
+                        raise RuntimeError(api_msg)
+                    stats["patched"] += 1
+                    by_id[str(patched_row.get("id") or new_mid)] = patched_row
+                    log(
+                        f"[맞추기] 필드 수정 등록#{item.id} "
+                        f"{item.search_code} ({', '.join(changed)})"
+                    )
+                else:
+                    stats["ok"] += 1
                 continue
 
             product = store.published_to_product(item)
@@ -946,8 +1120,8 @@ def reconcile_published_to_homepage(
     if on_progress:
         on_progress(total, total, "완료")
     log(
-        f"[맞추기] 끝 - 이미있음 {stats['ok']} / 재등록 {stats['fixed']} / "
-        f"실패 {stats['failed']} / 중복삭제 {stats['deduped']}"
+        f"[맞추기] 끝 - 이미같음 {stats['ok']} / 필드수정 {stats['patched']} / "
+        f"재등록 {stats['fixed']} / 실패 {stats['failed']} / 중복삭제 {stats['deduped']}"
     )
     return stats
 

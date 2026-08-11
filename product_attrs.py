@@ -651,6 +651,46 @@ def _has_any(text: str, lower: str, keys: tuple[str, ...] | list[str]) -> bool:
     return any(k.lower() in lower or k in text for k in keys)
 
 
+# Shop tags + names. 데님/진 is a material — never treat as clothing by itself.
+BAG_CUES: tuple[str, ...] = (
+    "가방",
+    "가방지갑",
+    "지갑가방",
+    "包包",
+    "箱包",
+    "bag",
+    "tote",
+    "토트",
+    "토트백",
+    "카바스",
+    "cabas",
+    "클러치",
+    "크로스백",
+    "크로스바디",
+    "백팩",
+    "핸드백",
+    "shoulder bag",
+    "handbag",
+    "버킷백",
+    "버킨",
+    "birkin",
+    "kelly",
+    "켈리",
+    "背包",
+    "手提包",
+    "斜挎",
+    "手拿包",
+    "숄더백",
+    "숄더 백",
+    "미니백",
+    "메신저백",
+    "호보",
+    "사첼",
+    "satchel",
+    "에코백",
+)
+
+
 def _has_scarf_cue(text: str, lower: str) -> bool:
     """Scarf/shawl cues — do not treat 숄더(백) as 숄(shawl)."""
     if _has_any(
@@ -712,32 +752,8 @@ def _shop_tag_category(tags: str) -> str | None:
     ):
         return "기타"
 
-    if _has_any(
-        text,
-        lower,
-        (
-            "가방",
-            "包包",
-            "箱包",
-            "bag",
-            "tote",
-            "클러치",
-            "크로스백",
-            "백팩",
-            "핸드백",
-            "shoulder bag",
-            "handbag",
-            "버킷백",
-            "버킨",
-            "birkin",
-            "kelly",
-            "켈리",
-            "背包",
-            "手提包",
-            "斜挎",
-            "手拿包",
-        ),
-    ):
+    has_bag = _has_any(text, lower, BAG_CUES)
+    if has_bag:
         return "가방"
 
     if _has_any(
@@ -810,7 +826,6 @@ def _shop_tag_category(tags: str) -> str | None:
             "하의",
             "팬츠",
             "pants",
-            "데님",
             "슬랙스",
             "자켓",
             "jacket",
@@ -843,7 +858,7 @@ def _shop_tag_category(tags: str) -> str | None:
             "남성옷",
         ),
     )
-    if is_clothing or is_mens or is_womens:
+    if (is_clothing or is_mens or is_womens) and not has_bag:
         if is_mens and not is_womens:
             return "남성옷"
         if is_womens and not is_mens:
@@ -943,34 +958,7 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
     ):
         return "기타"
 
-    has_bag = _has_any(
-        text,
-        lower,
-        (
-            "가방",
-            "包包",
-            "箱包",
-            "bag",
-            "tote",
-            "클러치",
-            "크로스백",
-            "백팩",
-            "핸드백",
-            "shoulder bag",
-            "handbag",
-            "버킷백",
-            "버킨",
-            "birkin",
-            "kelly",
-            "켈리",
-            "背包",
-            "手提包",
-            "斜挎",
-            "手拿包",
-            "숄더백",
-            "숄더 백",
-        ),
-    )
+    has_bag = _has_any(text, lower, BAG_CUES)
 
     has_scarf = _has_scarf_cue(text, lower)
 
@@ -1031,7 +1019,6 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
             "하의",
             "팬츠",
             "pants",
-            "데님",
             "슬랙스",
             "진",
             "短裤",
