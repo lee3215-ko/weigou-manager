@@ -1,10 +1,13 @@
 {
-    "version":  "1.0.25",
-    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.25/WeigouManager.zip",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.25/WeigouManager.zip",
-    "notes":  "Keep homepage catalog fields in sync with published list; fix bag vs accessory/clothing mis-category.",
-    "download_urls":  [
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.25/WeigouManager.zip",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
-                      ]
+  "version": "1.0.25",
+  "url": "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/509810482",
+  "download_url": "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.25/WeigouManager.zip",
+  "notes": "등록 목록과 홈페이지 카테고리/이름/추천을 항상 맞춥니다. 데님 가방이 옷·악세사리로 올라가던 문제를 고쳤습니다.",
+  "api_download_url": "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/509810482",
+  "asset_id": 509810482,
+  "download_urls": [
+    "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/509810482",
+    "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.25/WeigouManager.zip",
+    "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
+  ]
 }
