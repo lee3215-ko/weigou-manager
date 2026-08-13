@@ -1,9 +1,12 @@
 {
     "version":  "1.0.27",
-    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.27/WeigouManager.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/512816036",
     "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.27/WeigouManager.zip",
     "notes":  "자동 업데이트 후 프로그램이 다시 켜지도록 수정 (핸드셰이크 경로 통일, wscript 재실행, E2E 검증)",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/512816036",
+    "asset_id":  512816036,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/512816036",
                           "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.27/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
