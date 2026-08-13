@@ -5,7 +5,10 @@ import certifi
 block_cipher = None
 SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
 
-datas = [(certifi.where(), "certifi")]
+datas = [
+    (certifi.where(), "certifi"),
+    (os.path.join(SPEC_DIR, "scripts", "apply_update.ps1"), "scripts"),
+]
 binaries = []
 hiddenimports = [
     "certifi",

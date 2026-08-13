@@ -22,6 +22,7 @@ from updater import (
     get_update_log_path,
     schedule_apply_update,
     validate_zip_file,
+    wait_updater_started,
 )
 
 
@@ -189,15 +190,27 @@ def _auto_update(
                     app_slug=app_name,
                 )
                 log(f"[업데이트] 설치 스크립트 실행 (로그: {log_path})")
-            except (RuntimeError, OSError) as exc:
-                messagebox.showerror("업데이트 실패", str(exc), parent=root)
+            except (RuntimeError, OSError) as exec_exc:
+                messagebox.showerror("업데이트 실패", str(exec_exc), parent=root)
                 dialog.destroy()
-                log(f"[업데이트] 설치 준비 실패: {exc}")
+                log(f"[업데이트] 설치 준비 실패: {exec_exc}")
+                return
+
+            if not wait_updater_started(app_name, timeout=8.0):
+                messagebox.showerror(
+                    "업데이트 실패",
+                    "설치 프로그램이 시작되지 않았습니다.\n"
+                    f"로그: {log_path}\n\n"
+                    "zip을 받아 설치 폴더에 덮어쓴 뒤 다시 실행해 주세요.",
+                    parent=root,
+                )
+                log("[업데이트] 설치 스크립트 핸드셰이크 실패 — 종료하지 않음")
+                dialog.destroy()
                 return
 
             dialog.destroy()
-            # Give PowerShell a moment to attach before this process dies
-            time.sleep(2.0)
+            # Updater is alive and waiting for this PID — exit hard.
+            time.sleep(0.4)
             os._exit(0)
 
         root.after(0, finish)

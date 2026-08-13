@@ -182,8 +182,29 @@ def get_install_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def get_update_temp_dir() -> Path:
+    """Temp folder both the GUI process and PowerShell can see.
+
+    ``tempfile.gettempdir()`` can disagree with PowerShell ``$env:TEMP``
+    (ESTsoft/Creator hooks, Cursor agent TMP). LOCALAPPDATA\\Temp is stable.
+    """
+    local = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if local:
+        path = Path(local) / "Temp"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError:
+            pass
+    return Path(tempfile.gettempdir())
+
+
 def get_update_log_path(app_slug: str = DEFAULT_APP_SLUG) -> Path:
-    return Path(tempfile.gettempdir()) / f"{app_slug}_update.log"
+    return get_update_temp_dir() / f"{app_slug}_update.log"
+
+
+def get_update_running_path(app_slug: str = DEFAULT_APP_SLUG) -> Path:
+    return get_update_temp_dir() / f"{app_slug}_update.started"
 
 
 ProgressCallback = Callable[[int, int], None]
@@ -412,119 +433,104 @@ def extract_zip_to_staging(zip_path: Path, staging_dir: Path) -> Path:
     return staging_dir
 
 
+def _bundled_apply_update_script() -> Path:
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "") or ""
+        if meipass:
+            candidates.append(Path(meipass) / "scripts" / "apply_update.ps1")
+            candidates.append(Path(meipass) / "apply_update.ps1")
+        candidates.append(Path(sys.executable).resolve().parent / "scripts" / "apply_update.ps1")
+    candidates.append(Path(__file__).resolve().parent / "scripts" / "apply_update.ps1")
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise RuntimeError("apply_update.ps1 을 찾을 수 없습니다.")
+
+
 def _write_update_script(script_path: Path, *, app_slug: str) -> None:
+    del app_slug  # kept for call-site compatibility
+    src = _bundled_apply_update_script()
+    data = src.read_bytes()
     # UTF-8 BOM required so PowerShell -File parses correctly on Korean Windows.
-    script_path.write_text(
-        rf"""param(
-    [Parameter(Mandatory=$true)][string]$Staging,
-    [Parameter(Mandatory=$true)][string]$Install,
-    [Parameter(Mandatory=$true)][string]$Exe,
-    [Parameter(Mandatory=$true)][string]$Inner,
-    [Parameter(Mandatory=$true)][int]$WaitPid
-)
-$ErrorActionPreference = "Continue"
-$Log = Join-Path $env:TEMP "{app_slug}_update.log"
-function Write-Log([string]$Message) {{
-    Add-Content -Path $Log -Value ("[{{0}}] {{1}}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
-}}
+    if not data.startswith(b"\xef\xbb\xbf"):
+        data = b"\xef\xbb\xbf" + data
+    script_path.write_bytes(data)
 
-Write-Log "update start (powershell)"
-Write-Log "Staging=$Staging"
-Write-Log "Install=$Install"
-Write-Log "Exe=$Exe"
-Write-Log "Inner=$Inner"
-Write-Log "WaitPid=$WaitPid"
 
-$exeName = [IO.Path]::GetFileName($Exe)
-$procName = [IO.Path]::GetFileNameWithoutExtension($Exe)
+def launch_detached_updater(
+    *,
+    script_path: Path,
+    staging_dir: Path,
+    install_dir: Path,
+    exe_path: Path,
+    inner: str,
+    wait_pid: int,
+    app_slug: str = DEFAULT_APP_SLUG,
+) -> None:
+    """Start the update PowerShell so it survives GUI ``os._exit``.
 
-$deadline = (Get-Date).AddSeconds(90)
-while ((Get-Date) -lt $deadline) {{
-    if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) {{ break }}
-    Start-Sleep -Seconds 1
-}}
-if (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) {{
-    Write-Log "force stop pid $WaitPid"
-    Stop-Process -Id $WaitPid -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-}}
+    Verified: ``CREATE_NO_WINDOW`` keeps the child alive after the parent
+    dies. ``DETACHED_PROCESS`` and ``start /b`` do not.
+    Handshake/log paths are passed explicitly so Python TEMP and
+    PowerShell ``$env:TEMP`` can never disagree.
+    """
+    running = get_update_running_path(app_slug)
+    log_path = get_update_log_path(app_slug)
+    try:
+        running.unlink(missing_ok=True)
+    except OSError:
+        pass
 
-# Also stop any leftover app instances locking files
-Get-Process -Name $procName -ErrorAction SilentlyContinue | ForEach-Object {{
-    Write-Log ("stop leftover pid " + $_.Id)
-    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-}}
-Start-Sleep -Seconds 2
-Write-Log "process wait done"
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    flags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        flags = subprocess.CREATE_NO_WINDOW
 
-$src = Join-Path $Staging $Inner
-if (-not (Test-Path -LiteralPath $src)) {{
-    Write-Log "inner folder missing, search for $exeName under staging"
-    $hit = Get-ChildItem -LiteralPath $Staging -Recurse -Filter $exeName -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($hit) {{
-        $src = $hit.Directory.FullName
-        Write-Log "found exe under $src"
-    }} else {{
-        $src = $Staging
-    }}
-}} elseif (-not (Test-Path -LiteralPath (Join-Path $src $exeName))) {{
-    $hit = Get-ChildItem -LiteralPath $Staging -Recurse -Filter $exeName -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($hit) {{
-        $src = $hit.Directory.FullName
-        Write-Log "relocated src to $src"
-    }}
-}}
-
-Write-Log "robocopy `"$src`" -> `"$Install`" (data excluded)"
-& robocopy $src $Install /E /IS /IT /XD data /R:10 /W:2 /NFL /NDL /NJH /NJS | Out-Null
-$rc = $LASTEXITCODE
-Write-Log "robocopy exit=$rc"
-if ($rc -ge 8) {{
-    Write-Log "robocopy failed code $rc — still attempting restart"
-}}
-
-Start-Sleep -Seconds 1
-$workDir = Split-Path -Parent $Exe
-if (-not (Test-Path -LiteralPath $Exe)) {{
-    $fallback = Join-Path $src $exeName
-    Write-Log "install exe missing, fallback=$fallback"
-    if (Test-Path -LiteralPath $fallback) {{
-        Start-Process -LiteralPath $fallback -WorkingDirectory (Split-Path -Parent $fallback)
-        Write-Log "started fallback exe"
-        Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-        exit 0
-    }}
-    Write-Log "FATAL: cannot find exe to restart"
-    exit 1
-}}
-
-Write-Log "starting $Exe (cwd=$workDir)"
-try {{
-    Start-Process -LiteralPath $Exe -WorkingDirectory $workDir
-}} catch {{
-    Write-Log ("Start-Process failed: " + $_)
-}}
-Start-Sleep -Seconds 3
-if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {{
-    Write-Log "process not up — retry via cmd start"
-    $cmd = 'cmd.exe'
-    $arg = '/c start "" "' + $Exe + '"'
-    Start-Process -FilePath $cmd -ArgumentList $arg -WorkingDirectory $workDir -WindowStyle Hidden
-    Start-Sleep -Seconds 2
-}}
-if (Get-Process -Name $procName -ErrorAction SilentlyContinue) {{
-    Write-Log "update success — app running"
-}} else {{
-    Write-Log "WARNING: app still not running after restart attempts"
-}}
-
-Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-exit 0
-""",
-        encoding="utf-8-sig",
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+            "-Staging",
+            str(staging_dir),
+            "-Install",
+            str(install_dir),
+            "-Exe",
+            str(exe_path),
+            "-Inner",
+            str(inner),
+            "-WaitPid",
+            str(int(wait_pid)),
+            "-RunningFile",
+            str(running),
+            "-LogFile",
+            str(log_path),
+        ],
+        startupinfo=startupinfo,
+        creationflags=flags,
+        close_fds=True,
+        cwd=str(get_update_temp_dir()),
     )
+
+
+def wait_updater_started(app_slug: str = DEFAULT_APP_SLUG, timeout: float = 8.0) -> bool:
+    """True when the detached updater has written its handshake file."""
+    marker = get_update_running_path(app_slug)
+    deadline = time.time() + max(1.0, timeout)
+    while time.time() < deadline:
+        try:
+            if marker.is_file() and marker.stat().st_size > 0:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.15)
+    return False
 
 
 def schedule_apply_update(
@@ -534,8 +540,9 @@ def schedule_apply_update(
     exe_name: str,
     zip_inner_folder: str | None = None,
     app_slug: str = DEFAULT_APP_SLUG,
+    require_frozen: bool = True,
 ) -> None:
-    if not can_auto_update():
+    if require_frozen and not can_auto_update():
         raise RuntimeError("Auto-update works only in packaged exe builds.")
 
     validate_zip_file(zip_path)
@@ -544,7 +551,7 @@ def schedule_apply_update(
     inner = zip_inner_folder or target_dir.name
     exe_path = target_dir / exe_name
     slug = (app_slug or DEFAULT_APP_SLUG).strip() or DEFAULT_APP_SLUG
-    staging_dir = Path(tempfile.gettempdir()) / f"{slug}_staging_{os.getpid()}"
+    staging_dir = get_update_temp_dir() / f"{slug}_staging_{os.getpid()}"
 
     try:
         extract_zip_to_staging(zip_path, staging_dir)
@@ -559,42 +566,16 @@ def schedule_apply_update(
             f"업데이트 zip 안에 {exe_name} 이(가) 없습니다. 배포 zip 구조를 확인하세요."
         )
 
-    script_path = Path(tempfile.gettempdir()) / f"{slug}_update_{os.getpid()}.ps1"
+    script_path = get_update_temp_dir() / f"{slug}_update_{os.getpid()}.ps1"
     _write_update_script(script_path, app_slug=slug)
-
-    # Detach from this process tree so os._exit does not kill the updater.
-    flags = 0
-    if hasattr(subprocess, "DETACHED_PROCESS"):
-        flags |= subprocess.DETACHED_PROCESS
-    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        flags |= subprocess.CREATE_NEW_PROCESS_GROUP
-    if hasattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB"):
-        flags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
-
-    # Launcher .cmd avoids PowerShell being tied to the dying GUI process.
-    cmd_path = Path(tempfile.gettempdir()) / f"{slug}_update_{os.getpid()}.cmd"
-    cmd_path.write_text(
-        "\r\n".join(
-            [
-                "@echo off",
-                f'start "" /b powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script_path}" '
-                f'-Staging "{staging_dir}" -Install "{target_dir}" -Exe "{exe_path}" '
-                f'-Inner "{inner}" -WaitPid {os.getpid()}',
-                "exit /b 0",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    subprocess.Popen(
-        ["cmd.exe", "/c", str(cmd_path)],
-        creationflags=flags,
-        close_fds=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=str(tempfile.gettempdir()),
+    launch_detached_updater(
+        script_path=script_path,
+        staging_dir=staging_dir,
+        install_dir=target_dir,
+        exe_path=exe_path,
+        inner=inner,
+        wait_pid=os.getpid(),
+        app_slug=slug,
     )
 
     try:

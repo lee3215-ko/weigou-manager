@@ -21,12 +21,12 @@ if exist "%PYI_DIST%" rmdir /s /q "%PYI_DIST%" 2>nul
 pyinstaller --noconfirm --workpath "%PYI_WORK%" --distpath "%PYI_DIST%" build.spec
 if errorlevel 1 exit /b 1
 
-REM Use release-out (not release/) to avoid locks from a running installed copy
-set RELEASE=release-out\WeigouManager
-if exist release-out rmdir /s /q release-out 2>nul
+REM Fresh folder each time so Cursor/Explorer locks on release-out cannot block deploy
+set RELEASE=dist-out\WeigouManager
+if exist dist-out rmdir /s /q dist-out 2>nul
 mkdir "%RELEASE%"
-xcopy /E /I /Y "%PYI_DIST%\WeigouManager\*" "%RELEASE%\" >nul
-if errorlevel 1 exit /b 1
+robocopy "%PYI_DIST%\WeigouManager" "%RELEASE%" /E /IS /IT /NFL /NDL /NJH /NJS /R:2 /W:1
+if %ERRORLEVEL% GEQ 8 exit /b 1
 
 if not exist "%RELEASE%\data" mkdir "%RELEASE%\data"
 if not exist "%RELEASE%\bundled" mkdir "%RELEASE%\bundled"

@@ -10,7 +10,7 @@
   },
   "build": {
     "script": "build.bat",
-    "dist_dir": "release-out/WeigouManager"
+    "dist_dir": "dist-out/WeigouManager"
   },
   "git_add": [
     ".gitignore",

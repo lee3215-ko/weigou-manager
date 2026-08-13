@@ -6,6 +6,7 @@ dist/
 build/
 release/
 release-out/
+dist-out/
 *.zip
 *.spec.bak
 .DS_Store
