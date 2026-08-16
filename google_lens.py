@@ -161,7 +161,12 @@ def _collect_page_texts(page, *, max_lines: int = 200) -> list[str]:
 
 
 def _build_ai_prompt(
-    *, size: str = "", hint: str = "", color: str = "", brand: str = ""
+    *,
+    size: str = "",
+    hint: str = "",
+    color: str = "",
+    brand: str = "",
+    clothing: bool = False,
 ) -> str:
     """Short prompt after image paste (matches manual Google AI usage)."""
     brand_s = (brand or "").strip()
@@ -173,12 +178,16 @@ def _build_ai_prompt(
         lines.append(f"{brand_s} 제품인데")
     elif size_s:
         lines.append(f"사이즈 {size_s}")
-    lines.append("제품명과 컬러를 알려줘")
+    if clothing:
+        lines.append("옷종류와 컬러를 알려줘")
+        lines.append("예) 나시,니트,반팔티,긴팔티,가디건")
+    else:
+        lines.append("제품명과 컬러를 알려줘")
     return "\n".join(lines)
 
 
 def _build_multi_ai_prompt(
-    *, size: str = "", count: int = 0, brand: str = ""
+    *, size: str = "", count: int = 0, brand: str = "", clothing: bool = False
 ) -> str:
     """Prompt when several product images are pasted together."""
     brand_s = (brand or "").strip()
@@ -190,9 +199,13 @@ def _build_multi_ai_prompt(
         head = f"{brand_s} 제품인데. "
     elif size_s:
         head = f"사이즈 {size_s}. "
-    base = f"{head}각 제품의 제품명과 컬러를 알려줘".strip()
-    if count > 1 and not brand_s:
-        return f"{base} (이미지 {count}장 순서대로)"
+    if clothing:
+        base = (
+            f"{head}각 제품의 옷종류와 컬러를 알려줘 "
+            f"(예: 나시,니트,반팔티,긴팔티,가디건)"
+        ).strip()
+    else:
+        base = f"{head}각 제품의 제품명과 컬러를 알려줘".strip()
     if count > 1:
         return f"{base} (이미지 {count}장 순서대로)"
     return base
@@ -1199,6 +1212,7 @@ def _google_ai_mode_search(
     brand: str = "",
     headless: bool = False,
     multi: bool = False,
+    clothing: bool = False,
 ) -> list[str]:
     """Paste product image(s) into Google AI Mode. Reuses the same browser window."""
     paths = [Path(path)] if not isinstance(path, list) else [Path(p) for p in path]
@@ -1206,9 +1220,13 @@ def _google_ai_mode_search(
     if not paths:
         return []
     if multi or len(paths) > 1:
-        prompt = _build_multi_ai_prompt(size=size, count=len(paths), brand=brand)
+        prompt = _build_multi_ai_prompt(
+            size=size, count=len(paths), brand=brand, clothing=clothing
+        )
     else:
-        prompt = _build_ai_prompt(size=size, hint=hint, color=color, brand=brand)
+        prompt = _build_ai_prompt(
+            size=size, hint=hint, color=color, brand=brand, clothing=clothing
+        )
     session = _AI_SESSION_HEADLESS if headless else _AI_SESSION_HEADED
     return session.search(paths, prompt, headless=headless)
 
@@ -1404,6 +1422,7 @@ def search_image(
     color: str = "",
     brand: str = "",
     headless: bool = False,
+    clothing: bool = False,
 ) -> LensResult:
     path = Path(image_path) if image_path else None
     lines: list[str] = []
@@ -1420,6 +1439,7 @@ def search_image(
                 color=color,
                 brand=brand,
                 headless=headless,
+                clothing=clothing,
             )
             source = "google-ai"
             if not lines:
@@ -1438,6 +1458,7 @@ def search_image(
                     color=color,
                     brand=brand,
                     headless=headless,
+                    clothing=clothing,
                 )
                 source = "google-ai-url"
             if not lines:
@@ -1476,6 +1497,40 @@ def search_image(
 
     if not lines:
         return LensResult(error="검색 결과를 받지 못했습니다.", source=source)
+
+    from product_name import (
+        extract_ai_clothing_fields,
+        extract_ai_labeled_fields,
+        format_clothing_product_name,
+        ko_name_to_en,
+        normalize_ai_color,
+    )
+
+    if clothing:
+        clothing_type, ai_color = extract_ai_clothing_fields(lines)
+        found_color = normalize_ai_color(ai_color) if ai_color else ""
+        if not found_color and color:
+            found_color = normalize_ai_color(color)
+        brand_s = (brand or "").strip()
+        if not clothing_type:
+            return LensResult(
+                error="옷종류를 찾지 못했습니다.",
+                raw_texts=lines[:40],
+                source=source,
+                color=found_color,
+                category="여성옷",
+            )
+        name_ko = format_clothing_product_name(brand_s, clothing_type)
+        name_en = ko_name_to_en(name_ko)
+        return LensResult(
+            product_name=name_ko,
+            name_en=name_en,
+            candidates=[clothing_type, name_ko],
+            category="여성옷",
+            raw_texts=lines[:40],
+            source=source,
+            color=found_color,
+        )
 
     named = build_product_name(lines, hint=hint)
     # AI 「제품명:」「컬러:」 라벨만 사용 — 문장/이미지 추정으로 덮지 않음
@@ -1516,6 +1571,7 @@ def search_product_images(
     color: str = "",
     brand: str = "",
     headless: bool = False,
+    clothing: bool = False,
 ) -> LensResult:
     paths = [p for p in image_paths if Path(p).exists()]
     urls = [u for u in (image_urls or []) if u.startswith("http")]
@@ -1530,9 +1586,11 @@ def search_product_images(
             color=color,
             brand=brand,
             headless=headless,
+            clothing=clothing,
         )
         if r.product_name:
-            if len(r.product_name.split()) >= 3:
+            # Clothing names are short ("샤넬 니트"); bags need longer model names.
+            if clothing or len(r.product_name.split()) >= 3:
                 return r
             last = r
         elif r.error and "Chromium" in r.error:
@@ -1549,6 +1607,7 @@ def search_product_images(
             color=color,
             brand=brand,
             headless=headless,
+            clothing=clothing,
         )
     return last
 
@@ -1560,10 +1619,17 @@ def search_products_multi(
 ) -> list[LensResult]:
     """Paste many product images at once, parse per-image 제품명/컬러.
 
-    Each job: { "path": str, "size": str, "hint": str, "brand": str }
+    Each job: { "path": str, "size": str, "hint": str, "brand": str, "clothing": bool }
     Returns one LensResult per job (same order).
     """
-    prepared: list[tuple[int, Path, str, str, str]] = []
+    from product_name import (
+        extract_ai_clothing_fields,
+        format_clothing_product_name,
+        ko_name_to_en,
+        normalize_ai_color,
+    )
+
+    prepared: list[tuple[int, Path, str, str, str, bool]] = []
     for i, job in enumerate(jobs):
         p = Path(job.get("path") or "")
         if p.exists():
@@ -1574,6 +1640,7 @@ def search_products_multi(
                     (job.get("size") or "").strip(),
                     (job.get("hint") or "").strip(),
                     (job.get("brand") or "").strip(),
+                    bool(job.get("clothing")),
                 )
             )
 
@@ -1583,25 +1650,28 @@ def search_products_multi(
     if not prepared:
         return out
 
-    size_vals = [s for _i, _p, s, _h, _b in prepared if s]
+    size_vals = [s for _i, _p, s, _h, _b, _c in prepared if s]
     size_prompt = ""
     if size_vals:
         uniq = list(dict.fromkeys(size_vals))
         size_prompt = uniq[0] if len(uniq) == 1 else ", ".join(uniq[:3])
 
-    brand_vals = [b for _i, _p, _s, _h, b in prepared if b]
+    brand_vals = [b for _i, _p, _s, _h, b, _c in prepared if b]
     brand_prompt = ""
     if brand_vals:
         uniq_b = list(dict.fromkeys(brand_vals))
         brand_prompt = uniq_b[0] if len(uniq_b) == 1 else ", ".join(uniq_b[:4])
 
+    clothing_mode = all(c for _i, _p, _s, _h, _b, c in prepared)
+
     try:
         lines = _google_ai_mode_search(
-            [p for _i, p, _s, _h, _b in prepared],
+            [p for _i, p, _s, _h, _b, _c in prepared],
             size=size_prompt,
             brand=brand_prompt,
             headless=headless,
             multi=True,
+            clothing=clothing_mode,
         )
     except Exception as e:
         msg = str(e)
@@ -1615,12 +1685,12 @@ def search_products_multi(
 
     if not lines:
         err = LensResult(error="검색 결과를 받지 못했습니다.", source="google-ai")
-        for job_i, _p, _s, _h, _b in prepared:
+        for job_i, _p, _s, _h, _b, _c in prepared:
             out[job_i] = err
         return out
 
     parsed = parse_multi_image_answers(lines, len(prepared))
-    for j, (job_i, _path, _size, hint, _brand) in enumerate(prepared):
+    for j, (job_i, _path, _size, hint, brand, clothing) in enumerate(prepared):
         item = (
             parsed[j]
             if j < len(parsed)
@@ -1630,6 +1700,34 @@ def search_products_multi(
         color = (item.get("color") or "").strip()
         name_en = (item.get("name_en") or "").strip()
         chunk_lines = [ln for ln in (item.get("raw") or "").splitlines() if ln.strip()]
+        if clothing or clothing_mode:
+            ctype, ai_color = extract_ai_clothing_fields(
+                chunk_lines or ([name] if name else []) or lines
+            )
+            if not ctype and name:
+                ctype = name
+            color = normalize_ai_color(ai_color or color)
+            if not ctype:
+                out[job_i] = LensResult(
+                    error="옷종류를 찾지 못했습니다.",
+                    raw_texts=chunk_lines or lines[:20],
+                    source="google-ai-multi",
+                    color=color,
+                    category="여성옷",
+                )
+                continue
+            name = format_clothing_product_name(brand, ctype)
+            name_en = ko_name_to_en(name)
+            out[job_i] = LensResult(
+                product_name=name,
+                name_en=name_en,
+                category="여성옷",
+                color=color,
+                raw_texts=chunk_lines or lines[:20],
+                source="google-ai-multi",
+                candidates=[ctype, name],
+            )
+            continue
         if name and not name_en:
             named = build_product_name(chunk_lines or [name], hint=hint)
             name_en = named.name_en

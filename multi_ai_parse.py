@@ -6,6 +6,7 @@ import re
 
 from product_name import (
     build_product_name,
+    extract_ai_clothing_fields,
     extract_ai_labeled_fields,
     normalize_ai_color,
 )
@@ -127,6 +128,9 @@ def _color_from_chunk(chunk_lines: list[str], head: str) -> str:
 
 
 def _name_from_chunk(chunk_lines: list[str], shared_name: str) -> tuple[str, str]:
+    ctype, _c = extract_ai_clothing_fields(chunk_lines)
+    if ctype:
+        return ctype, ""
     name, _c = extract_ai_labeled_fields(chunk_lines)
     if name:
         named = build_product_name([name], hint="")

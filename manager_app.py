@@ -98,7 +98,7 @@ from paths import (
 )
 from price_codec import DEFAULT_PRICE_TEXT, effective_price_code
 from product_attrs import extract_attrs, resolve_product_category
-from product_name import ko_name_to_en
+from product_name import is_clothing_category, ko_name_to_en
 from product_parse import parse_products
 from product_store import (
     CATEGORY_ORDER,
@@ -5943,6 +5943,28 @@ class ManagerApp(tk.Tk):
             return gallery[index]
         return ""
 
+    def _product_is_clothing(self, product: Product) -> bool:
+        """True when this item should use 옷종류 검색 (not full product name)."""
+        cat = ""
+        if self.current_id == product.id:
+            cat = self.category_var.get().strip()
+        if not cat:
+            cat = (product.category or "").strip()
+        if is_clothing_category(cat):
+            return True
+        try:
+            resolved = resolve_product_category(
+                tags=product.tags or "",
+                title=product.title or "",
+                description=product.description or "",
+                google_name=product.google_name or "",
+                name_en=product.name_en or "",
+                existing=cat,
+            )
+            return is_clothing_category(resolved)
+        except Exception:
+            return False
+
     def _product_brand_for_search(self, product: Product) -> str:
         """Brand label for Google AI prompt (e.g. 샤넬)."""
         try:
@@ -5982,6 +6004,7 @@ class ManagerApp(tk.Tk):
             color = product.colors.strip()
         hint = " ".join(x for x in (product.title, product.tags, product.description) if x)
         brand = self._product_brand_for_search(product)
+        clothing = self._product_is_clothing(product)
         gallery = self._gallery_image_paths(product)
         if image_index < 0:
             image_index = 0
@@ -5998,13 +6021,14 @@ class ManagerApp(tk.Tk):
             if brand and size
             else (f"{brand} 제품인데" if brand else (f"사이즈 {size}" if size else ""))
         )
+        ask_bit = (
+            "옷종류와 컬러를 알려줘 (예: 나시,니트,반팔티,긴팔티,가디건)"
+            if clothing
+            else "제품명과 컬러를 알려줘"
+        )
         self._put_log(
             f"구글 검색({nth_label}): 이미지 복사붙여넣기 → "
-            + (
-                f"「{prompt_preview} / 제품명과 컬러를 알려줘」"
-                if prompt_preview
-                else "「제품명과 컬러를 알려줘」"
-            )
+            + (f"「{prompt_preview} / {ask_bit}」" if prompt_preview else f"「{ask_bit}」")
             + (f" · {pathlib.Path(pick_img).name}" if pick_img else " · 이미지 없음!")
             + (f" · {size}" if size and not prompt_preview else ""),
             channel=LOG_SEARCH,
@@ -6022,6 +6046,7 @@ class ManagerApp(tk.Tk):
             color="",  # 컬러는 질문에 넣지 않음 — 검색 결과로 받음
             brand=brand,
             headless=headless,
+            clothing=clothing,
         )
         if result.error and not result.product_name:
             return False, result.error
@@ -6195,7 +6220,16 @@ class ManagerApp(tk.Tk):
                 size = p.sizes.strip()
             hint = " ".join(x for x in (p.title, p.tags, p.description) if x)
             brand = self._product_brand_for_search(p)
-            jobs.append({"path": img, "size": size, "hint": hint, "brand": brand})
+            clothing = self._product_is_clothing(p)
+            jobs.append(
+                {
+                    "path": img,
+                    "size": size,
+                    "hint": hint,
+                    "brand": brand,
+                    "clothing": clothing,
+                }
+            )
             ready.append(p)
         if not jobs:
             detail = "\n".join(skipped[:8])
@@ -6211,13 +6245,15 @@ class ManagerApp(tk.Tk):
         if brands:
             uniq = list(dict.fromkeys(brands))
             brand_bit = uniq[0] if len(uniq) == 1 else ", ".join(uniq[:4])
+        clothing_all = all(bool(j.get("clothing")) for j in jobs)
+        ask_bit = (
+            "각 제품의 옷종류와 컬러를 알려줘 (예: 나시,니트,반팔티…)"
+            if clothing_all
+            else "각 제품의 제품명과 컬러를 알려줘"
+        )
         self._put_log(
             f"구글 다중 검색({nth}번째 이미지): {len(jobs)}장 붙여넣기 → "
-            + (
-                f"「{brand_bit} 제품인데 / 각 제품의 제품명과 컬러를 알려줘」"
-                if brand_bit
-                else "「각 제품의 제품명과 컬러를 알려줘」"
-            ),
+            + (f"「{brand_bit} 제품인데 / {ask_bit}」" if brand_bit else f"「{ask_bit}」"),
             channel=LOG_SEARCH,
         )
         if skipped:

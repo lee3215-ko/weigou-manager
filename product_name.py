@@ -757,6 +757,118 @@ def extract_ai_labeled_fields(lines: list[str]) -> tuple[str, str]:
     return name, color
 
 
+# 옷 이미지 검색: 상세 제품명 대신 종류만 (나시/니트/반팔티 …)
+_CLOTHING_TYPE_ALIASES: list[tuple[str, str]] = [
+    (r"민소매|나시|탱크\s*탑|tank\s*top|슬리브리스|sleeveless", "나시"),
+    (r"크롭\s*니트|니트|스웨터|sweater|pullover|울\s*니트", "니트"),
+    (r"반팔\s*티|반팔티|숏\s*슬리브|short\s*sleeve\s*t|t-?shirt.*short", "반팔티"),
+    (r"긴팔\s*티|긴팔티|롱\s*슬리브\s*티|long\s*sleeve\s*t", "긴팔티"),
+    (r"가디건|cardigan", "가디건"),
+    (r"후드\s*티|후디|hoodie|후드집업", "후드"),
+    (r"맨투맨|스웨트셔츠|sweatshirt", "맨투맨"),
+    (r"블라우스|blouse", "블라우스"),
+    (r"셔츠|shirt(?!\s*dress)", "셔츠"),
+    (r"원피스|드레스|dress", "원피스"),
+    (r"스커트|skirt", "스커트"),
+    (r"팬츠|슬랙스|바지|pants|trousers", "팬츠"),
+    (r"청바지|데님\s*팬츠|jeans", "데님팬츠"),
+    (r"자켓|재킷|jacket|블레이저|blazer", "자켓"),
+    (r"코트|coat", "코트"),
+    (r"패딩|다운|puffer", "패딩"),
+    (r"조끼|베스트|vest", "조끼"),
+    (r"폴로|polo", "폴로"),
+    (r"터틀넥|목폴라|turtleneck", "터틀넥"),
+]
+_CLOTHING_CANON = (
+    "나시",
+    "니트",
+    "반팔티",
+    "긴팔티",
+    "가디건",
+    "후드",
+    "맨투맨",
+    "블라우스",
+    "셔츠",
+    "원피스",
+    "스커트",
+    "팬츠",
+    "데님팬츠",
+    "자켓",
+    "코트",
+    "패딩",
+    "조끼",
+    "폴로",
+    "터틀넥",
+)
+_RE_AI_CLOTHING_TYPE = re.compile(
+    r"(?:^|[\n•·\-\*📌]\s*)(?:\*\*|__)?"
+    r"(?:옷\s*종류|의류\s*종류|종류|제품\s*종류|아이템)"
+    r"(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
+    re.I | re.M,
+)
+
+
+def is_clothing_category(category: str | None) -> bool:
+    c = (category or "").strip()
+    return c in {"여성옷", "남성옷", "상의", "하의", "자켓"}
+
+
+def normalize_clothing_type(raw: str) -> str:
+    """Map free-form AI clothing type to a short Korean label."""
+    text = (raw or "").strip()
+    text = re.sub(r"[*_`#]+", "", text)
+    text = re.split(r"[/|·,，、(\[]", text, maxsplit=1)[0].strip()
+    text = re.sub(r"\s+", "", text)
+    if not text:
+        return ""
+    for canon in _CLOTHING_CANON:
+        if text == canon or text.endswith(canon):
+            return canon
+    blob = (raw or "").strip()
+    for pat, canon in _CLOTHING_TYPE_ALIASES:
+        if re.search(pat, blob, re.I):
+            return canon
+    # already short Korean word
+    if re.fullmatch(r"[가-힣]{2,8}", text):
+        return text
+    return ""
+
+
+def extract_ai_clothing_fields(lines: list[str]) -> tuple[str, str]:
+    """옷 검색 답변에서 (옷종류, 컬러) 추출."""
+    blob = "\n".join(lines or [])
+    clothing = ""
+    m = _RE_AI_CLOTHING_TYPE.search(blob)
+    if m:
+        clothing = normalize_clothing_type(m.group(1))
+    name, color = extract_ai_labeled_fields(lines)
+    if not clothing and name:
+        clothing = normalize_clothing_type(name)
+        # 「샤넬 니트」처럼 붙어 있으면 종류만 남김
+        if not clothing:
+            for pat, canon in _CLOTHING_TYPE_ALIASES:
+                if re.search(pat, name, re.I):
+                    clothing = canon
+                    break
+    if not clothing:
+        for pat, canon in _CLOTHING_TYPE_ALIASES:
+            if re.search(pat, blob, re.I):
+                clothing = canon
+                break
+    return clothing, color
+
+
+def format_clothing_product_name(brand: str, clothing_type: str) -> str:
+    """제품명 입력: 「샤넬 니트」."""
+    b = (brand or "").strip()
+    t = normalize_clothing_type(clothing_type) or (clothing_type or "").strip()
+    if b and t:
+        if t.startswith(b):
+            return t
+        return f"{b} {t}".strip()
+    return t or b
+
+
 def _score_title(text: str, hint: str = "") -> int:
     if not text or _NOISE_LINE.match(text.strip()):
         return -100
