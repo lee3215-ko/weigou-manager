@@ -113,20 +113,22 @@ def re_safe(value: str) -> str:
 
 
 def normalize_colors(colors: list[str] | None) -> list[str]:
-    """여러 색상 토큰·쉼표를 / 로 묶어 한 색상 옵션으로 만든다."""
+    """쉼표·| 로 나뉜 값은 각각 선택 옵션, / 는 투톤(한 옵션)으로 유지."""
     if not colors:
         return []
-    parts: list[str] = []
+    out: list[str] = []
     for c in colors:
-        t = re.sub(r"\s*,\s*", "/", (c or "").strip())
-        t = re.sub(r"\s*/\s*", "/", t)
-        if t:
-            parts.append(t)
-    if not parts:
-        return []
-    if len(parts) == 1:
-        return parts
-    return ["/".join(parts)]
+        t = (c or "").strip()
+        if not t:
+            continue
+        for part in re.split(r"[,|]+", t):
+            part = part.strip()
+            if not part:
+                continue
+            part = re.sub(r"\s*/\s*", "/", part)
+            if part and part not in out:
+                out.append(part)
+    return out
 
 
 def _clean_description(
@@ -623,7 +625,16 @@ def _apply_recommend_flags(row: dict[str, Any], *, recommended: bool, category: 
 
 
 def _csv_list(value: str) -> list[str]:
-    return [p.strip() for p in (value or "").split(",") if p.strip()]
+    """Split option list: comma/pipe = options, slash kept inside a token (two-tone)."""
+    out: list[str] = []
+    for part in re.split(r"[,|]+", value or ""):
+        part = part.strip()
+        if not part:
+            continue
+        part = re.sub(r"\s*/\s*", "/", part)
+        if part and part not in out:
+            out.append(part)
+    return out
 
 
 def _apply_published_to_live(item: PublishedItem, live: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -1131,8 +1142,8 @@ def reconcile_published_to_homepage(
                 store.update_published(item.id, sku_no=DEFAULT_PRICE_TEXT)
                 item = store.get_published(item.id) or item
                 product = store.published_to_product(item)
-            colors = [c.strip() for c in (item.colors or "").split(",") if c.strip()]
-            sizes = [s.strip() for s in (item.sizes or "").split(",") if s.strip()]
+            colors = [c.strip() for c in re.split(r"[,|]+", item.colors or "") if c.strip()]
+            sizes = [s.strip() for s in re.split(r"[,/|]+", item.sizes or "") if s.strip()]
             use_mid = mid or None
             result = publish_product(
                 product,

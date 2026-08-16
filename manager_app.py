@@ -128,23 +128,23 @@ def re_split_csv(raw: str) -> list[str]:
 
 
 def re_split_colors(raw: str) -> list[str]:
-    """색상: 쉼표(,)는 / 로 바꿔 한 색으로 인식. | 만 별도 옵션 구분.
+    """색상: 쉼표(,)·파이프(|) = 별도 선택 옵션, 슬래시(/) = 투톤 한 색.
 
-    예) '화이트, 핑크' → ['화이트/핑크']
-        '화이트/핑크' → ['화이트/핑크']
-        '블랙|화이트' → ['블랙', '화이트']
+    예) '화이트, 블랙' → ['화이트', '블랙']  (주문 시 컬러 선택)
+        '화이트/핑크' → ['화이트/핑크']     (투톤 한 옵션)
+        '블랙|화이트/골드' → ['블랙', '화이트/골드']
     """
     s = (raw or "").strip()
     if not s:
         return []
     options: list[str] = []
-    for part in re.split(r"\|+", s):
+    for part in re.split(r"[,|]+", s):
         part = part.strip()
         if not part:
             continue
-        part = re.sub(r"\s*,\s*", "/", part)
         part = re.sub(r"\s*/\s*", "/", part)
-        options.append(part)
+        if part and part not in options:
+            options.append(part)
     return options
 
 
@@ -1507,6 +1507,14 @@ class ManagerApp(tk.Tk):
         labeled(5, "태그", self.tags_var)
         labeled(6, "컬러", self.color_var)
         labeled(7, "사이즈", self.size_var)
+        tk.Label(
+            form,
+            text="컬러 안내: 쉼표(,)=주문 시 선택옵션  ·  슬래시(/)=투톤 한색   예) 화이트,블랙  /  화이트/핑크",
+            bg="#f3efe8",
+            fg="#666",
+            font=("Malgun Gothic", 8),
+            anchor="w",
+        ).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(0, 2))
 
         cat_row = tk.Frame(form, bg="#f3efe8")
         cat_row.grid(row=8, column=0, columnspan=2, sticky="ew", pady=3)
