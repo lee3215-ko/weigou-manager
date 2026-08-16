@@ -3749,28 +3749,30 @@ class ManagerApp(tk.Tk):
                 preview_price(sku) + "  ·  수정 후 [재등록]으로 홈페이지 갱신"
             )
             self._clear_images()
-            paths = list(item.image_paths) if item.image_paths else []
-            if not paths and item.cover_path:
-                paths = [item.cover_path]
-            # Prefer files that still exist; published pack folder is p{id}
-            existing: list[str] = []
-            for pth in paths:
-                if pth and pathlib.Path(pth).exists():
-                    existing.append(pth)
-                    continue
-                name = pathlib.Path(pth).name if pth else ""
-                if name:
-                    alt = self.store.published_img_root / f"p{item.id}" / name
-                    if alt.is_file():
-                        existing.append(str(alt))
-            existing = self._order_cover_first(existing, item.cover_path or "")
+            # Always heal from pack folder (cover reorder rewrites 00/01… names)
+            try:
+                existing = self.store.ensure_published_images(item.id)
+            except Exception:
+                existing = []
+            if not existing:
+                paths = list(item.image_paths) if item.image_paths else []
+                if not paths and item.cover_path:
+                    paths = [item.cover_path]
+                for pth in paths:
+                    if pth and pathlib.Path(pth).exists():
+                        existing.append(pth)
+            fresh_item = self.store.get_published(item.id) or item
+            existing = self._order_cover_first(
+                existing, fresh_item.cover_path or ""
+            )
             gen = self._select_gen
             self._schedule_thumbs(
                 existing,
                 gen,
                 cover_only=False,
-                urls=list(item.image_urls or []),
-                cover_path=item.cover_path or (existing[0] if existing else ""),
+                urls=list(fresh_item.image_urls or []),
+                cover_path=fresh_item.cover_path
+                or (existing[0] if existing else ""),
                 allow_set_cover=True,
             )
         finally:
@@ -7012,6 +7014,12 @@ class ManagerApp(tk.Tk):
         self._clear_images()
         try:
             self.update_idletasks()
+        except Exception:
+            pass
+        try:
+            import gc
+
+            gc.collect()
         except Exception:
             pass
 

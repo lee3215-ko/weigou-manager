@@ -2440,7 +2440,11 @@ class ProductStore:
         *,
         max_images: int = 40,
     ) -> list[str]:
-        """Put ``chosen_path`` first and rewrite folder files as 00, 01, …"""
+        """Put ``chosen_path`` first and rewrite folder files as 00, 01, ….
+
+        Uses a sibling staging directory so we never delete sources in the same
+        folder we are still reading from (Windows lock / partial-delete bugs).
+        """
         folder.mkdir(parents=True, exist_ok=True)
         chosen = ""
         for p in current_paths:
@@ -2453,22 +2457,26 @@ class ProductStore:
                     chosen = str(pathlib.Path(chosen_path).resolve())
             except OSError:
                 chosen = (chosen_path or "").strip()
-        if not chosen:
+        if not chosen or not pathlib.Path(chosen).is_file():
             raise ValueError("선택한 이미지를 찾을 수 없습니다")
 
         ordered: list[str] = [chosen]
         for p in current_paths:
             if self._same_image_file(p, chosen):
                 continue
-            if p and p not in ordered:
+            if not p:
+                continue
+            if any(self._same_image_file(p, x) for x in ordered):
+                continue
+            if pathlib.Path(p).is_file():
                 ordered.append(p)
-        # Also pick up any other files in folder not listed
+
         img_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
         try:
             for f in sorted(folder.iterdir()):
                 if not f.is_file() or f.suffix.lower() not in img_exts:
                     continue
-                if f.name.startswith("__tmp_"):
+                if f.name.startswith("__tmp_") or f.name.startswith("_reorder_"):
                     continue
                 s = str(f.resolve())
                 if any(self._same_image_file(s, x) for x in ordered):
@@ -2477,8 +2485,14 @@ class ProductStore:
         except OSError:
             pass
         ordered = ordered[:max_images]
+        if not ordered:
+            raise ValueError("합칠 이미지가 없습니다")
 
-        temps: list[pathlib.Path] = []
+        staging = folder.parent / f"_reorder_{folder.name}"
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+        staged: list[pathlib.Path] = []
         try:
             for i, src in enumerate(ordered):
                 src_p = pathlib.Path(src)
@@ -2487,43 +2501,41 @@ class ProductStore:
                 ext = src_p.suffix.lower() or ".jpg"
                 if ext not in img_exts:
                     ext = ".jpg"
-                tmp = folder / f"__tmp_{i:02d}{ext}"
-                shutil.copy2(src_p, tmp)
-                temps.append(tmp)
-            if not temps:
+                dest = staging / f"{i:02d}{ext}"
+                shutil.copy2(src_p, dest)
+                # Verify copy is readable
+                if dest.stat().st_size <= 0:
+                    raise OSError(f"복사 결과가 비어 있음: {dest.name}")
+                staged.append(dest)
+            if not staged:
                 raise ValueError("이미지를 정리할 수 없습니다")
+
+            # Remove old gallery files from pack (keep product.txt)
             for f in list(folder.iterdir()):
                 if not f.is_file():
                     continue
-                if f.name.startswith("__tmp_"):
+                if f.name.lower() == "product.txt":
                     continue
-                if f.suffix.lower() in img_exts or f.name.lower() == "product.txt":
-                    if f.name.lower() == "product.txt":
-                        continue
+                if f.suffix.lower() in img_exts or f.name.startswith("__tmp_"):
                     try:
                         f.unlink()
                     except OSError:
                         pass
+
             final: list[str] = []
-            for i, tmp in enumerate(temps):
-                ext = tmp.suffix.lower() or ".jpg"
-                dest = folder / f"{i:02d}{ext}"
+            for staged_path in staged:
+                dest = folder / staged_path.name
                 if dest.exists():
                     try:
                         dest.unlink()
                     except OSError:
                         pass
-                tmp.rename(dest)
+                shutil.move(str(staged_path), str(dest))
                 final.append(str(dest.resolve()))
             return final
-        except Exception:
-            for tmp in temps:
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                except OSError:
-                    pass
-            raise
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
 
     def set_product_cover(self, product_id: int, image_path: str) -> list[str]:
         """Set representative image: reorder gallery so it is first in folder + DB."""
@@ -2996,23 +3008,74 @@ class ProductStore:
         if not item:
             return []
         folder = self.published_img_root / f"p{published_id}"
-        existing = [x for x in (item.image_paths or []) if pathlib.Path(x).exists()]
-        if not existing and folder.is_dir():
-            exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
-            for f in sorted(folder.iterdir()):
-                if f.is_file() and f.suffix.lower() in exts:
-                    existing.append(str(f))
-        if existing:
-            if existing != list(item.image_paths or []):
+        img_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+        def list_pack() -> list[str]:
+            if not folder.is_dir():
+                return []
+            out: list[str] = []
+            try:
+                for f in sorted(folder.iterdir()):
+                    if (
+                        f.is_file()
+                        and f.suffix.lower() in img_exts
+                        and not f.name.startswith("__tmp_")
+                        and not f.name.startswith("_reorder_")
+                    ):
+                        try:
+                            out.append(str(f.resolve()))
+                        except OSError:
+                            out.append(str(f))
+            except OSError:
+                return []
+            return out
+
+        # Pack folder is source of truth after cover reorder / path migrate
+        pack_files = list_pack()
+        db_existing = [
+            x for x in (item.image_paths or []) if x and pathlib.Path(x).is_file()
+        ]
+        cover = (item.cover_path or "").strip()
+
+        if pack_files:
+            # Prefer DB order when every DB file still exists inside the pack
+            ordered: list[str] = []
+            if db_existing:
+                for p in db_existing:
+                    try:
+                        if pathlib.Path(p).resolve().parent == folder.resolve():
+                            if p not in ordered:
+                                ordered.append(p)
+                    except OSError:
+                        if p not in ordered:
+                            ordered.append(p)
+            for p in pack_files:
+                if any(self._same_image_file(p, x) for x in ordered):
+                    continue
+                ordered.append(p)
+            # Cover first if still present
+            if cover:
+                ordered = (
+                    [p for p in ordered if self._same_image_file(p, cover)][:1]
+                    + [p for p in ordered if not self._same_image_file(p, cover)]
+                )
+            ordered = ordered[:max_images]
+            if ordered != list(item.image_paths or []) or (
+                cover and not self._same_image_file(cover, ordered[0])
+            ):
                 try:
                     self.update_published(
                         published_id,
-                        cover_path=existing[0],
-                        image_paths=existing,
+                        cover_path=ordered[0],
+                        image_paths=ordered,
                     )
                 except Exception:
                     pass
-            return existing
+            return ordered
+
+        if db_existing:
+            return db_existing[:max_images]
+
         saved = self._download_gallery(list(item.image_urls or []), folder, max_images)
         if not saved:
             return []
