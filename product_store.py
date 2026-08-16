@@ -2422,6 +2422,178 @@ class ProductStore:
                 (paths[0], json.dumps(paths, ensure_ascii=False), product_id),
             )
 
+    @staticmethod
+    def _same_image_file(a: str, b: str) -> bool:
+        try:
+            pa, pb = pathlib.Path(a), pathlib.Path(b)
+            if pa.is_file() and pb.is_file():
+                return pa.resolve() == pb.resolve()
+        except OSError:
+            pass
+        return (a or "").replace("\\", "/").lower() == (b or "").replace("\\", "/").lower()
+
+    def _reorder_gallery_cover(
+        self,
+        folder: pathlib.Path,
+        current_paths: list[str],
+        chosen_path: str,
+        *,
+        max_images: int = 40,
+    ) -> list[str]:
+        """Put ``chosen_path`` first and rewrite folder files as 00, 01, …"""
+        folder.mkdir(parents=True, exist_ok=True)
+        chosen = ""
+        for p in current_paths:
+            if self._same_image_file(p, chosen_path):
+                chosen = p
+                break
+        if not chosen:
+            try:
+                if pathlib.Path(chosen_path).is_file():
+                    chosen = str(pathlib.Path(chosen_path).resolve())
+            except OSError:
+                chosen = (chosen_path or "").strip()
+        if not chosen:
+            raise ValueError("선택한 이미지를 찾을 수 없습니다")
+
+        ordered: list[str] = [chosen]
+        for p in current_paths:
+            if self._same_image_file(p, chosen):
+                continue
+            if p and p not in ordered:
+                ordered.append(p)
+        # Also pick up any other files in folder not listed
+        img_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+        try:
+            for f in sorted(folder.iterdir()):
+                if not f.is_file() or f.suffix.lower() not in img_exts:
+                    continue
+                if f.name.startswith("__tmp_"):
+                    continue
+                s = str(f.resolve())
+                if any(self._same_image_file(s, x) for x in ordered):
+                    continue
+                ordered.append(s)
+        except OSError:
+            pass
+        ordered = ordered[:max_images]
+
+        temps: list[pathlib.Path] = []
+        try:
+            for i, src in enumerate(ordered):
+                src_p = pathlib.Path(src)
+                if not src_p.is_file():
+                    continue
+                ext = src_p.suffix.lower() or ".jpg"
+                if ext not in img_exts:
+                    ext = ".jpg"
+                tmp = folder / f"__tmp_{i:02d}{ext}"
+                shutil.copy2(src_p, tmp)
+                temps.append(tmp)
+            if not temps:
+                raise ValueError("이미지를 정리할 수 없습니다")
+            for f in list(folder.iterdir()):
+                if not f.is_file():
+                    continue
+                if f.name.startswith("__tmp_"):
+                    continue
+                if f.suffix.lower() in img_exts or f.name.lower() == "product.txt":
+                    if f.name.lower() == "product.txt":
+                        continue
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+            final: list[str] = []
+            for i, tmp in enumerate(temps):
+                ext = tmp.suffix.lower() or ".jpg"
+                dest = folder / f"{i:02d}{ext}"
+                if dest.exists():
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
+                tmp.rename(dest)
+                final.append(str(dest.resolve()))
+            return final
+        except Exception:
+            for tmp in temps:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def set_product_cover(self, product_id: int, image_path: str) -> list[str]:
+        """Set representative image: reorder gallery so it is first in folder + DB."""
+        p = self.get(product_id)
+        if not p:
+            raise ValueError(f"상품 #{product_id} 없음")
+        paths = self.resolve_local_images(
+            product_id, paths=list(p.image_paths or []), cover_path=p.cover_path or ""
+        )
+        if not paths:
+            paths = self.ensure_product_images(product_id)
+        folder = self.img_root / str(product_id)
+        final = self._reorder_gallery_cover(folder, paths, image_path)
+        urls = list(p.image_urls or [])
+        # Keep URL list length-aligned if possible: rotate so index matches new cover
+        if urls and len(urls) == len(paths):
+            try:
+                idx = next(
+                    i
+                    for i, x in enumerate(paths)
+                    if self._same_image_file(x, image_path)
+                )
+                urls = urls[idx:] + urls[:idx]
+            except StopIteration:
+                pass
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE products SET cover_path=?, image_paths=?, image_urls=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    final[0],
+                    json.dumps(final, ensure_ascii=False),
+                    json.dumps(urls, ensure_ascii=False),
+                    now,
+                    product_id,
+                ),
+            )
+        self.write_product_txt(product_id)
+        return final
+
+    def set_published_cover(self, published_id: int, image_path: str) -> list[str]:
+        """Set representative image for a published pack (reorder + DB)."""
+        item = self.get_published(published_id)
+        if not item:
+            raise ValueError(f"등록 #{published_id} 없음")
+        paths = self.ensure_published_images(published_id)
+        folder = self.published_img_root / f"p{published_id}"
+        final = self._reorder_gallery_cover(folder, paths, image_path)
+        urls = list(item.image_urls or [])
+        if urls and len(urls) == len(paths):
+            try:
+                idx = next(
+                    i
+                    for i, x in enumerate(paths)
+                    if self._same_image_file(x, image_path)
+                )
+                urls = urls[idx:] + urls[:idx]
+            except StopIteration:
+                pass
+        self.update_published(
+            published_id,
+            cover_path=final[0],
+            image_paths=final,
+            image_urls=urls,
+        )
+        return final
+
     def ensure_product_images(
         self,
         product_id: int,

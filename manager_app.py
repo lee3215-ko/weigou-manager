@@ -1745,7 +1745,14 @@ class ManagerApp(tk.Tk):
         self.btn_ai_select.pack_forget()
         self.btn_ai_apply.pack_forget()
 
-        tk.Label(right, text="이미지", bg="#f3efe8", font=("Malgun Gothic", 9), anchor="w").pack(fill="x")
+        tk.Label(
+            right,
+            text="이미지  ·  클릭하면 대표 이미지로 설정",
+            bg="#f3efe8",
+            font=("Malgun Gothic", 9),
+            anchor="w",
+            fg="#555",
+        ).pack(fill="x")
         canvas_wrap = tk.Frame(right, bg="#fffdf9", relief="solid", borderwidth=1)
         canvas_wrap.pack(fill="both", expand=True)
         self.img_canvas = tk.Canvas(canvas_wrap, bg="#fffdf9", highlightthickness=0)
@@ -3756,9 +3763,15 @@ class ManagerApp(tk.Tk):
                     alt = self.store.published_img_root / f"p{item.id}" / name
                     if alt.is_file():
                         existing.append(str(alt))
+            existing = self._order_cover_first(existing, item.cover_path or "")
             gen = self._select_gen
             self._schedule_thumbs(
-                existing, gen, cover_only=False, urls=list(item.image_urls or [])
+                existing,
+                gen,
+                cover_only=False,
+                urls=list(item.image_urls or []),
+                cover_path=item.cover_path or (existing[0] if existing else ""),
+                allow_set_cover=True,
             )
         finally:
             self._end_form_load()
@@ -3854,6 +3867,23 @@ class ManagerApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _order_cover_first(self, paths: list[str], cover_path: str) -> list[str]:
+        """Put cover image first when present; otherwise keep order (first = default cover)."""
+        if not paths:
+            return []
+        cover = (cover_path or "").strip()
+        if not cover:
+            return list(paths)
+        chosen: list[str] = []
+        rest: list[str] = []
+        for p in paths:
+            if self.store._same_image_file(p, cover):
+                if not chosen:
+                    chosen.append(p)
+            else:
+                rest.append(p)
+        return (chosen or []) + rest
+
     def _schedule_thumbs(
         self,
         paths: list[str],
@@ -3862,11 +3892,14 @@ class ManagerApp(tk.Tk):
         cover_only: bool = False,
         urls: list[str] | None = None,
         product_id: int | None = None,
+        cover_path: str = "",
+        allow_set_cover: bool = False,
     ) -> None:
         """Load thumbnails asynchronously so list selection stays instant.
 
         Prefer local files (including healed paths). URL preview is only a
         fallback when nothing readable exists on disk.
+        Click a thumbnail (상품/등록) to set it as the representative cover.
         """
         existing = [p for p in (paths or []) if p and pathlib.Path(p).is_file()]
         if not existing and product_id is not None:
@@ -3881,7 +3914,8 @@ class ManagerApp(tk.Tk):
             tk.Label(self.img_frame, text="이미지 없음", bg="#fffdf9", fg="#888").pack(pady=20)
             return
 
-        paths = existing[:40]
+        cover = (cover_path or "").strip() or (existing[0] if existing else "")
+        paths = self._order_cover_first(existing[:40], cover)
 
         def load_one(index: int = 0) -> None:
             self._thumb_after = None
@@ -3889,29 +3923,47 @@ class ManagerApp(tk.Tk):
                 return
             if index >= len(paths) or (cover_only and index >= 1):
                 return
-            # First frame immediately; rest deferred
             batch = 1 if index == 0 else 3
             end = min(len(paths), index + batch)
             for i in range(index, end):
                 if gen != self._select_gen:
                     return
                 path = paths[i]
-                cell = tk.Frame(self.img_frame, bg="#fffdf9", padx=4, pady=4)
+                is_cover = bool(cover) and self.store._same_image_file(path, cover)
+                cell_bg = "#ecfdf5" if is_cover else "#fffdf9"
+                cell = tk.Frame(self.img_frame, bg=cell_bg, padx=4, pady=4)
                 cell.grid(row=i // 3, column=i % 3, sticky="n")
+                if is_cover:
+                    tk.Label(
+                        cell,
+                        text="대표",
+                        bg="#166534",
+                        fg="white",
+                        font=("Malgun Gothic", 8, "bold"),
+                        padx=6,
+                    ).pack(anchor="w", pady=(0, 2))
                 photo = self._thumb(path)
                 if photo:
-                    lbl = tk.Label(cell, image=photo, bg="#fffdf9")
+                    lbl = tk.Label(cell, image=photo, bg=cell_bg, cursor="hand2")
                     lbl.pack()
                 else:
                     lbl = tk.Label(
                         cell,
                         text="열기 실패",
-                        bg="#fffdf9",
+                        bg=cell_bg,
                         fg="#888",
                         font=("Consolas", 8),
                     )
                     lbl.pack()
-                # Thumbnails steal focus — bind wheel so scroll still works
+                if allow_set_cover and not cover_only:
+                    def _set_cover(_e=None, pth=path, already=is_cover) -> None:
+                        if already:
+                            return
+                        self._on_set_cover_image(pth)
+
+                    for w in (cell, lbl):
+                        w.bind("<Button-1>", _set_cover)
+                        w.configure(cursor="hand2")
                 handler = getattr(self, "_bind_img_mousewheel", None)
                 enter = getattr(self, "_img_wheel_bind", None)
                 leave = getattr(self, "_img_wheel_unbind", None)
@@ -3928,6 +3980,48 @@ class ManagerApp(tk.Tk):
                 self._thumb_after = self.after(1, lambda: load_one(end))
 
         load_one(0)
+
+    def _on_set_cover_image(self, image_path: str) -> None:
+        """Make clicked gallery image the cover (front of folder + DB)."""
+        mode = self.list_mode.get()
+        path = (image_path or "").strip()
+        if not path or not pathlib.Path(path).is_file():
+            messagebox.showwarning("대표 이미지", "이미지 파일을 찾을 수 없습니다.")
+            return
+
+        self._release_image_locks_for_merge()
+
+        try:
+            if mode == "published" and self.current_published_id is not None:
+                pub_id = int(self.current_published_id)
+                self.store.set_published_cover(pub_id, path)
+                self._mark_catalog_dirty(push_now=True)
+                item = self.store.get_published(pub_id)
+                if item:
+                    self._show_published(item)
+                messagebox.showinfo(
+                    "대표 이미지",
+                    "대표 이미지를 바꿨습니다.\n"
+                    "홈페이지에 반영하려면 [재등록]을 눌러 주세요.",
+                )
+            elif mode == "products" and self.current_id is not None:
+                pid = int(self.current_id)
+                self.store.set_product_cover(pid, path)
+                self._mark_catalog_dirty(push_now=True)
+                p = self.store.get(pid)
+                if p:
+                    self._show_product(p)
+                try:
+                    self.status.set(f"대표 이미지 변경 — 상품 #{pid}")
+                except Exception:
+                    pass
+            else:
+                messagebox.showwarning(
+                    "대표 이미지",
+                    "상품 또는 등록 목록에서 상품을 선택한 뒤\n이미지를 클릭하세요.",
+                )
+        except Exception as e:
+            messagebox.showerror("대표 이미지", f"설정 실패:\n{e}")
 
     def _show_product(self, p: Product) -> None:
         """Fill form from DB first — image color analysis only when color empty."""
@@ -3968,8 +4062,14 @@ class ManagerApp(tk.Tk):
                     self.store.rewrite_product_image_paths(p.id, paths)
                 except Exception:
                     pass
+            paths = self._order_cover_first(paths, p.cover_path or "")
             self._schedule_thumbs(
-                paths, gen, urls=list(p.image_urls or []), product_id=p.id
+                paths,
+                gen,
+                urls=list(p.image_urls or []),
+                product_id=p.id,
+                cover_path=p.cover_path or (paths[0] if paths else ""),
+                allow_set_cover=True,
             )
         finally:
             self._end_form_load()

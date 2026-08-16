@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.33",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/516592963",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.33/WeigouManager.zip",
-    "notes":  "사이트 맞추기 자동실행: 버전마다 전체재검사 제거, 최초 1회만",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/516592963",
-    "asset_id":  516592963,
+    "version":  "1.0.34",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.34/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.34/WeigouManager.zip",
+    "notes":  "상품/등록 대표이미지 클릭 설정: 폴더 맨 앞으로 정렬, 등록은 재등록으로 반영",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/516592963",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.33/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.34/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }
