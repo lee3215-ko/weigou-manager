@@ -2645,8 +2645,16 @@ class ManagerApp(tk.Tk):
             names = sorted(self._jobs)
         if not names:
             return ""
-        labels = [self._job_labels.get(n, n) for n in names]
-        return " · ".join(f"{lb} 중" for lb in labels)
+        parts: list[str] = []
+        for n in names:
+            # Prefer live progress label (e.g. 사이트맞추기중) over generic job name
+            ch = self._job_log_channel.get(n)
+            bit = self._job_banner_bits.get(ch or "", "") if ch else ""
+            if bit:
+                parts.append(bit)
+            else:
+                parts.append(f"{self._job_labels.get(n, n)} 중")
+        return " · ".join(parts)
 
     def _refresh_job_banner(self) -> None:
         """Show running job labels next to 상품 관리 title."""
@@ -4277,12 +4285,12 @@ class ManagerApp(tk.Tk):
                 bar: ttk.Progressbar = state["bar"]
                 state["done"] = max(0, int(done))
                 state["total"] = max(0, int(total))
-                banner = self._banner_label_for_channel(channel)
+                banner = (action or "").strip() or self._banner_label_for_channel(channel)
                 if indeterminate or state["total"] <= 0:
                     if str(bar.cget("mode")) != "indeterminate":
                         bar.configure(mode="indeterminate")
                         bar.start(14)
-                    title = f"{action} ({state['done']}건)"
+                    title = f"{banner} ({state['done']}건)"
                     self._job_banner_bits[channel] = f"{banner} ({state['done']}건)"
                 else:
                     if str(bar.cget("mode")) != "determinate":
@@ -4293,7 +4301,7 @@ class ManagerApp(tk.Tk):
                         bar.configure(mode="determinate")
                     bar.configure(maximum=max(1, state["total"]))
                     bar["value"] = min(state["done"], state["total"])
-                    title = f"{action} ({state['done']}/{state['total']})"
+                    title = f"{banner} ({state['done']}/{state['total']})"
                     self._job_banner_bits[channel] = (
                         f"{banner} ({state['done']}/{state['total']})"
                     )
@@ -5023,11 +5031,6 @@ class ManagerApp(tk.Tk):
                     ),
                     dedupe_first=True,
                 )
-                if mark_flag:
-                    try:
-                        self.store.set_setting(mark_flag, "1")
-                    except Exception:
-                        pass
                 self._mark_catalog_dirty(push_now=True)
                 summary = (
                     f"이미같음 {stats.get('ok', 0)} · "
@@ -5059,9 +5062,17 @@ class ManagerApp(tk.Tk):
                 def fail() -> None:
                     self._job_end("publish")
                     self._put_log(f"[맞추기] 오류: {err}", channel=LOG_MALL)
-                    messagebox.showerror("사이트 전체 맞추기", err)
+                    if confirm:
+                        messagebox.showerror("사이트 전체 맞추기", err)
 
                 self.after(0, fail)
+            finally:
+                # Auto-run once per version even if it failed (avoid every-launch retry)
+                if mark_flag:
+                    try:
+                        self.store.set_setting(mark_flag, "1")
+                    except Exception:
+                        pass
 
         threading.Thread(target=work, daemon=True).start()
 

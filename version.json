@@ -1,13 +1,10 @@
 {
-    "version":  "1.0.30",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/516542585",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.30/WeigouManager.zip",
-    "notes":  "이미지 합치기 WinError 5 수정: keep 폴더 rename 제거, 복사만으로 병합",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/516542585",
-    "asset_id":  516542585,
+    "version":  "1.0.31",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.31/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.31/WeigouManager.zip",
+    "notes":  "시작 시 자동 사이트맞추기 표시 명확화 · 실패해도 매실행 재시도 방지",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/516542585",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.30/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.31/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }
