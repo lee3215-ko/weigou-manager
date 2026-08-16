@@ -966,6 +966,9 @@ class ProductStore:
         note: str | None = None,
         mall_id: str | None = None,
         recommended: bool | None = None,
+        cover_path: str | None = None,
+        image_paths: list[str] | None = None,
+        image_urls: list[str] | None = None,
     ) -> None:
         """Update fields on a published row (for edit → 재등록)."""
         item = self.get_published(published_id)
@@ -1003,6 +1006,65 @@ class ProductStore:
                     published_id,
                 ),
             )
+        # Optional gallery rewrite (merge / heal)
+        if cover_path is not None or image_paths is not None or image_urls is not None:
+            cover = cover_path if cover_path is not None else item.cover_path
+            paths = (
+                list(image_paths)
+                if image_paths is not None
+                else list(item.image_paths or [])
+            )
+            urls = (
+                list(image_urls)
+                if image_urls is not None
+                else list(item.image_urls or [])
+            )
+            if cover_path is not None and image_paths is None and paths:
+                cover = cover_path or paths[0]
+            elif image_paths is not None and paths and not cover:
+                cover = paths[0]
+            with self._connect() as con:
+                con.execute(
+                    """
+                    UPDATE published SET cover_path=?, image_paths=?, image_urls=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        cover or "",
+                        json.dumps(paths, ensure_ascii=False),
+                        json.dumps(urls, ensure_ascii=False),
+                        now,
+                        published_id,
+                    ),
+                )
+
+    def purge_published(self, published_id: int) -> str:
+        """Delete a published row + local pack (no restore to 상품). Returns mall_id."""
+        item = self.get_published(published_id)
+        if not item:
+            return ""
+        mall = (item.mall_id or "").strip() or f"wg-{published_id}"
+        with self._connect() as con:
+            con.execute("DELETE FROM published WHERE id=?", (published_id,))
+        pack = self.published_img_root / f"p{published_id}"
+        if pack.exists():
+            shutil.rmtree(pack, ignore_errors=True)
+        if item.cover_path:
+            try:
+                p = pathlib.Path(item.cover_path)
+                if p.exists() and p.parent == self.published_img_root:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for key in self._product_sync_keys(
+            goods_id=item.goods_id,
+            search_code=item.search_code,
+            fallback_id=published_id,
+        ):
+            self.record_tombstone("published", key)
+        if item.mall_id:
+            self.record_tombstone("published", item.mall_id)
+        return mall
 
     def published_to_product(self, item: PublishedItem) -> Product:
         """Build a Product snapshot from published row for homepage re-publish."""
@@ -2402,37 +2464,16 @@ class ProductStore:
             return ""
         return h.hexdigest()
 
-    def merge_product_images(
+    def _merge_copy_into_folder(
         self,
-        keep_id: int,
-        donor_ids: list[int],
+        folder: pathlib.Path,
+        keep_paths: list[str],
+        donor_paths: list[str],
         *,
         max_images: int = 40,
-    ) -> dict:
-        """Merge gallery images from donor products into ``keep_id`` folder.
-
-        Copies new (deduped) donor files into ``images/<keep_id>/`` in place —
-        never deletes/renames the keep folder (Windows locks PhotoImage files).
-        Merges ``image_urls``, fills empty metadata from donors, then deletes
-        the donor catalog rows (and their image folders).
-        """
-        keep = self.get(keep_id)
-        if not keep:
-            raise ValueError(f"기준 상품 #{keep_id} 없음")
-        donors_unique: list[int] = []
-        for did in donor_ids:
-            d = int(did)
-            if d == keep_id or d in donors_unique:
-                continue
-            if self.get(d):
-                donors_unique.append(d)
-        if not donors_unique:
-            raise ValueError("합칠 다른 상품을 선택하세요")
-
-        folder = self.img_root / str(keep_id)
+    ) -> list[str]:
+        """Copy unique donor images into folder; keep existing files in place."""
         folder.mkdir(parents=True, exist_ok=True)
-
-        keep_paths = self.ensure_product_images(keep_id, max_images=max_images)
         final_paths: list[str] = []
         seen: set[str] = set()
         for path in keep_paths:
@@ -2446,22 +2487,15 @@ class ProductStore:
             except OSError:
                 final_paths.append(path)
 
-        donor_products: list[Product] = []
         to_copy: list[str] = []
-        for did in donors_unique:
-            d = self.get(did)
-            if not d:
+        for path in donor_paths:
+            dig = self._image_file_digest(path)
+            key = dig or path
+            if key in seen:
                 continue
-            donor_products.append(d)
-            for path in self.ensure_product_images(did, max_images=max_images):
-                dig = self._image_file_digest(path)
-                key = dig or path
-                if key in seen:
-                    continue
-                seen.add(key)
-                to_copy.append(path)
+            seen.add(key)
+            to_copy.append(path)
 
-        # Next free numeric prefix in keep folder (00.jpg, 01.png, …)
         next_idx = 0
         img_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
         try:
@@ -2480,7 +2514,6 @@ class ProductStore:
             src_p = pathlib.Path(src)
             if not src_p.is_file():
                 continue
-            # Skip if source is already inside keep folder
             try:
                 if src_p.resolve().parent == folder.resolve():
                     final_paths.append(str(src_p.resolve()))
@@ -2501,24 +2534,62 @@ class ProductStore:
             final_paths.append(str(dest.resolve()))
             next_idx += 1
 
-        final_paths = final_paths[:max_images]
-        if not final_paths:
-            raise ValueError("합칠 이미지가 없습니다")
+        return final_paths[:max_images]
 
-        # Drop leftover staging dirs from older failed merges
-        for stale in self.img_root.glob(f"_merge_tmp_{keep_id}*"):
-            shutil.rmtree(stale, ignore_errors=True)
-
+    @staticmethod
+    def _merge_url_lists(*groups: list[str] | None) -> list[str]:
         urls: list[str] = []
-        for u in list(keep.image_urls or []):
-            s = str(u or "").strip()
-            if s and s not in urls:
-                urls.append(s)
-        for d in donor_products:
-            for u in list(d.image_urls or []):
+        for group in groups:
+            for u in list(group or []):
                 s = str(u or "").strip()
                 if s and s not in urls:
                     urls.append(s)
+        return urls
+
+    def merge_product_images(
+        self,
+        keep_id: int,
+        donor_ids: list[int],
+        *,
+        max_images: int = 40,
+    ) -> dict:
+        """Merge gallery images from donor products into ``keep_id`` folder."""
+        keep = self.get(keep_id)
+        if not keep:
+            raise ValueError(f"기준 상품 #{keep_id} 없음")
+        donors_unique: list[int] = []
+        for did in donor_ids:
+            d = int(did)
+            if d == keep_id or d in donors_unique:
+                continue
+            if self.get(d):
+                donors_unique.append(d)
+        if not donors_unique:
+            raise ValueError("합칠 다른 상품을 선택하세요")
+
+        folder = self.img_root / str(keep_id)
+        keep_paths = self.ensure_product_images(keep_id, max_images=max_images)
+        donor_products: list[Product] = []
+        donor_paths: list[str] = []
+        for did in donors_unique:
+            d = self.get(did)
+            if not d:
+                continue
+            donor_products.append(d)
+            donor_paths.extend(self.ensure_product_images(did, max_images=max_images))
+
+        final_paths = self._merge_copy_into_folder(
+            folder, keep_paths, donor_paths, max_images=max_images
+        )
+        if not final_paths:
+            raise ValueError("합칠 이미지가 없습니다")
+
+        for stale in self.img_root.glob(f"_merge_tmp_{keep_id}*"):
+            shutil.rmtree(stale, ignore_errors=True)
+
+        urls = self._merge_url_lists(
+            keep.image_urls, *[d.image_urls for d in donor_products]
+        )
 
         def _blank(s: str) -> bool:
             return not (s or "").strip()
@@ -2593,6 +2664,116 @@ class ProductStore:
             "deleted_ids": deleted,
         }
 
+    def merge_published_images(
+        self,
+        keep_id: int,
+        donor_ids: list[int],
+        *,
+        max_images: int = 40,
+    ) -> dict:
+        """Merge galleries of donor published rows into keep's ``published_covers/p#`` pack.
+
+        Purges donor rows locally (no restore to 상품). Returns mall_ids that
+        should be removed from the homepage.
+        """
+        keep = self.get_published(keep_id)
+        if not keep:
+            raise ValueError(f"기준 등록 #{keep_id} 없음")
+        donors_unique: list[int] = []
+        for did in donor_ids:
+            d = int(did)
+            if d == keep_id or d in donors_unique:
+                continue
+            if self.get_published(d):
+                donors_unique.append(d)
+        if not donors_unique:
+            raise ValueError("합칠 다른 등록 상품을 선택하세요")
+
+        folder = self.published_img_root / f"p{keep_id}"
+        keep_paths = self.ensure_published_images(keep_id, max_images=max_images)
+        donor_items: list[PublishedItem] = []
+        donor_paths: list[str] = []
+        for did in donors_unique:
+            d = self.get_published(did)
+            if not d:
+                continue
+            donor_items.append(d)
+            donor_paths.extend(self.ensure_published_images(did, max_images=max_images))
+
+        final_paths = self._merge_copy_into_folder(
+            folder, keep_paths, donor_paths, max_images=max_images
+        )
+        if not final_paths:
+            raise ValueError("합칠 이미지가 없습니다")
+
+        urls = self._merge_url_lists(
+            keep.image_urls, *[d.image_urls for d in donor_items]
+        )
+
+        def _blank(s: str) -> bool:
+            return not (s or "").strip()
+
+        fill_google = keep.google_name
+        fill_en = keep.name_en
+        fill_cat = keep.category
+        fill_colors = keep.colors
+        fill_sizes = keep.sizes
+        fill_title = keep.title
+        fill_tags = keep.tags
+        fill_desc = keep.description
+        fill_sku = keep.sku_no
+        for d in donor_items:
+            if _blank(fill_google) and d.google_name:
+                fill_google = d.google_name
+            if _blank(fill_en) and d.name_en:
+                fill_en = d.name_en
+            if _blank(fill_cat) and d.category:
+                fill_cat = d.category
+            if _blank(fill_colors) and d.colors:
+                fill_colors = d.colors
+            if _blank(fill_sizes) and d.sizes:
+                fill_sizes = d.sizes
+            if _blank(fill_title) and d.title:
+                fill_title = d.title
+            if _blank(fill_tags) and d.tags:
+                fill_tags = d.tags
+            if _blank(fill_desc) and d.description:
+                fill_desc = d.description
+            if _blank(fill_sku) and d.sku_no:
+                fill_sku = d.sku_no
+
+        self.update_published(
+            keep_id,
+            title=fill_title,
+            tags=fill_tags,
+            description=fill_desc,
+            category=fill_cat,
+            google_name=fill_google,
+            name_en=fill_en,
+            colors=fill_colors,
+            sizes=fill_sizes,
+            sku_no=fill_sku,
+            cover_path=final_paths[0],
+            image_paths=final_paths,
+            image_urls=urls,
+        )
+
+        deleted: list[int] = []
+        deleted_mall_ids: list[str] = []
+        for did in donors_unique:
+            mall = self.purge_published(did)
+            deleted.append(did)
+            if mall:
+                deleted_mall_ids.append(mall)
+
+        return {
+            "keep_id": keep_id,
+            "image_count": len(final_paths),
+            "deleted_ids": deleted,
+            "deleted_mall_ids": deleted_mall_ids,
+            "keep_mall_id": (keep.mall_id or "").strip() or f"wg-{keep_id}",
+        }
+
     def write_product_txt(self, product_id: int, folder: pathlib.Path | None = None) -> pathlib.Path | None:
         """Write/refresh ``product.txt`` next to gallery images (folder 열기용)."""
         p = self.get(product_id)
@@ -2624,7 +2805,7 @@ class ProductStore:
         return meta
 
     def ensure_published_images(
-        self, published_id: int, max_images: int = 20
+        self, published_id: int, max_images: int = 40
     ) -> list[str]:
         """Download published-item gallery images on demand and return local paths."""
         item = self.get_published(published_id)
@@ -2638,6 +2819,15 @@ class ProductStore:
                 if f.is_file() and f.suffix.lower() in exts:
                     existing.append(str(f))
         if existing:
+            if existing != list(item.image_paths or []):
+                try:
+                    self.update_published(
+                        published_id,
+                        cover_path=existing[0],
+                        image_paths=existing,
+                    )
+                except Exception:
+                    pass
             return existing
         saved = self._download_gallery(list(item.image_urls or []), folder, max_images)
         if not saved:

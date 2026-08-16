@@ -2862,6 +2862,7 @@ class ManagerApp(tk.Tk):
             self.list_hint.configure(text="Ctrl·Shift 클릭으로 여러 개 선택 → 제외 해제")
         elif mode == "published":
             self.btn_republish.pack(side="left", padx=6)
+            self.btn_merge_images.pack(side="left", padx=6)
             self.btn_reconcile_site.pack(side="left", padx=6)
             self.btn_recommend.pack(side="left", padx=6)
             self.btn_unrecommend.pack(side="left", padx=6)
@@ -2878,7 +2879,7 @@ class ManagerApp(tk.Tk):
                 )
             else:
                 self.list_hint.configure(
-                    text="클릭=1개 · [재등록]/[추천]/[추천 해제] · 「추천만」체크 가능"
+                    text="먼저 클릭한 상품이 기준 · Ctrl/Shift 추가 → 이미지 합치기/재등록/추천"
                 )
         else:
             self.btn_save.pack(side="left")
@@ -5169,6 +5170,7 @@ class ManagerApp(tk.Tk):
                         if fresh_item:
                             product.image_paths = fresh_item.image_paths
                             product.cover_path = fresh_item.cover_path
+                            product.image_urls = list(fresh_item.image_urls or [])
                     except Exception:
                         pass
                     try:
@@ -6814,8 +6816,12 @@ class ManagerApp(tk.Tk):
         self.refresh_list()
 
     def _on_merge_images(self) -> None:
-        """Merge galleries of 2+ selected products into one folder (keep current)."""
-        if self.list_mode.get() != "products":
+        """Merge galleries of 2+ selected items (상품 or 등록) into the focused one."""
+        mode = self.list_mode.get()
+        if mode == "published":
+            self._on_merge_published_images()
+            return
+        if mode != "products":
             return
         ids = self._selected_product_ids()
         if len(ids) < 2:
@@ -6857,23 +6863,9 @@ class ManagerApp(tk.Tk):
         ):
             return
 
-        # Persist form edits on keep before merge
         if self.current_id == keep_id:
             self._soft_save_current()
-
-        # Release thumbnail widgets so Windows does not lock image files
-        if self._thumb_after is not None:
-            try:
-                self.after_cancel(self._thumb_after)
-            except Exception:
-                pass
-            self._thumb_after = None
-        self._select_gen += 1
-        self._clear_images()
-        try:
-            self.update_idletasks()
-        except Exception:
-            pass
+        self._release_image_locks_for_merge()
 
         try:
             result = self.store.merge_product_images(keep_id, donors)
@@ -6899,6 +6891,122 @@ class ManagerApp(tk.Tk):
             f"완료 — #{keep_id} 폴더에 이미지 {n_img}장.\n"
             "홈페이지 등록하면 합친 이미지가 모두 올라갑니다.",
         )
+
+    def _release_image_locks_for_merge(self) -> None:
+        if self._thumb_after is not None:
+            try:
+                self.after_cancel(self._thumb_after)
+            except Exception:
+                pass
+            self._thumb_after = None
+        self._select_gen += 1
+        self._clear_images()
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    def _on_merge_published_images(self) -> None:
+        """Merge 등록 items → keep pack, purge donors, optional homepage republish."""
+        ids = self._selected_published_ids()
+        if len(ids) < 2:
+            messagebox.showwarning(
+                "이미지 합치기",
+                "같은 제품의 등록 상품을 2개 이상 선택하세요.\n"
+                "(Ctrl 또는 Shift 클릭으로 다중 선택)",
+            )
+            return
+
+        keep_id = (
+            self.current_published_id
+            if self.current_published_id is not None and self.current_published_id in ids
+            else ids[0]
+        )
+        donors = [i for i in ids if i != keep_id]
+        keep = self.store.get_published(keep_id)
+        if not keep:
+            messagebox.showwarning("없음", "기준 등록 상품을 찾을 수 없습니다.")
+            return
+
+        def _label(pid: int) -> str:
+            p = self.store.get_published(pid)
+            if not p:
+                return f"등록#{pid}"
+            name = (p.google_name or p.title or "").strip() or "(이름 없음)"
+            if len(name) > 40:
+                name = name[:39] + "…"
+            return f"등록#{pid} {name}"
+
+        donor_lines = "\n".join(f"  · {_label(d)}" for d in donors)
+        ans = messagebox.askyesnocancel(
+            "이미지 합치기 (등록)",
+            f"기준(상세에 보이는) 등록:\n  {_label(keep_id)}\n\n"
+            f"합친 뒤 삭제할 등록:\n{donor_lines}\n\n"
+            "이미지를 기준 폴더로 합치고,\n"
+            "합친 쪽은 등록 목록·홈페이지에서 삭제합니다.\n\n"
+            "예 = 합친 뒤 기준 상품 재등록 (이미지 전부 반영)\n"
+            "아니오 = 합치기만 (나중에 재등록)\n"
+            "취소 = 중단",
+        )
+        if ans is None:
+            return
+
+        if self.current_published_id == keep_id:
+            self._soft_save_current(force=True)
+        self._release_image_locks_for_merge()
+
+        try:
+            result = self.store.merge_published_images(keep_id, donors)
+        except Exception as e:
+            messagebox.showerror("이미지 합치기", f"합치기 실패:\n{e}")
+            return
+
+        n_img = int(result.get("image_count") or 0)
+        deleted = result.get("deleted_ids") or []
+        mall_ids = list(result.get("deleted_mall_ids") or [])
+        self._append(
+            f"등록 이미지 합치기 → 등록#{keep_id} ({n_img}장) · "
+            f"삭제 {', '.join('#'+str(x) for x in deleted)}"
+        )
+        self._mark_catalog_dirty(push_now=True)
+        self.current_published_id = keep_id
+        self._sticky_selected_ids = [keep_id]
+
+        def after_site_cleanup() -> None:
+            yview = self.listbox.yview()
+            self.refresh_list(
+                preserve_yview=(float(yview[0]), float(yview[1])),
+                focus_list=True,
+            )
+            if ans:
+                messagebox.showinfo(
+                    "이미지 합치기",
+                    f"합치기 완료 — 등록#{keep_id} 이미지 {n_img}장.\n"
+                    "이어서 홈페이지 재등록을 시작합니다.",
+                )
+                self._republish_ids([keep_id], confirm=False)
+            else:
+                messagebox.showinfo(
+                    "이미지 합치기",
+                    f"완료 — 등록#{keep_id} 이미지 {n_img}장.\n"
+                    "홈페이지에 반영하려면 [재등록]을 눌러 주세요.",
+                )
+
+        if mall_ids:
+            def work() -> None:
+                try:
+                    result_del = delete_mall_products(mall_ids, push_api=True)
+                    self._put_log(
+                        f"합치기 후 홈페이지 삭제 {len(mall_ids)}건 — {result_del.get('api')}",
+                        channel=LOG_MALL,
+                    )
+                except Exception as e:
+                    self._put_log(f"합치기 후 홈페이지 삭제 실패: {e}", channel=LOG_MALL)
+                self.after(0, after_site_cleanup)
+
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            after_site_cleanup()
 
     def _on_delete(self) -> None:
         if self.list_mode.get() != "products":
