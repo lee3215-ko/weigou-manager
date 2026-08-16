@@ -2411,8 +2411,9 @@ class ProductStore:
     ) -> dict:
         """Merge gallery images from donor products into ``keep_id`` folder.
 
-        Dedupes by file content hash, renumbers into ``images/<keep_id>/``,
-        merges ``image_urls``, fills empty metadata from donors, then deletes
+        Copies new (deduped) donor files into ``images/<keep_id>/`` in place —
+        never deletes/renames the keep folder (Windows locks PhotoImage files).
+        Merges ``image_urls``, fills empty metadata from donors, then deletes
         the donor catalog rows (and their image folders).
         """
         keep = self.get(keep_id)
@@ -2428,8 +2429,11 @@ class ProductStore:
         if not donors_unique:
             raise ValueError("합칠 다른 상품을 선택하세요")
 
+        folder = self.img_root / str(keep_id)
+        folder.mkdir(parents=True, exist_ok=True)
+
         keep_paths = self.ensure_product_images(keep_id, max_images=max_images)
-        ordered: list[str] = []
+        final_paths: list[str] = []
         seen: set[str] = set()
         for path in keep_paths:
             dig = self._image_file_digest(path)
@@ -2437,9 +2441,13 @@ class ProductStore:
             if key in seen:
                 continue
             seen.add(key)
-            ordered.append(path)
+            try:
+                final_paths.append(str(pathlib.Path(path).resolve()))
+            except OSError:
+                final_paths.append(path)
 
         donor_products: list[Product] = []
+        to_copy: list[str] = []
         for did in donors_unique:
             d = self.get(did)
             if not d:
@@ -2451,36 +2459,55 @@ class ProductStore:
                 if key in seen:
                     continue
                 seen.add(key)
-                ordered.append(path)
+                to_copy.append(path)
 
-        ordered = ordered[:max_images]
-        if not ordered:
+        # Next free numeric prefix in keep folder (00.jpg, 01.png, …)
+        next_idx = 0
+        img_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+        try:
+            for f in folder.iterdir():
+                if not f.is_file() or f.suffix.lower() not in img_exts:
+                    continue
+                m = re.match(r"^(\d+)", f.stem)
+                if m:
+                    next_idx = max(next_idx, int(m.group(1)) + 1)
+        except OSError:
+            pass
+
+        for src in to_copy:
+            if len(final_paths) >= max_images:
+                break
+            src_p = pathlib.Path(src)
+            if not src_p.is_file():
+                continue
+            # Skip if source is already inside keep folder
+            try:
+                if src_p.resolve().parent == folder.resolve():
+                    final_paths.append(str(src_p.resolve()))
+                    continue
+            except OSError:
+                pass
+            ext = src_p.suffix.lower() or ".jpg"
+            if ext not in img_exts:
+                ext = ".jpg"
+            dest = folder / f"{next_idx:02d}{ext}"
+            while dest.exists():
+                next_idx += 1
+                dest = folder / f"{next_idx:02d}{ext}"
+            try:
+                shutil.copy2(src_p, dest)
+            except OSError as e:
+                raise OSError(f"이미지 복사 실패: {src_p.name} → {dest.name}\n{e}") from e
+            final_paths.append(str(dest.resolve()))
+            next_idx += 1
+
+        final_paths = final_paths[:max_images]
+        if not final_paths:
             raise ValueError("합칠 이미지가 없습니다")
 
-        folder = self.img_root / str(keep_id)
-        staging = self.img_root / f"_merge_tmp_{keep_id}"
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(parents=True, exist_ok=True)
-        staged: list[pathlib.Path] = []
-        try:
-            for i, src in enumerate(ordered):
-                src_p = pathlib.Path(src)
-                ext = src_p.suffix.lower() or ".jpg"
-                if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
-                    ext = ".jpg"
-                dest = staging / f"{i:02d}{ext}"
-                shutil.copy2(src_p, dest)
-                staged.append(dest)
-            if folder.exists():
-                shutil.rmtree(folder, ignore_errors=True)
-            staging.rename(folder)
-        except Exception:
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-            raise
-
-        final_paths = [str((folder / p.name).resolve()) for p in staged]
+        # Drop leftover staging dirs from older failed merges
+        for stale in self.img_root.glob(f"_merge_tmp_{keep_id}*"):
+            shutil.rmtree(stale, ignore_errors=True)
 
         urls: list[str] = []
         for u in list(keep.image_urls or []):

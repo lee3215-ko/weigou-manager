@@ -6850,6 +6850,20 @@ class ManagerApp(tk.Tk):
         if self.current_id == keep_id:
             self._soft_save_current()
 
+        # Release thumbnail widgets so Windows does not lock image files
+        if self._thumb_after is not None:
+            try:
+                self.after_cancel(self._thumb_after)
+            except Exception:
+                pass
+            self._thumb_after = None
+        self._select_gen += 1
+        self._clear_images()
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
         try:
             result = self.store.merge_product_images(keep_id, donors)
         except Exception as e:
