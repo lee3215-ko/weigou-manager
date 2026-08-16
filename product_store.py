@@ -441,6 +441,18 @@ class ProductStore:
                 (key, value),
             )
 
+    def has_true_setting_like(self, key_prefix: str) -> bool:
+        """True if any settings key starting with prefix has value '1'."""
+        prefix = (key_prefix or "").strip()
+        if not prefix:
+            return False
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT 1 FROM settings WHERE key LIKE ? AND trim(value)='1' LIMIT 1",
+                (prefix + "%",),
+            ).fetchone()
+        return bool(row)
+
     def get_list_cursor(self, shop_id: str) -> int:
         """Last handled data-index for this album (-1 = none yet)."""
         sid = (shop_id or "").strip() or "_default"

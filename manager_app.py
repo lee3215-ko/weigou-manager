@@ -4981,17 +4981,26 @@ class ManagerApp(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _maybe_auto_reconcile_homepage(self) -> None:
-        """Run site reconcile once after upgrade so existing 「등록」 land on homepage."""
-        flag = f"homepage_reconcile_done_v{APP_VERSION}"
+        """Run full site reconcile at most once (not on every app version bump).
+
+        Field drift is handled separately by ``_maybe_sync_homepage_metadata``
+        on each launch. Full reconcile (missing/dupe repair) only needs to run
+        once after cloud setup — repeating it on every update wastes time.
+        """
+        flag = "homepage_full_reconcile_done"
         try:
             if (self.store.get_setting(flag, "") or "").strip() == "1":
+                return
+            # Legacy: older builds marked done per APP_VERSION — treat as already done
+            if self.store.has_true_setting_like("homepage_reconcile_done_v"):
+                self.store.set_setting(flag, "1")
                 return
         except Exception:
             return
         if not cloud_enabled():
             return
         self._put_log(
-            "[맞추기] 업데이트 후 자동: 등록 목록 ↔ 홈페이지 확인/중복정리 시작",
+            "[맞추기] 최초 1회: 등록 목록 ↔ 홈페이지 전체 확인/중복정리 시작",
             channel=LOG_MALL,
         )
         self._run_reconcile_homepage(confirm=False, mark_flag=flag)
