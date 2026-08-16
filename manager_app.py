@@ -199,6 +199,8 @@ class ManagerApp(tk.Tk):
         self.current_id: int | None = None
         self.current_excluded_id: int | None = None
         self.current_published_id: int | None = None
+        # Ctrl/Shift 다중 선택 시 상세(포커스)는 처음 선택한 상품 유지
+        self._list_select_mods: frozenset[str] = frozenset()
         self.list_mode = tk.StringVar(value="products")  # products | excluded | published
         self._photo_cache: list[tk.PhotoImage] = []
         self._photo_refs: list[tk.PhotoImage] = []  # URL-thumbnail cache (separate from local-file cache)
@@ -1389,6 +1391,8 @@ class ManagerApp(tk.Tk):
         self.listbox.configure(yscrollcommand=list_scroll.set)
         self.listbox.pack(side="left", fill="both", expand=True)
         list_scroll.pack(side="right", fill="y")
+        self.listbox.bind("<Button-1>", self._on_list_button1, add="+")
+        self.listbox.bind("<KeyPress>", self._on_list_keypress, add="+")
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
 
         def _on_list_mousewheel(event: tk.Event) -> str | None:
@@ -2877,7 +2881,7 @@ class ManagerApp(tk.Tk):
             self.listbox.configure(selectmode=tk.EXTENDED)
             self.chk_recommended_only.configure(state="disabled")
             self.chk_searched_only.configure(state="normal")
-            hint = "Ctrl·Shift 클릭으로 여러 개 선택 → 등록/제외/이미지 합치기"
+            hint = "먼저 클릭한 상품이 기준(상세) · Ctrl/Shift로 추가 → 등록/제외/이미지 합치기"
             if self.filter_searched_only.get():
                 hint = "검색완료(제품명 있음)만 표시 중 · " + hint
             self.list_hint.configure(text=hint)
@@ -3237,20 +3241,90 @@ class ManagerApp(tk.Tk):
         finally:
             self._end_form_load()
 
+    def _capture_list_select_mods(self, event: tk.Event) -> None:
+        """Remember Ctrl/Shift at click/key so multi-select keeps first focus."""
+        state = int(getattr(event, "state", 0) or 0)
+        mods: set[str] = set()
+        if state & 0x4:  # Control
+            mods.add("control")
+        if state & 0x1:  # Shift
+            mods.add("shift")
+        self._list_select_mods = frozenset(mods)
+
+    def _on_list_button1(self, event: tk.Event) -> None:
+        self._capture_list_select_mods(event)
+
+    def _on_list_keypress(self, event: tk.Event) -> None:
+        key = str(getattr(event, "keysym", "") or "")
+        if key in ("Up", "Down", "Prior", "Next", "Home", "End", "space", "Space"):
+            self._capture_list_select_mods(event)
+
+    def _focus_index_from_selection(self, sel: tuple[int, ...] | list[int]) -> int:
+        """Index whose detail panel should show.
+
+        Plain click → newly activated row.
+        Ctrl/Shift multi-select → keep the previously focused row if still selected
+        (so the first-clicked product stays the merge/register focus).
+        """
+        if not sel:
+            return 0
+        indices = [int(i) for i in sel]
+        mods = getattr(self, "_list_select_mods", frozenset())
+        multi_extend = bool(mods & {"control", "shift"}) and len(indices) > 1
+        mode = self.list_mode.get()
+
+        current: int | None = None
+        items_len = 0
+        if mode == "excluded":
+            current = self.current_excluded_id
+            items_len = len(self.excluded_items)
+        elif mode == "published":
+            current = self.current_published_id
+            items_len = len(self.published_items)
+        else:
+            current = self.current_id
+            items_len = len(self.products)
+
+        if multi_extend and current is not None:
+            for i in indices:
+                if mode == "excluded":
+                    if 0 <= i < items_len and self.excluded_items[i].id == current:
+                        return i
+                elif mode == "published":
+                    if 0 <= i < items_len and self.published_items[i].id == current:
+                        return i
+                else:
+                    if 0 <= i < items_len and self.products[i].id == current:
+                        return i
+
+        # New primary selection: prefer Tk "active" (the row just clicked)
+        try:
+            active = int(self.listbox.index("active"))
+            if active in indices:
+                return active
+        except Exception:
+            pass
+        return indices[-1]
+
     def _on_select(self, _event=None) -> None:
         sel = self.listbox.curselection()
         if not sel:
             return
         self._remember_list_selection()
-        # 다중 선택 시 마지막(활성) 항목 상세를 표시
-        idx = int(sel[-1])
+        idx = self._focus_index_from_selection(sel)
         mode = self.list_mode.get()
         if mode == "excluded":
             if 0 <= idx < len(self.excluded_items):
-                self._show_excluded(self.excluded_items[idx])
+                item = self.excluded_items[idx]
+                if self.current_excluded_id == item.id:
+                    return
+                self._show_excluded(item)
         elif mode == "published":
             if 0 <= idx < len(self.published_items):
-                self._show_published(self.published_items[idx])
+                item = self.published_items[idx]
+                if self.current_published_id == item.id:
+                    return
+                self._show_published(item)
         else:
             # 다른 항목 클릭 전 한글 조합 확정 + 현재 입력값 즉시 저장
             if self.current_id is not None:
@@ -3258,8 +3332,10 @@ class ManagerApp(tk.Tk):
                     self._finalize_ime(self.focus_get() or self._ime_focus_widget)
                     self._soft_save_current(force=True)
             if 0 <= idx < len(self.products):
-                self._show_product(self.products[idx])
-
+                p = self.products[idx]
+                if self.current_id == p.id:
+                    return
+                self._show_product(p)
     def _selected_product_ids(self) -> list[int]:
         if self.list_mode.get() != "products":
             return []
@@ -6762,11 +6838,11 @@ class ManagerApp(tk.Tk):
         donor_lines = "\n".join(f"  · {_label(d)}" for d in donors)
         if not messagebox.askyesno(
             "이미지 합치기",
-            f"기준(남길) 상품:\n  {_label(keep_id)}\n\n"
+            f"기준(상세에 보이는) 상품:\n  {_label(keep_id)}\n\n"
             f"합친 뒤 삭제할 상품:\n{donor_lines}\n\n"
             "이미지를 기준 폴더로 합치고,\n"
             "합친 상품은 목록에서 삭제합니다.\n"
-            "(홈페이지 등록 시 합친 이미지가 모두 올라갑니다)",
+            "(먼저 클릭한 상품이 기준입니다)",
         ):
             return
 
