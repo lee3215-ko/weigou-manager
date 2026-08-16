@@ -2388,6 +2388,184 @@ class ProductStore:
         self.write_product_txt(product_id)
         return saved
 
+    @staticmethod
+    def _image_file_digest(path: str | pathlib.Path) -> str:
+        h = hashlib.md5()
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+        except OSError:
+            return ""
+        return h.hexdigest()
+
+    def merge_product_images(
+        self,
+        keep_id: int,
+        donor_ids: list[int],
+        *,
+        max_images: int = 40,
+    ) -> dict:
+        """Merge gallery images from donor products into ``keep_id`` folder.
+
+        Dedupes by file content hash, renumbers into ``images/<keep_id>/``,
+        merges ``image_urls``, fills empty metadata from donors, then deletes
+        the donor catalog rows (and their image folders).
+        """
+        keep = self.get(keep_id)
+        if not keep:
+            raise ValueError(f"기준 상품 #{keep_id} 없음")
+        donors_unique: list[int] = []
+        for did in donor_ids:
+            d = int(did)
+            if d == keep_id or d in donors_unique:
+                continue
+            if self.get(d):
+                donors_unique.append(d)
+        if not donors_unique:
+            raise ValueError("합칠 다른 상품을 선택하세요")
+
+        keep_paths = self.ensure_product_images(keep_id, max_images=max_images)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for path in keep_paths:
+            dig = self._image_file_digest(path)
+            key = dig or path
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(path)
+
+        donor_products: list[Product] = []
+        for did in donors_unique:
+            d = self.get(did)
+            if not d:
+                continue
+            donor_products.append(d)
+            for path in self.ensure_product_images(did, max_images=max_images):
+                dig = self._image_file_digest(path)
+                key = dig or path
+                if key in seen:
+                    continue
+                seen.add(key)
+                ordered.append(path)
+
+        ordered = ordered[:max_images]
+        if not ordered:
+            raise ValueError("합칠 이미지가 없습니다")
+
+        folder = self.img_root / str(keep_id)
+        staging = self.img_root / f"_merge_tmp_{keep_id}"
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+        staged: list[pathlib.Path] = []
+        try:
+            for i, src in enumerate(ordered):
+                src_p = pathlib.Path(src)
+                ext = src_p.suffix.lower() or ".jpg"
+                if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
+                    ext = ".jpg"
+                dest = staging / f"{i:02d}{ext}"
+                shutil.copy2(src_p, dest)
+                staged.append(dest)
+            if folder.exists():
+                shutil.rmtree(folder, ignore_errors=True)
+            staging.rename(folder)
+        except Exception:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        final_paths = [str((folder / p.name).resolve()) for p in staged]
+
+        urls: list[str] = []
+        for u in list(keep.image_urls or []):
+            s = str(u or "").strip()
+            if s and s not in urls:
+                urls.append(s)
+        for d in donor_products:
+            for u in list(d.image_urls or []):
+                s = str(u or "").strip()
+                if s and s not in urls:
+                    urls.append(s)
+
+        def _blank(s: str) -> bool:
+            return not (s or "").strip()
+
+        fill_google = keep.google_name
+        fill_en = keep.name_en
+        fill_cat = keep.category
+        fill_colors = keep.colors
+        fill_sizes = keep.sizes
+        fill_title = keep.title
+        fill_tags = keep.tags
+        fill_desc = keep.description
+        fill_sku = keep.sku_no
+        for d in donor_products:
+            if _blank(fill_google) and d.google_name:
+                fill_google = d.google_name
+            if _blank(fill_en) and d.name_en:
+                fill_en = d.name_en
+            if _blank(fill_cat) and d.category:
+                fill_cat = d.category
+            if _blank(fill_colors) and d.colors:
+                fill_colors = d.colors
+            if _blank(fill_sizes) and d.sizes:
+                fill_sizes = d.sizes
+            if _blank(fill_title) and d.title:
+                fill_title = d.title
+            if _blank(fill_tags) and d.tags:
+                fill_tags = d.tags
+            if _blank(fill_desc) and d.description:
+                fill_desc = d.description
+            if _blank(fill_sku) and d.sku_no:
+                fill_sku = d.sku_no
+
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE products SET
+                    cover_path=?, image_paths=?, image_urls=?,
+                    title=?, tags=?, description=?,
+                    category=?, google_name=?, name_en=?,
+                    colors=?, sizes=?, sku_no=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    final_paths[0],
+                    json.dumps(final_paths, ensure_ascii=False),
+                    json.dumps(urls, ensure_ascii=False),
+                    fill_title,
+                    fill_tags,
+                    fill_desc,
+                    fill_cat,
+                    fill_google,
+                    fill_en,
+                    fill_colors,
+                    fill_sizes,
+                    fill_sku,
+                    now,
+                    keep_id,
+                ),
+            )
+
+        deleted: list[int] = []
+        for did in donors_unique:
+            self.delete(did)
+            deleted.append(did)
+
+        self.write_product_txt(keep_id)
+        return {
+            "keep_id": keep_id,
+            "image_count": len(final_paths),
+            "deleted_ids": deleted,
+        }
+
     def write_product_txt(self, product_id: int, folder: pathlib.Path | None = None) -> pathlib.Path | None:
         """Write/refresh ``product.txt`` next to gallery images (folder 열기용)."""
         p = self.get(product_id)

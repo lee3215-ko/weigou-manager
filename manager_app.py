@@ -1608,6 +1608,19 @@ class ManagerApp(tk.Tk):
             padx=10,
         )
         self.btn_exclude.pack(side="left", padx=6)
+        self.btn_merge_images = tk.Button(
+            btn_row,
+            text="이미지 합치기",
+            command=self._on_merge_images,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#0f766e",
+            fg="white",
+            activebackground="#0d9488",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+        )
+        self.btn_merge_images.pack(side="left", padx=6)
         self.btn_unexclude = tk.Button(
             btn_row,
             text="제외 해제",
@@ -2819,6 +2832,7 @@ class ManagerApp(tk.Tk):
         self.btn_save.pack_forget()
         self.btn_publish.pack_forget()
         self.btn_exclude.pack_forget()
+        self.btn_merge_images.pack_forget()
         self.btn_delete.pack_forget()
         self.btn_unexclude.pack_forget()
         self.btn_unpublish.pack_forget()
@@ -2858,11 +2872,12 @@ class ManagerApp(tk.Tk):
             self.btn_save.pack(side="left")
             self.btn_publish.pack(side="left", padx=6)
             self.btn_exclude.pack(side="left", padx=6)
+            self.btn_merge_images.pack(side="left", padx=6)
             self.btn_delete.pack(side="left", padx=6)
             self.listbox.configure(selectmode=tk.EXTENDED)
             self.chk_recommended_only.configure(state="disabled")
             self.chk_searched_only.configure(state="normal")
-            hint = "Ctrl·Shift 클릭으로 여러 개 선택 → 등록/제외"
+            hint = "Ctrl·Shift 클릭으로 여러 개 선택 → 등록/제외/이미지 합치기"
             if self.filter_searched_only.get():
                 hint = "검색완료(제품명 있음)만 표시 중 · " + hint
             self.list_hint.configure(text=hint)
@@ -3678,7 +3693,7 @@ class ManagerApp(tk.Tk):
             return
 
         # Cap preview count; cover first, rest in parallel.
-        urls = list(urls)[:9]
+        urls = list(urls)[:24]
         placeholders: list[tk.Label] = []
         for index, _url in enumerate(urls):
             cell = tk.Frame(self.img_frame, bg="#fffdf9", padx=4, pady=4)
@@ -3776,12 +3791,12 @@ class ManagerApp(tk.Tk):
                 existing = []
         if not existing:
             if urls:
-                self._schedule_url_thumbs(list(urls)[:9], gen)
+                self._schedule_url_thumbs(list(urls)[:24], gen)
                 return
             tk.Label(self.img_frame, text="이미지 없음", bg="#fffdf9", fg="#888").pack(pady=20)
             return
 
-        paths = existing
+        paths = existing[:40]
 
         def load_one(index: int = 0) -> None:
             self._thumb_after = None
@@ -6710,6 +6725,79 @@ class ManagerApp(tk.Tk):
         self._mark_catalog_dirty()
         self.current_excluded_id = None
         self.refresh_list()
+
+    def _on_merge_images(self) -> None:
+        """Merge galleries of 2+ selected products into one folder (keep current)."""
+        if self.list_mode.get() != "products":
+            return
+        ids = self._selected_product_ids()
+        if len(ids) < 2:
+            messagebox.showwarning(
+                "이미지 합치기",
+                "같은 제품의 상품을 2개 이상 선택하세요.\n"
+                "(Ctrl 또는 Shift 클릭으로 다중 선택)",
+            )
+            return
+
+        keep_id = (
+            self.current_id
+            if self.current_id is not None and self.current_id in ids
+            else ids[0]
+        )
+        donors = [i for i in ids if i != keep_id]
+        keep = self.store.get(keep_id)
+        if not keep:
+            messagebox.showwarning("없음", "기준 상품을 찾을 수 없습니다.")
+            return
+
+        def _label(pid: int) -> str:
+            p = self.store.get(pid)
+            if not p:
+                return f"#{pid}"
+            name = (p.google_name or p.title or "").strip() or "(이름 없음)"
+            if len(name) > 40:
+                name = name[:39] + "…"
+            return f"#{pid} {name}"
+
+        donor_lines = "\n".join(f"  · {_label(d)}" for d in donors)
+        if not messagebox.askyesno(
+            "이미지 합치기",
+            f"기준(남길) 상품:\n  {_label(keep_id)}\n\n"
+            f"합친 뒤 삭제할 상품:\n{donor_lines}\n\n"
+            "이미지를 기준 폴더로 합치고,\n"
+            "합친 상품은 목록에서 삭제합니다.\n"
+            "(홈페이지 등록 시 합친 이미지가 모두 올라갑니다)",
+        ):
+            return
+
+        # Persist form edits on keep before merge
+        if self.current_id == keep_id:
+            self._soft_save_current()
+
+        try:
+            result = self.store.merge_product_images(keep_id, donors)
+        except Exception as e:
+            messagebox.showerror("이미지 합치기", f"합치기 실패:\n{e}")
+            return
+
+        n_img = int(result.get("image_count") or 0)
+        deleted = result.get("deleted_ids") or []
+        self._append(
+            f"이미지 합치기 → #{keep_id} ({n_img}장) · 삭제 {', '.join('#'+str(x) for x in deleted)}"
+        )
+        self._mark_catalog_dirty(push_now=True)
+        self.current_id = keep_id
+        self._sticky_selected_ids = [keep_id]
+        yview = self.listbox.yview()
+        self.refresh_list(
+            preserve_yview=(float(yview[0]), float(yview[1])),
+            focus_list=True,
+        )
+        messagebox.showinfo(
+            "이미지 합치기",
+            f"완료 — #{keep_id} 폴더에 이미지 {n_img}장.\n"
+            "홈페이지 등록하면 합친 이미지가 모두 올라갑니다.",
+        )
 
     def _on_delete(self) -> None:
         if self.list_mode.get() != "products":
