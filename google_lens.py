@@ -182,7 +182,7 @@ def _build_ai_prompt(
         lines.append("옷종류와 컬러를 알려줘")
         lines.append("예) 나시,니트,반팔티,긴팔티,가디건")
     else:
-        lines.append("제품명과 컬러를 알려줘")
+        lines.append("정확한 명칭과 공식 컬러명을 알려줘")
     return "\n".join(lines)
 
 
@@ -205,7 +205,7 @@ def _build_multi_ai_prompt(
             f"(예: 나시,니트,반팔티,긴팔티,가디건)"
         ).strip()
     else:
-        base = f"{head}각 제품의 제품명과 컬러를 알려줘".strip()
+        base = f"{head}각 제품의 정확한 명칭과 공식 컬러명을 알려줘".strip()
     if count > 1:
         return f"{base} (이미지 {count}장 순서대로)"
     return base

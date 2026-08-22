@@ -1,10 +1,10 @@
 {
-    "version":  "1.0.36",
-    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.36/WeigouManager.zip",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.36/WeigouManager.zip",
-    "notes":  "컬러 쉼표=선택옵션, 슬래시=투톤 — 등록/재등록 시 주문 컬러선택 가능",
+    "version":  "1.0.37",
+    "url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.37/WeigouManager.zip",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.37/WeigouManager.zip",
+    "notes":  "이미지 검색: 정확한 명칭·공식 컬러명 자동 입력 (제품 정보 개요 형식 지원)",
     "download_urls":  [
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.36/WeigouManager.zip",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.37/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }

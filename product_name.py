@@ -165,10 +165,24 @@ _COLORS = [
     (r"camel|카멜", "카멜", "Camel"),
 ]
 
-# AI Mode labeled answers: **제품명:** … / **컬러:** … / **컬러/소재:** …
+# AI Mode labeled answers: **제품명:** … / **컬러:** … / **공식 컬러명:** …
 # NOTE: never use bare "색" — it false-matches mid-sentence junk
 # Google often answers "컬러/소재:" — allow optional /소재·재료 suffix
-_RE_AI_COLOR_LABEL = r"(?:컬러|색상)(?:\s*/\s*[^\s:*：*]+)?"
+_RE_AI_COLOR_LABEL = r"(?:공식\s*)?(?:컬러|색상)(?:명)?(?:\s*/\s*[^\s:*：*]+)?"
+_RE_AI_NAME_LABEL_INLINE = re.compile(
+    r"(?:정확한\s*)?(?:명칭|제품명|이름)\s*[:：]\s*"
+    r"(?P<name>.+?)"
+    r"(?:\s*[\(（][^)）]*[\)）])?"
+    r"(?=\s*사이즈\s*안내|\s*공식\s*컬러|\s*상품\s*코드|\s*컬러\s*[:：]|\s*색상\s*[:：]"
+    r"|\s*(?:이며|이고)\s*|\s*[.\n]|$)",
+    re.I,
+)
+_RE_AI_OFFICIAL_COLOR_INLINE = re.compile(
+    r"공식\s*컬러(?:명)?\s*[:：]\s*"
+    r"(?P<color>.+?)"
+    r"(?=\s*[\(（]|\s*또는\s*|\s*상품\s*코드|\s*[.\n]|$)",
+    re.I,
+)
 _RE_AI_NAME = re.compile(
     r"(?:^|[\n•·\-\*📌]\s*)(?:\*\*|__)?제품명(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
     re.I | re.M,
@@ -489,12 +503,32 @@ def _extract_parts(raw: str, hint: str = "") -> NameParts:
     )
 
 
+def _strip_ai_name_prefix(text: str) -> str:
+    """Keep only the product name after '정확한 명칭은 …'."""
+    s = (text or "").strip()
+    m = _RE_AI_EXACT_NAME.search(s)
+    if m:
+        got = (m.group("name") or "").strip()
+        if got:
+            return got
+    s = re.sub(
+        r"^(?:사진\s*속\s*)?(?:이\s*)?(?:[가-힣A-Za-z]{1,12}의\s+)?"
+        r"(?:정확한\s*)?(?:명칭|제품명|이름)\s*(?:은|는|[:：])\s*",
+        "",
+        s,
+        flags=re.I,
+    ).strip()
+    s = re.sub(r"\s*(?:입니다|이에요|예요|이다|임)\s*[.!]?\s*$", "", s).strip()
+    return s
+
+
 def _clean_ai_name(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
         return ""
     text = re.sub(r"[*\[\]`#_~]+", "", text)
     text = re.sub(r"\s+", " ", text).strip()
+    text = _strip_ai_name_prefix(text)
     text = re.split(r"\s*[\(（]", text, maxsplit=1)[0].strip()
     text = re.split(r"\s*또는\s*", text, maxsplit=1)[0].strip()
     text = re.split(
@@ -608,6 +642,16 @@ _RE_AI_NARRATIVE_OF = re.compile(
     re.I,
 )
 # 사진 속 제품은 미우미우 로고 런웨이 무테 선글라스(…)이며
+# 사진 속 가방의 정확한 명칭은 알라이아 르 테켈 미디움 백
+_RE_AI_EXACT_NAME = re.compile(
+    r"(?:사진\s*속\s*)?(?:이\s*)?(?:[가-힣A-Za-z]{1,12}의\s+)?"
+    r"(?:정확한\s*)?(?:명칭|제품명|이름)\s*(?:은|는|[:：])\s*"
+    r"(?P<name>.+?)"
+    r"(?:\s*[\(（][^)）]*[\)）])?"
+    r"(?=\s*사이즈\s*안내|\s*공식\s*컬러|\s*상품\s*코드|\s*컬러\s*[:：]|\s*색상\s*[:：]"
+    r"|\s*(?:이며|이고|,|입니다|이에요|예요|이다|임)|\s*[.\n]|$)",
+    re.I,
+)
 _RE_AI_PRODUCT_IS = re.compile(
     rf"(?:사진\s*속\s*)?(?:이\s*)?제품은\s*"
     rf"(?P<name>(?:{_AI_BRANDS_KO})[^.\n]{{0,60}}?{_AI_TYPE_TAIL})"
@@ -635,6 +679,7 @@ _RE_AI_MODEL_CODE = re.compile(
 
 def _finalize_ai_product_name(name: str, blob: str = "") -> str:
     name = re.sub(r"[*\[\]`#_~]+", "", (name or "").strip())
+    name = _strip_ai_name_prefix(name)
     name = re.split(r"\s*[\(（]", name, maxsplit=1)[0].strip()
     name = re.sub(r"\s+", " ", name).strip(" ,，·-–—")
     if not name or len(name) < 4:
@@ -662,6 +707,11 @@ def _finalize_ai_product_name(name: str, blob: str = "") -> str:
 def _extract_narrative_ai_name(blob: str) -> str:
     """Parse Google AI Mode narrative answers into a product name."""
     text = blob or ""
+    m = _RE_AI_EXACT_NAME.search(text)
+    if m:
+        got = _finalize_ai_product_name(m.group("name"), text)
+        if got:
+            return got
     m = _RE_AI_PRODUCT_IS.search(text)
     if m:
         got = _finalize_ai_product_name(m.group("name"), text)
@@ -692,6 +742,8 @@ def extract_ai_labeled_fields(lines: list[str]) -> tuple[str, str]:
     blob = "\n".join(lines or [])
     section = blob
     for marker in (
+        "제품 정보 개요",
+        "제품정보개요",
         "제품 상세 정보",
         "제품상세정보",
         "제품 정보",
@@ -707,8 +759,24 @@ def extract_ai_labeled_fields(lines: list[str]) -> tuple[str, str]:
 
     name = ""
     color = ""
+    # 한 줄로 붙은 「제품 정보 개요」 형식 (정확한 명칭 / 공식 컬러명)
+    m = _RE_AI_NAME_LABEL_INLINE.search(section) or _RE_AI_NAME_LABEL_INLINE.search(blob)
+    if m:
+        cand = _clean_ai_name(m.group("name"))
+        if cand:
+            name = cand
+    m = _RE_AI_OFFICIAL_COLOR_INLINE.search(section) or _RE_AI_OFFICIAL_COLOR_INLINE.search(blob)
+    if m:
+        cand = normalize_ai_color(m.group("color"))
+        if cand:
+            color = cand
+
     color_re = re.compile(
         rf"(?:\*\*|__)?{_RE_AI_COLOR_LABEL}(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
+        re.I,
+    )
+    name_re = re.compile(
+        r"(?:\*\*|__)?(?:정확한\s*)?(?:명칭|제품명|이름)(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
         re.I,
     )
     for ln in section.splitlines():
@@ -716,11 +784,7 @@ def extract_ai_labeled_fields(lines: list[str]) -> tuple[str, str]:
         if not ln:
             continue
         if not name:
-            m = re.search(
-                r"(?:\*\*|__)?제품명(?:\*\*|__)?\s*[:：]\s*\**\s*(.+)$",
-                ln,
-                re.I,
-            )
+            m = name_re.search(ln)
             if m:
                 cand = _clean_ai_name(m.group(1))
                 if cand:

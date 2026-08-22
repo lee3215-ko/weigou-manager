@@ -6247,7 +6247,7 @@ class ManagerApp(tk.Tk):
         ask_bit = (
             "옷종류와 컬러를 알려줘 (예: 나시,니트,반팔티,긴팔티,가디건)"
             if clothing
-            else "제품명과 컬러를 알려줘"
+            else "정확한 명칭과 공식 컬러명을 알려줘"
         )
         self._put_log(
             f"구글 검색({nth_label}): 이미지 복사붙여넣기 → "
@@ -6340,6 +6340,7 @@ class ManagerApp(tk.Tk):
         try:
             if result.product_name:
                 self.google_name_var.set(result.product_name)
+                self.title_var.set(result.product_name)
             if result.name_en:
                 self.name_en_var.set(result.name_en)
             # 검색 컬러는 무조건 반영 (빈 문자열이면 유지)
@@ -6472,7 +6473,7 @@ class ManagerApp(tk.Tk):
         ask_bit = (
             "각 제품의 옷종류와 컬러를 알려줘 (예: 나시,니트,반팔티…)"
             if clothing_all
-            else "각 제품의 제품명과 컬러를 알려줘"
+            else "각 제품의 정확한 명칭과 공식 컬러명을 알려줘"
         )
         self._put_log(
             f"구글 다중 검색({nth}번째 이미지): {len(jobs)}장 붙여넣기 → "
