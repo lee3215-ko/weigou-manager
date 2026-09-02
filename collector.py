@@ -129,6 +129,30 @@ def find_cdp_targets(ports: Iterable[int] = CDP_PORTS) -> list[dict]:
     return targets
 
 
+def open_cdp_tab(url: str, ports: Iterable[int] = CDP_PORTS) -> tuple[bool, str]:
+    """Open URL in a new tab on the CDP debug browser (微购相册)."""
+    from urllib.parse import quote
+
+    raw = (url or "").strip()
+    if not raw:
+        return False, "URL이 비어 있습니다."
+    encoded = quote(raw, safe="")
+    last_err = ""
+    for port in ports:
+        if not _port_open(port):
+            continue
+        api = f"http://127.0.0.1:{port}/json/new?{encoded}"
+        for method in ("PUT", "GET"):
+            try:
+                req = urllib.request.Request(api, method=method)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if 200 <= int(getattr(resp, "status", 200) or 200) < 300:
+                        return True, f"디버그 창에 탭을 열었습니다 (포트 {port})."
+            except Exception as exc:
+                last_err = str(exc)
+    return False, last_err or "CDP 포트에 연결할 수 없습니다."
+
+
 def pick_album_target(targets: list[dict]) -> dict | None:
     scored: list[tuple[int, dict]] = []
     for t in targets:

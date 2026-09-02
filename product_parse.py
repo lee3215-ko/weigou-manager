@@ -19,6 +19,7 @@ class ParsedProduct:
     tags: str = ""
     description: str = ""
     image_urls: list[str] = field(default_factory=list)
+    list_seq: int | None = None
 
 
 _RE_GOODS = re.compile(

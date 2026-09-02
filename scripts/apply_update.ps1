@@ -59,6 +59,26 @@ Get-Process -Name $procName -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Log ("stop leftover pid " + $_.Id)
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
+
+function Stop-ProcessesUnderInstall {
+    param([string]$Root)
+    if (-not $Root) { return }
+    $rootNorm = $Root.TrimEnd('\')
+    try {
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+            $path = [string]$_.ExecutablePath
+            if (-not $path) { return }
+            if ($path.StartsWith($rootNorm, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Write-Log ("stop install-tree pid " + $_.ProcessId + " " + $path)
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Write-Log ("Stop-ProcessesUnderInstall failed: " + $_)
+    }
+}
+
+Stop-ProcessesUnderInstall -Root $Install
 Start-Sleep -Seconds 3
 Write-Log "process wait done"
 
@@ -106,26 +126,27 @@ if (-not (Test-Path -LiteralPath $Exe)) {
 function Start-App {
     param([string]$Target, [string]$Dir)
     Write-Log "starting $Target (cwd=$Dir)"
+    try {
+        $p = Start-Process -FilePath $Target -WorkingDirectory $Dir -PassThru -WindowStyle Normal
+        Write-Log ("Start-Process pid=" + $p.Id)
+        return
+    } catch {
+        Write-Log ("Start-Process failed: " + $_)
+    }
     $vbs = Join-Path $Dir "weigou_relaunch.vbs"
     $line1 = 'Set s=CreateObject("WScript.Shell")'
-    $line2 = 's.CurrentDirectory="' + $Dir + '"'
-    $line3 = 's.Run """' + $Target + '""",1,False'
+    $line2 = 's.CurrentDirectory="' + ($Dir -replace '"', '""') + '"'
+    $line3 = 's.Run """' + ($Target -replace '"', '""') + '""",1,False'
     try {
-        Set-Content -LiteralPath $vbs -Value ($line1 + "`r`n" + $line2 + "`r`n" + $line3 + "`r`n") -Encoding ASCII
+        $vbsBody = $line1 + "`r`n" + $line2 + "`r`n" + $line3 + "`r`n"
+        [System.IO.File]::WriteAllText($vbs, $vbsBody, [System.Text.Encoding]::Unicode)
         $wp = Start-Process -FilePath "wscript.exe" -ArgumentList $vbs -PassThru -WindowStyle Hidden
         Write-Log ("wscript pid=" + $wp.Id)
         return
     } catch {
         Write-Log ("wscript failed: " + $_)
     }
-    try {
-        Start-Process -FilePath $Target -WorkingDirectory $Dir
-        Write-Log "Start-Process ok"
-        return
-    } catch {
-        Write-Log ("Start-Process failed: " + $_)
-    }
-    $arg = '/c start "" /D "' + $Dir + '" "' + $Target + '"'
+    $arg = '/c start "" /D "' + ($Dir -replace '"', '""') + '" "' + ($Target -replace '"', '""') + '"'
     try {
         Start-Process -FilePath "cmd.exe" -ArgumentList $arg
         Write-Log "cmd start issued"
@@ -135,16 +156,16 @@ function Start-App {
 }
 
 Start-App -Target $Exe -Dir $workDir
-Start-Sleep -Seconds 4
+Start-Sleep -Seconds 5
 if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
     Write-Log "process not up - retry Start-Process"
     try { Start-Process -FilePath $Exe -WorkingDirectory $workDir } catch { Write-Log ("retry failed: " + $_) }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 4
 }
 if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
     Write-Log "process not up - retry explorer"
     Start-Process -FilePath "explorer.exe" -ArgumentList $Exe
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 4
 }
 if (Get-Process -Name $procName -ErrorAction SilentlyContinue) {
     Write-Log "update success - app running"

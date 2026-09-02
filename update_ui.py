@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 import threading
 import time
 import urllib.error
@@ -20,6 +19,8 @@ from updater import (
     fetch_version_payload,
     format_network_error,
     get_update_log_path,
+    get_update_temp_dir,
+    prepare_for_update_exit,
     schedule_apply_update,
     validate_zip_file,
     wait_updater_started,
@@ -149,7 +150,7 @@ def _auto_update(
             root.after(0, lambda: status.configure(text="다운로드 중..."))
 
     def worker() -> None:
-        zip_path = Path(tempfile.gettempdir()) / f"{app_name}-{info.version}.zip"
+        zip_path = get_update_temp_dir() / f"{app_name}-{info.version}.zip"
         log_path = get_update_log_path(app_name)
         try:
             log(f"[업데이트] 다운로드 시작: {info.version}")
@@ -210,7 +211,8 @@ def _auto_update(
 
             dialog.destroy()
             # Updater is alive and waiting for this PID — exit hard.
-            time.sleep(0.4)
+            prepare_for_update_exit()
+            time.sleep(0.6)
             os._exit(0)
 
         root.after(0, finish)

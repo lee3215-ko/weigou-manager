@@ -182,6 +182,36 @@ def get_install_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def kill_install_tree_processes(install_dir: Path | None = None) -> None:
+    """Best-effort: stop child processes that lock files under the install folder."""
+    if sys.platform != "win32":
+        return
+    root = install_dir or get_install_dir()
+    root_s = str(root.resolve())
+    try:
+        ps = (
+            "$root = "
+            + json.dumps(root_s)
+            + "; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+            "ForEach-Object { $p = [string]$_.ExecutablePath; "
+            "if ($p -and $p.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) "
+            "{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
+        )
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
+
+
+def prepare_for_update_exit(install_dir: Path | None = None) -> None:
+    """Call right before ``os._exit`` so robocopy can replace locked onedir files."""
+    kill_install_tree_processes(install_dir)
+
+
 def get_update_temp_dir() -> Path:
     """Temp folder both the GUI process and PowerShell can see.
 

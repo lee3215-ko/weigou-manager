@@ -35,6 +35,8 @@ hiddenimports = [
     "manager_app",
     "google_lens",
     "auto_collect",
+    "wecatalog_collect",
+    "wecatalog_browser",
     "collector",
     "launcher",
     "ime_win",

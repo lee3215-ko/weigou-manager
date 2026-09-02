@@ -3,13 +3,16 @@
 
 Rule (examples):
   NO 8888010
-  → digits after 88880 → 10
+  → digits after 8888(0) → 10
   → cost = 10 * 10,000원 = 100,000원
   → sell = cost + 50% margin = 150,000원
 
   NO 8888033.5
   → 33.5만원 = 335,000원 (소수점 = 천원 단위)
   → sell = 502,500원
+
+  NO 888832.5
+  → (0 없이) 32.5만원 — same as 8888032.5
 
   NO 00008
   → digits after the last 0 → 8
@@ -65,12 +68,16 @@ def normalize_sell_price(amount: int) -> int:
 
 
 def normalize_sku(raw: str) -> str:
-    """Keep digits and a single decimal point (8888033.5)."""
+    """Keep digits and a single decimal point (8888033.5 / 888832.5)."""
     s = (raw or "").strip().upper()
     s = re.sub(r"^NO\s*[：:]\s*", "", s)
     s = s.replace(",", "").replace(" ", "")
-    # Prefer explicit 88880… fragment if buried in a longer title
+    # Prefer 8888… price fragment if buried in a longer title
+    # (88880… canonical, or 8888… without the extra 0)
     m = re.search(r"88880\d+(?:\.\d+)?", s)
+    if m:
+        return m.group(0)
+    m = re.search(r"8888\d+(?:\.\d+)?", s)
     if m:
         return m.group(0)
     # Keep one decimal: strip other non-digit except first '.'
@@ -111,10 +118,11 @@ def decode_price_code(raw: str, margin_rate: float = MARGIN_RATE) -> PriceInfo |
       8888010    → 10만원
       8888033    → 33만원
       8888033.5  → 33.5만원 (335,000원)
+      888832.5   → 32.5만원 (0 없는 표기, 8888032.5와 동일)
       88880100   → 100만원
       00008      → 8만원  (leading zeros; digits after last 0)
       000033.5   → 33.5만원
-    Prefers `88880` + manwon. Then `0…0` + manwon. Else last `0` + trailing digits.
+    Prefers `8888` + manwon (optional 0 after 8888). Then `0…0` + manwon.
     """
     code = normalize_sku(raw)
     if not code:
@@ -122,7 +130,8 @@ def decode_price_code(raw: str, margin_rate: float = MARGIN_RATE) -> PriceInfo |
 
     manwon: float | None = None
 
-    m = re.match(r"^88880(\d+(?:\.\d+)?)$", code)
+    # 8888032.5 / 888832.5 / 8888010 → amount after prefix 8888
+    m = re.match(r"^8888(\d+(?:\.\d+)?)$", code)
     if m:
         try:
             manwon = float(m.group(1))
@@ -165,11 +174,15 @@ if __name__ == "__main__":
         "8888010",
         "8888033",
         "8888033.5",
+        "888832.5",
+        "8888032.5",
+        "888832",
         "88880100",
         "00008",
         "000010",
         "000033.5",
         "NO：8888033.5",
+        "NO：888832.5",
         "CHANEL size 14*21*6 NO：8888033.5",
     ):
         info = decode_price_code(sample)

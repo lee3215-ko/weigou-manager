@@ -311,6 +311,13 @@ class CatalogSyncService:
                         self._push_needed = False
                     self._set_status("ok", f"목록 동기화됨 · rev {self._last_remote_rev}")
                     return
+                if prefer_table and not self._cloud_restricted:
+                    # Tables missing — do not fall back to huge Storage JSON.
+                    raise RuntimeError(
+                        "Supabase 테이블 동기화가 아직 준비되지 않았습니다. "
+                        "대시보드 → SQL Editor에서 shoot-repl/supabase/manager_catalog.sql "
+                        "전체 내용을 실행한 뒤 프로그램을 다시 시작하세요."
+                    )
                 if self._cloud_restricted:
                     raise RuntimeError(self._cloud_restricted)
                 self._pull(cfg)

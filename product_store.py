@@ -19,7 +19,7 @@ from product_parse import ParsedProduct
 
 ProgressCb = Callable[[str], None]
 
-CATEGORY_ORDER = ["가방", "신발", "여성옷", "남성옷", "선글라스", "벨트", "악세사리", "기타"]
+CATEGORY_ORDER = ["가방", "신발", "여성옷", "남성옷", "선글라스", "벨트", "시계", "악세사리", "기타"]
 
 
 def search_code_sort_num(code: str) -> int:
@@ -33,37 +33,12 @@ def search_code_sort_num(code: str) -> int:
     return int(m.group(1)) if m else 10**18
 
 
-# Shared across A/B: local SQLite id differs per machine, so never ORDER BY id for UI lists.
-_PRODUCT_ORDER_SQL = (
-    " ORDER BY "
-    "CASE WHEN trim(COALESCE(search_code,'')) = '' THEN 1 ELSE 0 END, "
-    "CASE WHEN search_code GLOB '[0-9]*' AND search_code NOT GLOB '*[^0-9]*' "
-    "THEN CAST(search_code AS INTEGER) ELSE 1000000000000000000 END, "
-    "lower(COALESCE(search_code,'')), "
-    "lower(COALESCE(goods_id,'')), "
-    "created_at DESC"
-)
+# 상품 이미지 폴더명이 products.id이므로 목록도 폴더 번호 순서로 고정한다.
+_PRODUCT_ORDER_SQL = " ORDER BY id ASC"
 
-_EXCLUDED_ORDER_SQL = (
-    " ORDER BY "
-    "CASE WHEN trim(COALESCE(search_code,'')) = '' THEN 1 ELSE 0 END, "
-    "CASE WHEN search_code GLOB '[0-9]*' AND search_code NOT GLOB '*[^0-9]*' "
-    "THEN CAST(search_code AS INTEGER) ELSE 1000000000000000000 END, "
-    "lower(COALESCE(search_code,'')), "
-    "lower(COALESCE(goods_id,'')), "
-    "created_at DESC"
-)
+_EXCLUDED_ORDER_SQL = " ORDER BY id ASC"
 
-_PUBLISHED_ORDER_SQL = (
-    " ORDER BY "
-    "CASE WHEN trim(COALESCE(search_code,'')) = '' THEN 1 ELSE 0 END, "
-    "CASE WHEN search_code GLOB '[0-9]*' AND search_code NOT GLOB '*[^0-9]*' "
-    "THEN CAST(search_code AS INTEGER) ELSE 1000000000000000000 END, "
-    "lower(COALESCE(search_code,'')), "
-    "lower(COALESCE(goods_id,'')), "
-    "lower(COALESCE(mall_id,'')), "
-    "created_at DESC"
-)
+_PUBLISHED_ORDER_SQL = " ORDER BY id ASC"
 
 
 def _prefer_text(remote: str | None, local: str | None) -> str:
@@ -153,18 +128,48 @@ class PublishedItem:
     image_urls: list[str] = field(default_factory=list)
 
 
+@dataclass
+class UnpublishedItem:
+    """Homepage-removed archive (등록목록에서 제거) — not restored to 상품관리."""
+
+    id: int
+    goods_id: str
+    shop_id: str
+    search_code: str
+    sku_no: str
+    title: str
+    tags: str
+    category: str
+    cover_path: str
+    note: str
+    mall_id: str
+    created_at: str
+    removed_at: str = ""
+    updated_at: str = ""
+    google_name: str = ""
+    name_en: str = ""
+    colors: str = ""
+    sizes: str = ""
+    description: str = ""
+    image_paths: list[str] = field(default_factory=list)
+    image_urls: list[str] = field(default_factory=list)
+    source_published_id: int = 0
+
+
 class ProductStore:
     def __init__(self, root: pathlib.Path | None = None) -> None:
         self.root = root or default_root()
         self.img_root = self.root / "images"
         self.excluded_img_root = self.root / "excluded_covers"
         self.published_img_root = self.root / "published_covers"
+        self.unpublished_img_root = self.root / "unpublished_covers"
         self.db_path = self.root / "catalog.db"
         self._db_lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.img_root.mkdir(parents=True, exist_ok=True)
         self.excluded_img_root.mkdir(parents=True, exist_ok=True)
         self.published_img_root.mkdir(parents=True, exist_ok=True)
+        self.unpublished_img_root.mkdir(parents=True, exist_ok=True)
         self._init_db()
         # Heal leftovers from older builds that archived without tombstones.
         try:
@@ -244,10 +249,44 @@ class ProductStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_published_goods ON published(goods_id);
                 CREATE INDEX IF NOT EXISTS idx_published_search ON published(search_code);
+                CREATE TABLE IF NOT EXISTS unpublished (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goods_id TEXT NOT NULL DEFAULT '',
+                    shop_id TEXT NOT NULL DEFAULT '',
+                    search_code TEXT NOT NULL DEFAULT '',
+                    sku_no TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT '',
+                    cover_path TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    mall_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    removed_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    google_name TEXT NOT NULL DEFAULT '',
+                    name_en TEXT NOT NULL DEFAULT '',
+                    colors TEXT NOT NULL DEFAULT '',
+                    sizes TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    image_paths TEXT NOT NULL DEFAULT '[]',
+                    image_urls TEXT NOT NULL DEFAULT '[]',
+                    source_published_id INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_unpublished_goods ON unpublished(goods_id);
+                CREATE INDEX IF NOT EXISTS idx_unpublished_search ON unpublished(search_code);
+                CREATE INDEX IF NOT EXISTS idx_unpublished_removed ON unpublished(removed_at);
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS publish_failures (
+                    product_id INTEGER PRIMARY KEY,
+                    error TEXT NOT NULL DEFAULT '',
+                    failed_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_publish_failures_at
+                    ON publish_failures(failed_at);
                 CREATE TABLE IF NOT EXISTS sync_tombstones (
                     kind TEXT NOT NULL,
                     sync_key TEXT NOT NULL,
@@ -264,6 +303,7 @@ class ProductStore:
                     ("image_urls", "TEXT NOT NULL DEFAULT '[]'"),
                     ("colors", "TEXT NOT NULL DEFAULT ''"),
                     ("sizes", "TEXT NOT NULL DEFAULT ''"),
+                    ("list_seq", "INTEGER"),
                 ]
                 for name, decl in migrations:
                     if name not in cols:
@@ -307,7 +347,7 @@ class ProductStore:
                     "CREATE INDEX IF NOT EXISTS idx_published_updated ON published(updated_at)"
                 )
                 # 상의/하의/자켓 → 여성옷 (성별 미상 기존 의류)
-                for table in ("products", "excluded", "published"):
+                for table in ("products", "excluded", "published", "unpublished"):
                     con.execute(
                         f"UPDATE {table} SET category='여성옷' "
                         "WHERE category IN ('상의','하의','자켓')"
@@ -346,12 +386,17 @@ class ProductStore:
         )
 
     def _list_products_sql(
-        self, query: str, category: str, *, searched_only: bool = False
-    ) -> tuple[str, list[str]]:
+        self,
+        query: str,
+        category: str,
+        *,
+        searched_only: bool = False,
+        exclude_ids: list[int] | set[int] | None = None,
+    ) -> tuple[str, list]:
         q = (query or "").strip()
         cat = (category or "").strip()
         sql = " WHERE 1=1"
-        args: list[str] = []
+        args: list = []
         if q:
             like = f"%{q}%"
             sql += (
@@ -365,6 +410,11 @@ class ProductStore:
             args.append(cat)
         if searched_only:
             sql += " AND trim(COALESCE(google_name,'')) != ''"
+        ex = [int(i) for i in (exclude_ids or []) if int(i) > 0]
+        if ex:
+            qmarks = ",".join("?" for _ in ex)
+            sql += f" AND id NOT IN ({qmarks})"
+            args.extend(ex)
         return sql, args
 
     def list_products(
@@ -375,14 +425,14 @@ class ProductStore:
         limit: int | None = None,
         offset: int = 0,
         searched_only: bool = False,
+        exclude_ids: list[int] | set[int] | None = None,
     ) -> list[Product]:
-        """List products matching query/category.
-
-        Order is stable across machines (A/B): search_code numeric, then
-        search_code/goods_id/created_at — never local ``id`` (those differ per PC).
-        """
+        """List products matching query/category in image-folder number order."""
         where_sql, args = self._list_products_sql(
-            query, category, searched_only=searched_only
+            query,
+            category,
+            searched_only=searched_only,
+            exclude_ids=exclude_ids,
         )
         sql = "SELECT * FROM products" + where_sql + _PRODUCT_ORDER_SQL
         if limit is not None:
@@ -395,23 +445,23 @@ class ProductStore:
         if limit is not None:
             return products
 
-        # Full export: same key as SQL (covers non-pure-digit codes like "12A")
-        def sort_key(p: Product) -> tuple:
-            return (
-                search_code_sort_num(p.search_code),
-                (p.search_code or "").lower(),
-                (p.goods_id or "").lower(),
-                p.created_at or "",
-            )
-
-        products.sort(key=sort_key)
+        # Keep unpaged callers consistent with the paged SQL query.
+        products.sort(key=lambda p: p.id)
         return products
 
     def count_products(
-        self, query: str = "", category: str = "", *, searched_only: bool = False
+        self,
+        query: str = "",
+        category: str = "",
+        *,
+        searched_only: bool = False,
+        exclude_ids: list[int] | set[int] | None = None,
     ) -> int:
         where_sql, args = self._list_products_sql(
-            query, category, searched_only=searched_only
+            query,
+            category,
+            searched_only=searched_only,
+            exclude_ids=exclude_ids,
         )
         with self._connect() as con:
             row = con.execute(
@@ -539,10 +589,157 @@ class ProductStore:
             shutil.rmtree(folder, ignore_errors=True)
         with self._connect() as con:
             con.execute("DELETE FROM products WHERE id=?", (product_id,))
+            con.execute("DELETE FROM publish_failures WHERE product_id=?", (product_id,))
         for key in self._product_sync_keys(
             goods_id=p.goods_id, search_code=p.search_code, fallback_id=product_id
         ):
             self.record_tombstone("product", key)
+
+    def record_publish_failure(self, product_id: int, error: str = "") -> None:
+        """Remember a homepage-publish failure so it can be retried from the 실패 tab."""
+        pid = int(product_id)
+        if pid <= 0 or not self.get(pid):
+            return
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        err = (error or "").strip()
+        if len(err) > 800:
+            err = err[:800] + "…"
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO publish_failures (product_id, error, failed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(product_id) DO UPDATE SET
+                    error=excluded.error,
+                    failed_at=excluded.failed_at
+                """,
+                (pid, err, now),
+            )
+
+    def clear_publish_failure(self, product_id: int) -> None:
+        with self._connect() as con:
+            con.execute(
+                "DELETE FROM publish_failures WHERE product_id=?", (int(product_id),)
+            )
+
+    def clear_publish_failures(self, product_ids: list[int]) -> int:
+        ids = [int(i) for i in product_ids if int(i) > 0]
+        if not ids:
+            return 0
+        with self._connect() as con:
+            # Drop rows whose product already disappeared
+            con.execute(
+                """
+                DELETE FROM publish_failures
+                WHERE product_id NOT IN (SELECT id FROM products)
+                """
+            )
+            qmarks = ",".join("?" for _ in ids)
+            cur = con.execute(
+                f"DELETE FROM publish_failures WHERE product_id IN ({qmarks})",
+                ids,
+            )
+            return int(cur.rowcount or 0)
+
+    def get_publish_failure_error(self, product_id: int) -> str:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT error FROM publish_failures WHERE product_id=?",
+                (int(product_id),),
+            ).fetchone()
+        return (row["error"] if row else "") or ""
+
+    def publish_failure_errors(self, product_ids: list[int] | None = None) -> dict[int, str]:
+        with self._connect() as con:
+            if product_ids is None:
+                rows = con.execute(
+                    "SELECT product_id, error FROM publish_failures"
+                ).fetchall()
+            else:
+                ids = [int(i) for i in product_ids if int(i) > 0]
+                if not ids:
+                    return {}
+                qmarks = ",".join("?" for _ in ids)
+                rows = con.execute(
+                    f"SELECT product_id, error FROM publish_failures "
+                    f"WHERE product_id IN ({qmarks})",
+                    ids,
+                ).fetchall()
+        return {int(r["product_id"]): (r["error"] or "") for r in rows}
+
+    def _list_publish_fail_sql(
+        self,
+        query: str,
+        category: str,
+        *,
+        exclude_ids: list[int] | set[int] | None = None,
+    ) -> tuple[str, list]:
+        q = (query or "").strip()
+        cat = (category or "").strip()
+        sql = (
+            " FROM products p"
+            " INNER JOIN publish_failures f ON f.product_id = p.id"
+            " WHERE 1=1"
+        )
+        args: list = []
+        if cat:
+            sql += " AND p.category = ?"
+            args.append(cat)
+        if q:
+            like = f"%{q}%"
+            sql += (
+                " AND (p.title LIKE ? OR p.search_code LIKE ? OR p.sku_no LIKE ?"
+                " OR p.tags LIKE ? OR p.google_name LIKE ? OR p.name_en LIKE ?"
+                " OR f.error LIKE ?)"
+            )
+            args.extend([like, like, like, like, like, like, like])
+        ex = [int(i) for i in (exclude_ids or []) if int(i) > 0]
+        if ex:
+            qmarks = ",".join("?" for _ in ex)
+            sql += f" AND p.id NOT IN ({qmarks})"
+            args.extend(ex)
+        return sql, args
+
+    def count_publish_failures(
+        self,
+        query: str = "",
+        category: str = "",
+        *,
+        exclude_ids: list[int] | set[int] | None = None,
+    ) -> int:
+        body, args = self._list_publish_fail_sql(
+            query, category, exclude_ids=exclude_ids
+        )
+        with self._connect() as con:
+            # Prune orphans
+            con.execute(
+                """
+                DELETE FROM publish_failures
+                WHERE product_id NOT IN (SELECT id FROM products)
+                """
+            )
+            row = con.execute("SELECT COUNT(*) AS c" + body, args).fetchone()
+        return int(row["c"] if row else 0)
+
+    def list_publish_failures(
+        self,
+        query: str = "",
+        category: str = "",
+        *,
+        limit: int = 0,
+        offset: int = 0,
+        exclude_ids: list[int] | set[int] | None = None,
+    ) -> list[Product]:
+        body, args = self._list_publish_fail_sql(
+            query, category, exclude_ids=exclude_ids
+        )
+        sql = "SELECT p.*" + body + " ORDER BY f.failed_at DESC, p.id DESC"
+        if limit and limit > 0:
+            sql += " LIMIT ? OFFSET ?"
+            args = list(args) + [int(limit), max(0, int(offset))]
+        with self._connect() as con:
+            rows = con.execute(sql, args).fetchall()
+        return [self._row_to_product(r) for r in rows]
 
     def purge_products_already_published(self) -> int:
         """Remove catalog rows that already exist in published (same goods_id/search_code)."""
@@ -731,6 +928,26 @@ class ProductStore:
                 "SELECT goods_id FROM products WHERE trim(COALESCE(goods_id,'')) != ''"
             ).fetchall()
         return {str(r["goods_id"]) for r in rows}
+
+    def catalog_image_urls(self) -> list[str]:
+        """Remote image URLs from products + published (목록 이미지 스킵용)."""
+        out: list[str] = []
+        with self._connect() as con:
+            for table in ("products", "published"):
+                try:
+                    rows = con.execute(
+                        f"SELECT image_urls FROM {table} WHERE trim(COALESCE(image_urls,'')) NOT IN ('', '[]')"
+                    ).fetchall()
+                except Exception:
+                    continue
+                for r in rows:
+                    try:
+                        urls = json.loads(r["image_urls"] or "[]")
+                    except Exception:
+                        urls = []
+                    if isinstance(urls, list):
+                        out.extend(str(u) for u in urls if u)
+        return out
 
     def excluded_search_codes(self) -> set[str]:
         with self._connect() as con:
@@ -1257,6 +1474,7 @@ class ProductStore:
             )
             # Remove catalog row only (images already moved)
             con.execute("DELETE FROM products WHERE id=?", (product_id,))
+            con.execute("DELETE FROM publish_failures WHERE product_id=?", (product_id,))
         # Tell other devices to drop this catalog row (archive used to skip this).
         for key in self._product_sync_keys(
             goods_id=p.goods_id, search_code=p.search_code, fallback_id=product_id
@@ -1271,7 +1489,7 @@ class ProductStore:
         return pid
 
     def unpublish(self, published_id: int) -> int | None:
-        """Remove from published list and restore into product management catalog."""
+        """Remove from published list into unpublished archive (not 상품관리)."""
         item = self.get_published(published_id)
         if not item:
             return None
@@ -1279,34 +1497,39 @@ class ProductStore:
         with self._connect() as con:
             cur = con.execute(
                 """
-                INSERT INTO products
-                (goods_id, shop_id, title, search_code, sku_no, tags, description,
-                 cover_path, image_paths, image_urls, category, google_name, name_en,
-                 colors, sizes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, '', '[]', ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO unpublished
+                (goods_id, shop_id, search_code, sku_no, title, tags, category,
+                 cover_path, note, mall_id, created_at, removed_at, updated_at,
+                 google_name, name_en, colors, sizes, description,
+                 image_paths, image_urls, source_published_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)
                 """,
                 (
                     item.goods_id,
                     item.shop_id,
-                    item.title,
                     item.search_code,
                     item.sku_no,
+                    item.title,
                     item.tags,
-                    item.description,
-                    json.dumps(item.image_urls, ensure_ascii=False),
                     item.category,
+                    item.note,
+                    item.mall_id,
+                    item.created_at or now,
+                    now,
+                    now,
                     item.google_name,
                     item.name_en,
                     item.colors,
                     item.sizes,
-                    now,
-                    now,
+                    item.description,
+                    json.dumps(item.image_urls, ensure_ascii=False),
+                    int(published_id),
                 ),
             )
             new_id = int(cur.lastrowid)
 
         pack = self.published_img_root / f"p{published_id}"
-        dest_folder = self.img_root / str(new_id)
+        dest_folder = self.unpublished_img_root / f"u{new_id}"
         new_paths: list[str] = []
         cover_keep = ""
         try:
@@ -1343,7 +1566,7 @@ class ProductStore:
         with self._connect() as con:
             con.execute(
                 """
-                UPDATE products SET cover_path=?, image_paths=? WHERE id=?
+                UPDATE unpublished SET cover_path=?, image_paths=? WHERE id=?
                 """,
                 (
                     cover_keep,
@@ -1360,13 +1583,7 @@ class ProductStore:
             self.record_tombstone("published", key)
         if item.mall_id:
             self.record_tombstone("published", item.mall_id)
-        # Restored into catalog — allow product sync again.
-        if item.goods_id:
-            self.clear_tombstone("product", item.goods_id)
-        if item.search_code:
-            self.clear_tombstone("product", item.search_code)
 
-        # leftover single cover file (legacy archives)
         if item.cover_path:
             try:
                 p = pathlib.Path(item.cover_path)
@@ -1375,6 +1592,260 @@ class ProductStore:
             except OSError:
                 pass
         return new_id
+
+    def _row_to_unpublished(self, row: sqlite3.Row) -> UnpublishedItem:
+        keys = row.keys()
+
+        def jlist(key: str) -> list[str]:
+            try:
+                if key not in keys:
+                    return []
+                return list(json.loads(row[key] or "[]"))
+            except (json.JSONDecodeError, TypeError):
+                return []
+
+        return UnpublishedItem(
+            id=int(row["id"]),
+            goods_id=row["goods_id"] or "",
+            shop_id=row["shop_id"] or "",
+            search_code=row["search_code"] or "",
+            sku_no=row["sku_no"] or "",
+            title=row["title"] or "",
+            tags=row["tags"] or "",
+            category=row["category"] or "",
+            cover_path=row["cover_path"] or "",
+            note=row["note"] or "",
+            mall_id=(row["mall_id"] if "mall_id" in keys else "") or "",
+            created_at=row["created_at"] or "",
+            removed_at=(row["removed_at"] if "removed_at" in keys else "") or "",
+            updated_at=(row["updated_at"] if "updated_at" in keys else "") or "",
+            google_name=(row["google_name"] if "google_name" in keys else "") or "",
+            name_en=(row["name_en"] if "name_en" in keys else "") or "",
+            colors=(row["colors"] if "colors" in keys else "") or "",
+            sizes=(row["sizes"] if "sizes" in keys else "") or "",
+            description=(row["description"] if "description" in keys else "") or "",
+            image_paths=jlist("image_paths"),
+            image_urls=jlist("image_urls"),
+            source_published_id=int(row["source_published_id"] or 0)
+            if "source_published_id" in keys
+            else 0,
+        )
+
+    def _list_unpublished_sql(self, query: str, category: str) -> tuple[str, list[object]]:
+        q = (query or "").strip()
+        cat = (category or "").strip()
+        sql = " WHERE 1=1"
+        args: list[object] = []
+        if q:
+            like = f"%{q}%"
+            sql += (
+                " AND (title LIKE ? OR search_code LIKE ? OR sku_no LIKE ?"
+                " OR tags LIKE ? OR goods_id LIKE ? OR category LIKE ?"
+                " OR mall_id LIKE ? OR note LIKE ? OR google_name LIKE ?"
+                " OR name_en LIKE ? OR colors LIKE ?)"
+            )
+            args.extend(
+                [like, like, like, like, like, like, like, like, like, like, like]
+            )
+        if cat and cat != "전체":
+            sql += " AND category = ?"
+            args.append(cat)
+        return sql, args
+
+    def list_unpublished(
+        self,
+        query: str = "",
+        category: str = "",
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[UnpublishedItem]:
+        where_sql, args = self._list_unpublished_sql(query, category)
+        sql = (
+            "SELECT * FROM unpublished"
+            + where_sql
+            + " ORDER BY removed_at DESC, id DESC"
+        )
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args = [*args, int(limit), int(offset)]
+        with self._connect() as con:
+            rows = con.execute(sql, args).fetchall()
+        return [self._row_to_unpublished(r) for r in rows]
+
+    def count_unpublished(self, query: str = "", category: str = "") -> int:
+        where_sql, args = self._list_unpublished_sql(query, category)
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM unpublished" + where_sql, args
+            ).fetchone()
+        return int(row["c"] if row else 0)
+
+    def get_unpublished(self, unpublished_id: int) -> UnpublishedItem | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM unpublished WHERE id=?", (int(unpublished_id),)
+            ).fetchone()
+        return self._row_to_unpublished(row) if row else None
+
+    def delete_unpublished(self, unpublished_id: int) -> bool:
+        """Permanently delete an archived (homepage-removed) item."""
+        item = self.get_unpublished(unpublished_id)
+        if not item:
+            return False
+        pack = self.unpublished_img_root / f"u{unpublished_id}"
+        try:
+            if pack.exists():
+                shutil.rmtree(pack, ignore_errors=True)
+        except OSError:
+            pass
+        if item.cover_path:
+            try:
+                pathlib.Path(item.cover_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        with self._connect() as con:
+            con.execute("DELETE FROM unpublished WHERE id=?", (int(unpublished_id),))
+        for key in self._product_sync_keys(
+            goods_id=item.goods_id,
+            search_code=item.search_code,
+            fallback_id=unpublished_id,
+        ):
+            self.record_tombstone("unpublished", key)
+        if item.mall_id:
+            self.record_tombstone("unpublished", item.mall_id)
+        return True
+
+    def unpublished_to_product(self, item: UnpublishedItem) -> Product:
+        """Build a transient Product for re-publishing from the archive."""
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        return Product(
+            id=0,
+            goods_id=item.goods_id,
+            shop_id=item.shop_id,
+            title=item.title,
+            search_code=item.search_code,
+            sku_no=item.sku_no,
+            tags=item.tags,
+            description=item.description,
+            cover_path=item.cover_path,
+            image_paths=list(item.image_paths or []),
+            created_at=item.created_at or now,
+            updated_at=item.updated_at or now,
+            category=item.category,
+            google_name=item.google_name,
+            name_en=item.name_en,
+            image_urls=list(item.image_urls or []),
+            colors=item.colors,
+            sizes=item.sizes,
+        )
+
+    def ensure_unpublished_images(self, unpublished_id: int) -> list[str]:
+        item = self.get_unpublished(unpublished_id)
+        if not item:
+            return []
+        pack = self.unpublished_img_root / f"u{unpublished_id}"
+        if pack.is_dir():
+            files = sorted(
+                [f for f in pack.iterdir() if f.is_file()],
+                key=lambda f: f.name,
+            )
+            paths = [str(f) for f in files]
+            if paths:
+                cover = item.cover_path if item.cover_path in paths else paths[0]
+                with self._connect() as con:
+                    con.execute(
+                        "UPDATE unpublished SET cover_path=?, image_paths=? WHERE id=?",
+                        (cover, json.dumps(paths, ensure_ascii=False), unpublished_id),
+                    )
+                return paths
+        existing = [p for p in (item.image_paths or []) if p and pathlib.Path(p).is_file()]
+        if existing:
+            return existing
+        if item.cover_path and pathlib.Path(item.cover_path).is_file():
+            return [item.cover_path]
+        return []
+
+    def restore_unpublished_to_published(
+        self, unpublished_id: int, *, mall_id: str = ""
+    ) -> int | None:
+        """Move archive row back into 등록 목록 after homepage re-publish."""
+        item = self.get_unpublished(unpublished_id)
+        if not item:
+            return None
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        mid = (mall_id or item.mall_id or "").strip()
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                INSERT INTO published
+                (goods_id, shop_id, search_code, sku_no, title, tags, category,
+                 cover_path, note, mall_id, created_at, updated_at,
+                 google_name, name_en, colors, sizes, description,
+                 image_paths, image_urls, recommended)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, 0)
+                """,
+                (
+                    item.goods_id,
+                    item.shop_id,
+                    item.search_code,
+                    item.sku_no,
+                    item.title,
+                    item.tags,
+                    item.category,
+                    item.note or "",
+                    mid,
+                    item.created_at or now,
+                    now,
+                    item.google_name,
+                    item.name_en,
+                    item.colors,
+                    item.sizes,
+                    item.description,
+                    json.dumps(item.image_urls, ensure_ascii=False),
+                ),
+            )
+            pub_id = int(cur.lastrowid)
+
+        src_pack = self.unpublished_img_root / f"u{unpublished_id}"
+        dest_pack = self.published_img_root / f"p{pub_id}"
+        new_paths: list[str] = []
+        cover_keep = ""
+        try:
+            if src_pack.exists():
+                if dest_pack.exists():
+                    shutil.rmtree(dest_pack, ignore_errors=True)
+                shutil.move(str(src_pack), str(dest_pack))
+            if dest_pack.exists():
+                files = sorted(
+                    [f for f in dest_pack.iterdir() if f.is_file()],
+                    key=lambda f: f.name,
+                )
+                new_paths = [str(f) for f in files]
+                if item.cover_path:
+                    cname = pathlib.Path(item.cover_path).name
+                    for f in files:
+                        if f.name == cname:
+                            cover_keep = str(f)
+                            break
+                if not cover_keep and new_paths:
+                    cover_keep = new_paths[0]
+        except OSError:
+            pass
+
+        with self._connect() as con:
+            con.execute(
+                "UPDATE published SET cover_path=?, image_paths=?, mall_id=? WHERE id=?",
+                (cover_keep, json.dumps(new_paths, ensure_ascii=False), mid, pub_id),
+            )
+            con.execute("DELETE FROM unpublished WHERE id=?", (int(unpublished_id),))
+        if item.goods_id:
+            self.clear_tombstone("published", item.goods_id)
+        if item.search_code:
+            self.clear_tombstone("published", item.search_code)
+        if mid:
+            self.clear_tombstone("published", mid)
+        return pub_id
 
     def update_description(
         self,
@@ -1595,14 +2066,15 @@ class ProductStore:
             sizes0 = ""
 
         if existing_id is None:
+            list_seq = getattr(parsed, "list_seq", None)
             with self._connect() as con:
                 cur = con.execute(
                     """
                     INSERT INTO products
                     (goods_id, shop_id, title, search_code, sku_no, tags, description,
                      cover_path, image_paths, image_urls, category, google_name,
-                     colors, sizes, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '', '[]', ?, ?, '', ?, ?, ?, ?)
+                     colors, sizes, list_seq, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, '', '[]', ?, ?, '', ?, ?, ?, ?, ?)
                     """,
                     (
                         parsed.goods_id,
@@ -1616,6 +2088,7 @@ class ProductStore:
                         cat,
                         colors0,
                         sizes0,
+                        list_seq,
                         now,
                         now,
                     ),
@@ -1623,12 +2096,14 @@ class ProductStore:
                 product_id = int(cur.lastrowid)
         else:
             product_id = existing_id
+            list_seq = getattr(parsed, "list_seq", None)
             with self._connect() as con:
                 con.execute(
                     """
                     UPDATE products SET
                         shop_id=?, title=?, search_code=?, sku_no=?, tags=?, description=?,
                         image_urls=?,
+                        list_seq=COALESCE(?, list_seq),
                         category=COALESCE(NULLIF(category,''), ?),
                         colors=CASE WHEN trim(COALESCE(colors,''))='' THEN ? ELSE colors END,
                         sizes=CASE WHEN trim(COALESCE(sizes,''))='' THEN ? ELSE sizes END,
@@ -1643,6 +2118,7 @@ class ProductStore:
                         parsed.tags,
                         parsed.description,
                         json.dumps(parsed.image_urls, ensure_ascii=False),
+                        list_seq,
                         cat,
                         colors0,
                         sizes0,

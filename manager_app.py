@@ -10,27 +10,63 @@ import os
 import pathlib
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
 import urllib.request
 import webbrowser
 import zipfile
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 # 로그 관리 탭 채널
-LOG_COLLECT = "collect"  # 수집·가져오기·디버그
+# 수집 탭은 UI에서 좌(微购)·우(wecatalog)로 분리 표시
+LOG_COLLECT_WEIGOU = "collect_weigou"
+LOG_COLLECT_WECATALOG = "collect_wecatalog"
 LOG_MALL = "mall"  # 홈페이지등록·추천·AI코디
 LOG_SEARCH = "search"  # 이미지검색
-LOG_CHANNELS = (LOG_COLLECT, LOG_MALL, LOG_SEARCH)
+LOG_OTHER = "other"  # 동기화·업데이트·폴더재확인 등
+LOG_COLLECT_CHANNELS = (LOG_COLLECT_WEIGOU, LOG_COLLECT_WECATALOG)
+LOG_CHANNELS = (
+    LOG_COLLECT_WEIGOU,
+    LOG_COLLECT_WECATALOG,
+    LOG_MALL,
+    LOG_SEARCH,
+    LOG_OTHER,
+)
 LOG_CHANNEL_LABELS = {
-    LOG_COLLECT: "1. 수집",
-    LOG_MALL: "2. 홈페이지/추천/AI코디",
-    LOG_SEARCH: "3. 이미지검색",
+    LOG_COLLECT_WEIGOU: "微购 자동수집",
+    LOG_COLLECT_WECATALOG: "wecatalog 수집",
+    LOG_MALL: "홈페이지/추천/AI코디",
+    LOG_SEARCH: "이미지검색",
+    LOG_OTHER: "기타",
 }
+# 노트북 탭 (수집=1탭·좌우 분할)
+LOG_NB_TABS: tuple[tuple[str, ...], ...] = (
+    LOG_COLLECT_CHANNELS,
+    (LOG_MALL,),
+    (LOG_SEARCH,),
+    (LOG_OTHER,),
+)
+LOG_NB_TAB_LABELS = (
+    "1. 수집",
+    "2. 홈페이지/추천/AI코디",
+    "3. 이미지검색",
+    "4. 기타",
+)
 
 from app_role import get_app_role, is_manager_role, role_label
 from auto_collect import walk_list_details
+from wecatalog_browser import is_wecatalog_cdp_up, start_wecatalog_chrome
+from wecatalog_collect import (
+    audit_wecatalog_list,
+    build_wecatalog_audit_db,
+    collect_wecatalog,
+    format_wecatalog_error,
+    open_wecatalog_in_debug,
+    preview_wecatalog_screen,
+    wecatalog_fail_setting_key,
+)
 from catalog_sync import (
     CatalogSyncService,
     ensure_sync_defaults,
@@ -39,6 +75,7 @@ from catalog_sync import (
 )
 from collector import collect_page_best, is_cdp_up
 from google_lens import close_ai_browsers, search_product_images, search_products_multi
+from local_image_match import find_local_matches
 from launcher import DEFAULT_PORT, is_running, start_debug
 from ime_win import (
     commit_composition,
@@ -68,9 +105,12 @@ from mall_cloud import (
 from mall_publish import (
     _api_failed,
     delete_mall_products,
+    normalize_recommend_slots,
     preview_price,
     publish_product,
     push_published_metadata,
+    RECOMMEND_SLOT_IDS,
+    RECOMMEND_SLOT_LABELS,
     recommend_slot_label,
     recommend_slots_for_category,
     reconcile_published_to_homepage,
@@ -106,6 +146,7 @@ from product_store import (
     Product,
     ProductStore,
     PublishedItem,
+    UnpublishedItem,
     default_root,
 )
 from style_publish import publish_style_look
@@ -184,6 +225,148 @@ class EntryField:
         self._entry.insert(0, self._value)
 
 
+class WrapButtonBar(tk.Frame):
+    """Button strip that wraps to the next line when the parent is too narrow.
+
+    Uses place() + explicit height so wrapping does not fight pack geometry
+    or re-enter Configure in a loop.
+    """
+
+    def __init__(self, parent: tk.Misc, *, bg: str = "#f3efe8", gap: int = 6) -> None:
+        super().__init__(parent, bg=bg)
+        self._bg = bg
+        self._gap = gap
+        self._items: list[tk.Widget] = []
+        self._reflow_after: str | None = None
+        self._last_width = -1
+        self._laying_out = False
+        self._btn_sizes: dict[int, tuple[int, int]] = {}
+        # Height is managed by us; width still fills parent via pack(fill="x")
+        self.pack_propagate(False)
+        self.configure(height=36)
+        # Configure 바인딩 없음 — 창 이동마다 reflow 되면 렉. set_visible 때만 배치.
+
+    def set_visible(self, widgets: list[tk.Widget]) -> None:
+        """Show only these buttons (in order), wrapped to available width."""
+        seen: set[int] = set()
+        ordered: list[tk.Widget] = []
+        for w in widgets:
+            if w is None:
+                continue
+            wid = id(w)
+            if wid in seen:
+                continue
+            seen.add(wid)
+            ordered.append(w)
+        self._items = ordered
+
+        # Hide every direct child button (including ones not in this mode)
+        for child in self.winfo_children():
+            try:
+                child.place_forget()
+            except Exception:
+                pass
+            try:
+                child.pack_forget()
+            except Exception:
+                pass
+            try:
+                child.grid_forget()
+            except Exception:
+                pass
+
+        # Force reflow even if width unchanged (mode switch)
+        self._last_width = -1
+        self._btn_sizes.clear()
+        self._schedule_reflow()
+
+    def _on_configure(self, event: tk.Event) -> None:
+        if event.widget is not self or self._laying_out:
+            return
+        # Only react to meaningful width changes — ignore height / move jitter
+        if abs(int(event.width) - self._last_width) < 24:
+            return
+        self._schedule_reflow()
+
+    def _schedule_reflow(self) -> None:
+        if self._reflow_after is not None:
+            try:
+                self.after_cancel(self._reflow_after)
+            except Exception:
+                pass
+        self._reflow_after = self.after(180, self._reflow)
+
+    def _reflow(self) -> None:
+        self._reflow_after = None
+        if self._laying_out:
+            return
+        width = int(self.winfo_width() or 0)
+        if width < 40:
+            self._reflow_after = self.after(50, self._reflow)
+            return
+        if width == self._last_width and self._items:
+            # Still need first paint if nothing placed yet
+            placed = False
+            for w in self._items:
+                try:
+                    if w.winfo_ismapped():
+                        placed = True
+                        break
+                except Exception:
+                    pass
+            if placed:
+                return
+
+        self._laying_out = True
+        try:
+            for child in self.winfo_children():
+                try:
+                    child.place_forget()
+                except Exception:
+                    pass
+
+            if not self._items:
+                self._last_width = width
+                self.configure(height=8)
+                return
+
+            x = 0
+            y = 0
+            row_h = 0
+            for w in self._items:
+                wid = id(w)
+                cached = self._btn_sizes.get(wid)
+                if cached:
+                    bw, bh = cached
+                else:
+                    try:
+                        bw = max(1, int(w.winfo_reqwidth()))
+                        bh = max(1, int(w.winfo_reqheight()))
+                        if bw <= 1:
+                            w.update_idletasks()
+                            bw = max(1, int(w.winfo_reqwidth()))
+                            bh = max(1, int(w.winfo_reqheight()))
+                        self._btn_sizes[wid] = (bw, bh)
+                    except Exception:
+                        bw, bh = 80, 28
+                if x > 0 and x + bw > width:
+                    x = 0
+                    y += row_h + self._gap
+                    row_h = 0
+                try:
+                    w.place(x=x, y=y, width=bw, height=bh)
+                except Exception:
+                    continue
+                x += bw + self._gap
+                row_h = max(row_h, bh)
+
+            total_h = y + max(row_h, 1)
+            self._last_width = width
+            self.configure(height=max(total_h, 28))
+        finally:
+            self._laying_out = False
+
+
 class ManagerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -196,12 +379,16 @@ class ManagerApp(tk.Tk):
         self.products: list[Product] = []
         self.excluded_items: list[ExcludedItem] = []
         self.published_items: list[PublishedItem] = []
+        self.unpublished_items: list[UnpublishedItem] = []
         self.current_id: int | None = None
         self.current_excluded_id: int | None = None
         self.current_published_id: int | None = None
+        self.current_unpublished_id: int | None = None
         # Ctrl/Shift 다중 선택 시 상세(포커스)는 처음 선택한 상품 유지
         self._list_select_mods: frozenset[str] = frozenset()
-        self.list_mode = tk.StringVar(value="products")  # products | excluded | published
+        # products | published | excluded | publish_fail | publishing | unpublished
+        self.list_mode = tk.StringVar(value="products")
+        self.publish_fail_errors: dict[int, str] = {}
         self._photo_cache: list[tk.PhotoImage] = []
         self._photo_refs: list[tk.PhotoImage] = []  # URL-thumbnail cache (separate from local-file cache)
         self._list_photos: dict[int, tk.PhotoImage] = {}
@@ -212,8 +399,10 @@ class ManagerApp(tk.Tk):
         self._jobs: set[str] = set()
         self._jobs_lock = threading.Lock()
         self._stop = threading.Event()
-        self._cancel_job = threading.Event()
-        self._collect_pause = threading.Event()  # set = paused
+        self._cancel_job = threading.Event()  # weigou 수집·가져오기
+        self._cancel_wecatalog = threading.Event()
+        self._collect_pause = threading.Event()  # weigou 일시정지 (set = paused)
+        self._wecatalog_pause = threading.Event()
         self._form_loading = False
         self._ime_composing = False
         self._pending_soft_save = False
@@ -224,16 +413,18 @@ class ManagerApp(tk.Tk):
         self._attr_after: str | None = None
         self._collect_refresh_after: str | None = None
         self._job_labels = {
-            "collect": "자동수집",
+            "collect": "微购 자동수집",
+            "wecatalog": "wecatalog 수집",
             "import": "가져오기",
             "search": "이미지검색",
             "publish": "홈페이지등록",
             "launch": "디버그실행",
         }
         self._job_log_channel = {
-            "collect": LOG_COLLECT,
-            "import": LOG_COLLECT,
-            "launch": LOG_COLLECT,
+            "collect": LOG_COLLECT_WEIGOU,
+            "wecatalog": LOG_COLLECT_WECATALOG,
+            "import": LOG_COLLECT_WEIGOU,
+            "launch": LOG_COLLECT_WEIGOU,
             "publish": LOG_MALL,
             "search": LOG_SEARCH,
         }
@@ -296,10 +487,16 @@ class ManagerApp(tk.Tk):
         self._publish_fail = 0
         self._publish_lines: list[str] = []
         self._publish_queued_ids: set[int] = set()
+        self._publish_order: list[int] = []  # 제품등록중 탭 표시 순서 (대기+진행)
         self._publish_active_id: int | None = None
         self._publish_prog: dict | None = None
         self._publish_next_id: int | None = None
         self._publish_yview: tuple[float, float] | None = None
+        # publish | republish | reconcile — 재등록은 진행 중 추가 대기 가능
+        self._publish_mode: str | None = None
+        self._republish_q: queue.Queue = queue.Queue()
+        self._republish_queued_ids: set[int] = set()
+        self._republish_active_id: int | None = None
         # 이미지 검색 대기열 (진행 중 추가 검색)
         self._search_q: queue.Queue = queue.Queue()
         self._search_lock = threading.Lock()
@@ -311,6 +508,29 @@ class ManagerApp(tk.Tk):
         self._search_queued_ids: set[int] = set()
         self._search_active_id: int | None = None
         self._search_prog: dict | None = None
+        # 목록 busy 갱신 디바운스 (등록/검색 중 DB·전체 리빌드 방지)
+        self._list_busy_after: str | None = None
+        self._list_busy_last_key: tuple = ()
+        self._list_mode_after: str | None = None
+        self._img_canvas_cfg_after: str | None = None
+        self._img_frame_cfg_after: str | None = None
+        self._img_canvas_last_w: int = 0
+        self._img_canvas_wrap: tk.Frame | None = None
+        self._gallery_paths: list[str] = []
+        self._gallery_cover: str = ""
+        self._gallery_gen: int = 0
+        self._gallery_allow_set_cover: bool = False
+        self._gallery_expanded: bool = False
+        # 창 이동/크기조절 중 DWM 렉 방지 (ENTERSIZEMOVE 때 단색 덮개 1회)
+        self._move_light_on = False
+        self._move_cover: tk.Frame | None = None
+        self._sizemove_active = False
+        self._sizemove_hwnd = 0
+        self._sizemove_old_wndproc = 0
+        self._sizemove_wndproc_ref = None
+        self._sizemove_tick_after: str | None = None
+        self._pending_catalog_pull = False
+        self._pending_list_busy = False
 
         # Cloud-first: seed credentials + sync settings before UI (no manual sync click)
         ensure_cloud_settings(repair_invalid=True)
@@ -318,7 +538,7 @@ class ManagerApp(tk.Tk):
 
         self._sync = CatalogSyncService(
             self.store,
-            on_log=lambda m: self._put_log(m, channel=LOG_COLLECT),
+            on_log=lambda m: self._put_log(m, channel=LOG_OTHER),
             on_pulled=lambda: self.after(0, self._on_catalog_pulled),
             on_status=lambda st: self.after(0, lambda s=st: self._apply_sync_status(s)),
         )
@@ -333,6 +553,7 @@ class ManagerApp(tk.Tk):
         self.after(200, self._poll_log)
         threading.Thread(target=self._status_loop, daemon=True).start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(250, self._setup_move_light)
         # Start sync ASAP — pull shared catalog without user pressing a button
         self.after(400, self._sync.start)
         self.after(4000, self._start_mall_watch)
@@ -350,7 +571,7 @@ class ManagerApp(tk.Tk):
                 exe_name=EXE_NAME,
                 zip_inner_folder=APP_NAME,
                 release_asset=RELEASE_ASSET,
-                log_callback=lambda m: self._put_log(m, channel=LOG_COLLECT),
+                log_callback=lambda m: self._put_log(m, channel=LOG_OTHER),
             ),
         )
 
@@ -1070,7 +1291,7 @@ class ManagerApp(tk.Tk):
         ).pack(side="left")
         tk.Label(
             head,
-            text="수집 · 홈페이지/추천/AI코디 · 이미지검색 로그를 나눠 봅니다",
+            text="수집=좌·우 분리 · 동기화는 기타 탭",
             bg="#f3efe8",
             fg="#666",
             font=("Malgun Gothic", 9),
@@ -1098,65 +1319,102 @@ class ManagerApp(tk.Tk):
         self.log_nb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self._log_widgets = {}
         self._log_progress: dict[str, dict] = {}
-        default_idle = {
-            LOG_COLLECT: "수집 대기",
+        self._log_nb_tab_channels = list(LOG_NB_TABS)
+
+        idle = {
+            LOG_COLLECT_WEIGOU: "微购 자동수집 대기",
+            LOG_COLLECT_WECATALOG: "wecatalog 수집 대기",
             LOG_MALL: "홈페이지 등록 대기",
             LOG_SEARCH: "이미지 검색 대기",
+            LOG_OTHER: "기타 대기",
         }
-        for key in LOG_CHANNELS:
-            frame = tk.Frame(self.log_nb, bg="#f3efe8")
-            self.log_nb.add(frame, text=f"  {LOG_CHANNEL_LABELS[key]}  ")
 
-            prog_wrap = tk.Frame(frame, bg="#f3efe8")
-            prog_wrap.pack(fill="x", padx=6, pady=(6, 2))
-            title_var = tk.StringVar(value=default_idle.get(key, "대기"))
-            detail_var = tk.StringVar(value="")
+        # 1) 수집 — 좌(微购) / 우(wecatalog)
+        collect_frame = tk.Frame(self.log_nb, bg="#f3efe8")
+        self.log_nb.add(collect_frame, text=f"  {LOG_NB_TAB_LABELS[0]}  ")
+        paned = ttk.Panedwindow(collect_frame, orient=tk.HORIZONTAL)
+        paned.pack(fill="both", expand=True, padx=4, pady=4)
+        for key, pane_title in (
+            (LOG_COLLECT_WEIGOU, "微购 목록→상세 자동수집"),
+            (LOG_COLLECT_WECATALOG, "wecatalog 수집"),
+        ):
+            pane = tk.Frame(paned, bg="#f3efe8")
+            paned.add(pane, weight=1)
+            self._build_log_channel_panel(pane, key, idle.get(key, "대기"), pane_title)
+
+        # 2~4) 단일 채널 탭
+        for tab_i, channels in enumerate(LOG_NB_TABS[1:], start=1):
+            frame = tk.Frame(self.log_nb, bg="#f3efe8")
+            self.log_nb.add(frame, text=f"  {LOG_NB_TAB_LABELS[tab_i]}  ")
+            key = channels[0]
+            self._build_log_channel_panel(frame, key, idle.get(key, "대기"))
+
+        self.log = self._log_widgets[LOG_COLLECT_WEIGOU]
+
+    def _build_log_channel_panel(
+        self,
+        parent: tk.Frame,
+        key: str,
+        idle_text: str,
+        heading: str | None = None,
+    ) -> None:
+        if heading:
             tk.Label(
-                prog_wrap,
-                textvariable=title_var,
+                parent,
+                text=heading,
+                font=("Malgun Gothic", 10, "bold"),
                 bg="#f3efe8",
                 fg="#1f1a17",
-                font=("Malgun Gothic", 10, "bold"),
                 anchor="w",
-            ).pack(fill="x")
-            bar = ttk.Progressbar(
-                prog_wrap,
-                maximum=100,
-                mode="determinate",
-                value=0,
-            )
-            bar.pack(fill="x", pady=(4, 2))
-            tk.Label(
-                prog_wrap,
-                textvariable=detail_var,
-                bg="#f3efe8",
-                fg="#666",
-                font=("Malgun Gothic", 8),
-                anchor="w",
-            ).pack(fill="x")
-            self._log_progress[key] = {
-                "title": title_var,
-                "detail": detail_var,
-                "bar": bar,
-                "idle": default_idle.get(key, "대기"),
-                "total": 0,
-                "done": 0,
-            }
+            ).pack(fill="x", padx=6, pady=(4, 0))
 
-            txt = scrolledtext.ScrolledText(
-                frame,
-                font=("Consolas", 10),
-                bg="#fffdf9",
-                relief="solid",
-                borderwidth=1,
-                wrap="word",
-            )
-            txt.pack(fill="both", expand=True, padx=4, pady=(2, 4))
-            txt.configure(state="disabled")
-            self._log_widgets[key] = txt
+        prog_wrap = tk.Frame(parent, bg="#f3efe8")
+        prog_wrap.pack(fill="x", padx=6, pady=(4, 2))
+        title_var = tk.StringVar(value=idle_text)
+        detail_var = tk.StringVar(value="")
+        tk.Label(
+            prog_wrap,
+            textvariable=title_var,
+            bg="#f3efe8",
+            fg="#1f1a17",
+            font=("Malgun Gothic", 10, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        bar = ttk.Progressbar(
+            prog_wrap,
+            maximum=100,
+            mode="determinate",
+            value=0,
+        )
+        bar.pack(fill="x", pady=(4, 2))
+        tk.Label(
+            prog_wrap,
+            textvariable=detail_var,
+            bg="#f3efe8",
+            fg="#666",
+            font=("Malgun Gothic", 8),
+            anchor="w",
+        ).pack(fill="x")
+        self._log_progress[key] = {
+            "title": title_var,
+            "detail": detail_var,
+            "bar": bar,
+            "idle": idle_text,
+            "total": 0,
+            "done": 0,
+        }
 
-        # 상품관리 하단 미리보기와 동일 버퍼를 쓰도록 alias
-        self.log = self._log_widgets[LOG_COLLECT]
+        txt = scrolledtext.ScrolledText(
+            parent,
+            font=("Consolas", 10),
+            bg="#fffdf9",
+            relief="solid",
+            borderwidth=1,
+            wrap="word",
+        )
+        txt.pack(fill="both", expand=True, padx=4, pady=(2, 4))
+        txt.configure(state="disabled")
+        self._log_widgets[key] = txt
 
     def _build_products_page(self, parent: tk.Frame) -> None:
         top = tk.Frame(parent, bg="#f3efe8")
@@ -1195,6 +1453,14 @@ class ManagerApp(tk.Tk):
             bg="#ebe4da",
         )
         self.btn_launch.pack(side="right", padx=4)
+        self.btn_wecatalog_chrome = tk.Button(
+            top,
+            text="wecatalog Chrome",
+            command=self._on_wecatalog_chrome,
+            font=("Malgun Gothic", 10),
+            bg="#d1fae5",
+        )
+        self.btn_wecatalog_chrome.pack(side="right", padx=4)
 
         # Cloud catalog banner — separate from album CDP connection
         self._sync_banner = tk.Label(
@@ -1210,18 +1476,32 @@ class ManagerApp(tk.Tk):
         self._sync_banner.pack(fill="x", padx=12, pady=(0, 4))
         tk.Button(
             top,
-            text="선택된 이미지 검색",
-            command=self._on_google_selected,
-            font=("Malgun Gothic", 10),
-            bg="#ebe4da",
-        ).pack(side="right", padx=4)
-        tk.Button(
-            top,
             text="중지",
             command=self._on_cancel_job,
             font=("Malgun Gothic", 10),
             bg="#ebe4da",
         ).pack(side="right", padx=4)
+        self.btn_wecatalog_collect = tk.Button(
+            top,
+            text="wecatalog 수집",
+            command=self._on_wecatalog_collect,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#0f766e",
+            fg="white",
+            activebackground="#115e59",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+        )
+        self.btn_wecatalog_collect.pack(side="right", padx=4)
+        self.btn_wecatalog_audit = tk.Button(
+            top,
+            text="목록 대조",
+            command=self._on_wecatalog_audit,
+            font=("Malgun Gothic", 10),
+            bg="#e0e7ff",
+        )
+        self.btn_wecatalog_audit.pack(side="right", padx=4)
         self.btn_auto_collect = tk.Button(
             top,
             text="목록→상세 자동수집",
@@ -1268,25 +1548,16 @@ class ManagerApp(tk.Tk):
             self.collect_limit_var.set(label_map.get(saved, "100건"))
         except Exception:
             pass
-        self.btn_import = tk.Button(
-            top,
-            text="현재 화면 가져오기",
-            command=self._on_import,
-            font=("Malgun Gothic", 11, "bold"),
-            bg="#c45c26",
-            fg="white",
-            activebackground="#a64c1f",
-            activeforeground="white",
-            relief="flat",
-            padx=12,
-        )
-        self.btn_import.pack(side="right", padx=4)
-
         body = tk.Frame(parent, bg="#f3efe8")
         body.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
-        # Left pane — 목록 제목이 잘리지 않도록 넓게
-        left = tk.Frame(body, bg="#f3efe8", width=480)
+        # Left pane — 슬라이더로 목록 폭을 조절할 수 있음
+        try:
+            list_width = int(self.store.get_setting("list_width", "480") or "480")
+        except (TypeError, ValueError):
+            list_width = 480
+        list_width = max(360, min(900, list_width))
+        left = tk.Frame(body, bg="#f3efe8", width=list_width)
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
 
@@ -1301,6 +1572,44 @@ class ManagerApp(tk.Tk):
             command=self._reset_list_page_and_refresh,
             font=("Malgun Gothic", 9),
         ).pack(side="left", padx=(6, 0))
+
+        width_row = tk.Frame(left, bg="#f3efe8")
+        width_row.pack(fill="x", pady=(0, 4))
+        tk.Label(
+            width_row,
+            text="목록 폭",
+            bg="#f3efe8",
+            font=("Malgun Gothic", 8),
+        ).pack(side="left")
+
+        def resize_list_width(value: str) -> None:
+            try:
+                left.configure(width=max(360, min(900, int(float(value)))))
+            except (TypeError, ValueError):
+                pass
+
+        width_scale = tk.Scale(
+            width_row,
+            from_=360,
+            to=900,
+            resolution=10,
+            orient="horizontal",
+            showvalue=True,
+            variable=tk.IntVar(value=list_width),
+            command=resize_list_width,
+            bg="#f3efe8",
+            highlightthickness=0,
+            troughcolor="#d8d0c5",
+            length=210,
+            font=("Malgun Gothic", 8),
+        )
+        width_scale.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        width_scale.bind(
+            "<ButtonRelease-1>",
+            lambda _e: self.store.set_setting(
+                "list_width", str(int(width_scale.get()))
+            ),
+        )
 
         filter_row = tk.Frame(left, bg="#f3efe8")
         filter_row.pack(fill="x", pady=(0, 6))
@@ -1371,6 +1680,42 @@ class ManagerApp(tk.Tk):
             font=("Malgun Gothic", 9),
             activebackground="#f3efe8",
         ).pack(side="left", padx=(8, 0))
+        tk.Radiobutton(
+            mode_row,
+            text="등록해제",
+            variable=self.list_mode,
+            value="unpublished",
+            command=self._on_list_mode,
+            bg="#f3efe8",
+            font=("Malgun Gothic", 9),
+            activebackground="#f3efe8",
+            fg="#5b21b6",
+            activeforeground="#5b21b6",
+        ).pack(side="left", padx=(8, 0))
+        tk.Radiobutton(
+            mode_row,
+            text="실패",
+            variable=self.list_mode,
+            value="publish_fail",
+            command=self._on_list_mode,
+            bg="#f3efe8",
+            font=("Malgun Gothic", 9),
+            activebackground="#f3efe8",
+            fg="#8b1a1a",
+            activeforeground="#8b1a1a",
+        ).pack(side="left", padx=(8, 0))
+        tk.Radiobutton(
+            mode_row,
+            text="제품등록중",
+            variable=self.list_mode,
+            value="publishing",
+            command=self._on_list_mode,
+            bg="#f3efe8",
+            font=("Malgun Gothic", 9),
+            activebackground="#f3efe8",
+            fg="#0b3d66",
+            activeforeground="#0b3d66",
+        ).pack(side="left", padx=(8, 0))
         list_wrap = tk.Frame(left, bg="#f3efe8")
         list_wrap.pack(fill="both", expand=True)
         self.listbox = tk.Listbox(
@@ -1394,6 +1739,8 @@ class ManagerApp(tk.Tk):
         self.listbox.bind("<Button-1>", self._on_list_button1, add="+")
         self.listbox.bind("<KeyPress>", self._on_list_keypress, add="+")
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        self.listbox.bind("<Control-c>", self._on_copy_folder_numbers)
+        self.listbox.bind("<Control-C>", self._on_copy_folder_numbers)
 
         def _on_list_mousewheel(event: tk.Event) -> str | None:
             # Windows: event.delta 120 단위 / Linux: Button-4/5
@@ -1533,41 +1880,12 @@ class ManagerApp(tk.Tk):
         self.category_box.bind("<<ComboboxSelected>>", self._on_category_chosen)
         tk.Button(
             cat_row,
-            text="자동인식",
-            command=lambda: self._auto_fill_attrs(silent=False),
-            font=("Malgun Gothic", 9),
-        ).pack(side="left", padx=8)
-        tk.Button(
-            cat_row,
             text="같은 태그 일괄수정",
             command=self._on_bulk_category_by_tag,
             font=("Malgun Gothic", 9),
             bg="#ebe4da",
             relief="flat",
         ).pack(side="left", padx=4)
-        tk.Button(
-            cat_row,
-            text="이미지로 제품명 찾기",
-            command=self._on_google_one,
-            font=("Malgun Gothic", 9, "bold"),
-            bg="#c45c26",
-            fg="white",
-            activebackground="#a64c1f",
-            activeforeground="white",
-            relief="flat",
-        ).pack(side="left", padx=4)
-        tk.Button(
-            cat_row,
-            text="두번째 이미지 검색",
-            command=self._on_google_second,
-            font=("Malgun Gothic", 9, "bold"),
-            bg="#1f4e79",
-            fg="white",
-            activebackground="#163a5c",
-            activeforeground="white",
-            relief="flat",
-        ).pack(side="left", padx=4)
-
         tk.Label(
             right,
             textvariable=self.price_preview,
@@ -1588,14 +1906,17 @@ class ManagerApp(tk.Tk):
         self.desc.pack(fill="x")
         self._bind_ime_safe_text(self.desc)
 
-        btn_row = tk.Frame(right, bg="#f3efe8")
-        btn_row.pack(fill="x", pady=8)
+        self.btn_bar = WrapButtonBar(right, bg="#f3efe8", gap=6)
+        self.btn_bar.pack(fill="x", pady=8)
         self.btn_save = tk.Button(
-            btn_row, text="설명 저장", command=self._on_save, font=("Malgun Gothic", 10), bg="#ebe4da"
+            self.btn_bar,
+            text="설명 저장",
+            command=self._on_save,
+            font=("Malgun Gothic", 10),
+            bg="#ebe4da",
         )
-        self.btn_save.pack(side="left")
         self.btn_publish = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="홈페이지 등록",
             command=self._on_publish,
             font=("Malgun Gothic", 10, "bold"),
@@ -1606,9 +1927,8 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_publish.pack(side="left", padx=6)
         self.btn_exclude = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="제외",
             command=self._on_exclude,
             font=("Malgun Gothic", 10, "bold"),
@@ -1619,9 +1939,8 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_exclude.pack(side="left", padx=6)
         self.btn_merge_images = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="이미지 합치기",
             command=self._on_merge_images,
             font=("Malgun Gothic", 10, "bold"),
@@ -1632,9 +1951,8 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_merge_images.pack(side="left", padx=6)
         self.btn_unexclude = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="제외 해제",
             command=self._on_unexclude,
             font=("Malgun Gothic", 10, "bold"),
@@ -1645,9 +1963,20 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_unexclude.pack(side="left", padx=6)
+        self.btn_clear_publish_fail = tk.Button(
+            self.btn_bar,
+            text="실패목록에서 제거",
+            command=self._on_clear_publish_fail,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#7c2d12",
+            fg="white",
+            activebackground="#5c210d",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+        )
         self.btn_unpublish = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="등록목록에서 제거",
             command=self._on_unpublish,
             font=("Malgun Gothic", 10, "bold"),
@@ -1658,9 +1987,32 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_unpublish.pack(side="left", padx=6)
+        self.btn_delete_unpublished = tk.Button(
+            self.btn_bar,
+            text="보관함에서 삭제",
+            command=self._on_delete_unpublished,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#7c2d12",
+            fg="white",
+            activebackground="#5c210d",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+        )
+        self.btn_republish_unpublished = tk.Button(
+            self.btn_bar,
+            text="홈페이지 다시 등록",
+            command=self._on_republish_unpublished,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#c45c26",
+            fg="white",
+            activebackground="#a64c1f",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+        )
         self.btn_republish = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="재등록",
             command=self._on_republish,
             font=("Malgun Gothic", 10, "bold"),
@@ -1671,9 +2023,8 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_republish.pack(side="left", padx=6)
         self.btn_reconcile_site = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="사이트 전체 맞추기",
             command=self._on_reconcile_homepage,
             font=("Malgun Gothic", 10, "bold"),
@@ -1684,9 +2035,8 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_reconcile_site.pack(side="left", padx=6)
         self.btn_recommend = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="추천상품으로 재등록하기",
             command=self._on_recommend,
             font=("Malgun Gothic", 10, "bold"),
@@ -1697,9 +2047,8 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_recommend.pack(side="left", padx=6)
         self.btn_unrecommend = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="추천상품 해제",
             command=self._on_unrecommend,
             font=("Malgun Gothic", 10, "bold"),
@@ -1710,9 +2059,8 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_unrecommend.pack(side="left", padx=6)
         self.btn_ai_select = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="AI 상품선택",
             command=self._on_ai_select,
             font=("Malgun Gothic", 10, "bold"),
@@ -1723,9 +2071,8 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_ai_select.pack(side="left", padx=6)
         self.btn_ai_apply = tk.Button(
-            btn_row,
+            self.btn_bar,
             text="AI 코디 만들기",
             command=self._on_ai_style_dialog,
             font=("Malgun Gothic", 10, "bold"),
@@ -1736,22 +2083,42 @@ class ManagerApp(tk.Tk):
             relief="flat",
             padx=10,
         )
-        self.btn_ai_apply.pack(side="left", padx=6)
-        self.btn_delete = tk.Button(
-            btn_row, text="삭제", command=self._on_delete, font=("Malgun Gothic", 10)
+        self.btn_find_by_image = tk.Button(
+            self.btn_bar,
+            text="이미지로 찾기",
+            command=self._on_find_published_by_image,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#0e7490",
+            fg="white",
+            activebackground="#155e75",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
         )
-        self.btn_delete.pack(side="left", padx=6)
-        tk.Button(
-            btn_row, text="폴더 열기", command=self._open_folder, font=("Malgun Gothic", 10)
-        ).pack(side="left")
-        self.btn_unexclude.pack_forget()
-        self.btn_unpublish.pack_forget()
-        self.btn_republish.pack_forget()
-        self.btn_reconcile_site.pack_forget()
-        self.btn_recommend.pack_forget()
-        self.btn_unrecommend.pack_forget()
-        self.btn_ai_select.pack_forget()
-        self.btn_ai_apply.pack_forget()
+        self.btn_delete = tk.Button(
+            self.btn_bar,
+            text="삭제",
+            command=self._on_delete,
+            font=("Malgun Gothic", 10),
+        )
+        self.btn_folder_open = tk.Button(
+            self.btn_bar,
+            text="폴더 열기",
+            command=self._open_folder,
+            font=("Malgun Gothic", 10),
+        )
+        self.btn_folder_recheck = tk.Button(
+            self.btn_bar,
+            text="폴더 재확인",
+            command=self._on_folder_recheck,
+            font=("Malgun Gothic", 10),
+        )
+        self.btn_folder_copy = tk.Button(
+            self.btn_bar,
+            text="폴더번호 복사",
+            command=self._on_copy_folder_numbers,
+            font=("Malgun Gothic", 10),
+        )
 
         tk.Label(
             right,
@@ -1763,6 +2130,7 @@ class ManagerApp(tk.Tk):
         ).pack(fill="x")
         canvas_wrap = tk.Frame(right, bg="#fffdf9", relief="solid", borderwidth=1)
         canvas_wrap.pack(fill="both", expand=True)
+        self._img_canvas_wrap = canvas_wrap
         self.img_canvas = tk.Canvas(canvas_wrap, bg="#fffdf9", highlightthickness=0)
         scroll = ttk.Scrollbar(canvas_wrap, orient="vertical", command=self.img_canvas.yview)
         self.img_canvas.configure(yscrollcommand=scroll.set)
@@ -1770,12 +2138,8 @@ class ManagerApp(tk.Tk):
         self.img_canvas.pack(side="left", fill="both", expand=True)
         self.img_frame = tk.Frame(self.img_canvas, bg="#fffdf9")
         self._img_window = self.img_canvas.create_window((0, 0), window=self.img_frame, anchor="nw")
-        self.img_frame.bind(
-            "<Configure>", lambda _e: self.img_canvas.configure(scrollregion=self.img_canvas.bbox("all"))
-        )
-        self.img_canvas.bind(
-            "<Configure>", lambda e: self.img_canvas.itemconfigure(self._img_window, width=e.width)
-        )
+        # Configure 바인딩 금지: 창 이동 시에도 Configure가 쏟아져 Python 콜백이 렉을 만듦.
+        # 너비는 갤러리 갱신 때 한 번만 맞춤.
 
         def _on_img_mousewheel(event: tk.Event) -> str | None:
             if getattr(event, "num", None) == 4:
@@ -1889,46 +2253,57 @@ class ManagerApp(tk.Tk):
         )
         self._log_recent.pack(fill="x", pady=(4, 0))
         self._append(
-            f"저장 위치: {default_root()}\n"
-            "1) 디버그 실행 → 2) 친구 앨범 목록 열기 → 3) [목록→상세 자동수집]\n"
-            "   · 맨 위부터 PageDown · 하단 로딩 대기 · 상단 [수집개수]로 한도 선택\n"
-            "   · 이미 수집·제외·등록은 상품ID로 패스 · 이미지 1~2장은 제외 목록으로\n"
-            "   · 수집 중 버튼 = 일시정지 / 수집 계속 · 완전 종료는 [중지]\n"
-            "4) [이미지로 제품명 찾기] → 1번째 이미지로 제품명·카테고리 기록\n"
-            "   [두번째 이미지 검색] → 선택 상품을 하나씩 2번째 이미지로 검색\n"
-            "5) NO·컬러·사이즈 확인 후 [홈페이지 등록] → 등록 목록으로 이동\n"
-            "   (제품명 한/영·컬러·사이즈 함께 저장됨)\n"
-            "[제외]/[등록] 상품은 이후 자동/수동 수집에서 건너뜁니다.\n"
-            "[등록목록에서 제거] 시 홈페이지 상품도 삭제되고 상품 관리 목록으로 복원됩니다.\n"
-            "[등록] 탭: 상품 선택 → [AI 상품선택] → [AI 코디 만들기]에서 모델 이미지 업로드 후 홈페이지 적용\n"
-            "상세 로그는 상단 [로그 관리] 탭에서 채널별로 확인할 수 있습니다.\n",
-            channel=LOG_COLLECT,
+            "微购: 디버그 실행 → 앨범 목록 → [목록→상세 자동수집]\n"
+            "로그는 [로그 관리] 수집 탭 왼쪽(微购)에 표시됩니다.\n",
+            channel=LOG_COLLECT_WEIGOU,
+        )
+        self._append(
+            "wecatalog: [wecatalog Chrome] → 목록 URL → [wecatalog 수집]\n"
+            "로그는 [로그 관리] 수집 탭 오른쪽(wecatalog)에 표시됩니다.\n",
+            channel=LOG_COLLECT_WECATALOG,
         )
         self._append(
             "홈페이지 등록 · 추천 등록/해제 · AI 코디 로그가 여기에 쌓입니다.\n",
             channel=LOG_MALL,
         )
         self._append(
-            "이미지로 제품명 찾기 · 선택 이미지 검색 로그가 여기에 쌓입니다.\n",
-            channel=LOG_SEARCH,
+            "동기화 업로드/반영 · 업데이트 확인 로그가 여기에 쌓입니다.\n",
+            channel=LOG_OTHER,
         )
         self._apply_role_ui()
+        self._apply_mode_buttons()
 
     def _apply_role_ui(self) -> None:
         """Manager(B) role hides collect/debug/import controls — those PCs only curate and publish."""
-        widgets = (self.btn_launch, self.btn_import, self.btn_auto_collect, self.collect_opt)
+        widgets = (
+            self.btn_launch,
+            self.btn_wecatalog_chrome,
+            self.btn_wecatalog_audit,
+            self.btn_wecatalog_collect,
+            self.btn_auto_collect,
+            self.collect_opt,
+        )
         if is_manager_role():
             for w in widgets:
                 w.pack_forget()
         else:
             # Re-pack in the same relative side="right" order used at build time
             self.btn_launch.pack(side="right", padx=4)
+            self.btn_wecatalog_chrome.pack(side="right", padx=4)
+            self.btn_wecatalog_audit.pack(side="right", padx=4)
+            self.btn_wecatalog_collect.pack(side="right", padx=4)
             self.btn_auto_collect.pack(side="right", padx=4)
             self.collect_opt.pack(side="right", padx=(4, 2))
-            self.btn_import.pack(side="right", padx=4)
 
     def _on_close(self) -> None:
         self._stop.set()
+        if self._sizemove_tick_after is not None:
+            try:
+                self.after_cancel(self._sizemove_tick_after)
+            except Exception:
+                pass
+            self._sizemove_tick_after = None
+        self._restore_sizemove_wndproc()
         if self._mall_watch_after is not None:
             try:
                 self.after_cancel(self._mall_watch_after)
@@ -1940,6 +2315,210 @@ class ManagerApp(tk.Tk):
         except Exception:
             pass
         self.destroy()
+
+    def _setup_move_light(self) -> None:
+        """Pre-create overlay + hook WM_ENTERSIZEMOVE (never call Tk inside WndProc)."""
+        try:
+            if self._move_cover is None:
+                cover = tk.Frame(self, bg="#e4e0d8", highlightthickness=0)
+                tk.Label(
+                    cover,
+                    text="창 이동 중…",
+                    bg="#e4e0d8",
+                    fg="#666666",
+                    font=("Malgun Gothic", 13),
+                ).place(relx=0.5, rely=0.5, anchor="center")
+                self._move_cover = cover
+        except Exception:
+            self._move_cover = None
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                self.update_idletasks()
+                try:
+                    frame = self.wm_frame()
+                    hwnd = int(frame, 16) if frame else int(self.winfo_id())
+                except Exception:
+                    hwnd = int(self.winfo_id())
+                self._sizemove_hwnd = int(hwnd)
+
+                GWLP_WNDPROC = -4
+                WM_ENTERSIZEMOVE = 0x0231
+                WM_EXITSIZEMOVE = 0x0232
+                LRESULT = ctypes.c_longlong
+                WNDPROC = ctypes.WINFUNCTYPE(
+                    LRESULT,
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.WPARAM,
+                    wintypes.LPARAM,
+                )
+                user32 = ctypes.windll.user32
+                user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+                user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+                user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+                user32.SetWindowLongPtrW.argtypes = [
+                    wintypes.HWND,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                ]
+                user32.CallWindowProcW.restype = LRESULT
+                user32.CallWindowProcW.argtypes = [
+                    ctypes.c_void_p,
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.WPARAM,
+                    wintypes.LPARAM,
+                ]
+
+                old = user32.GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+
+                @WNDPROC
+                def _wndproc(h, msg, wp, lp):
+                    # Flags only — never touch Tk from here (cross-thread / re-entrancy).
+                    if msg == WM_ENTERSIZEMOVE:
+                        self._sizemove_active = True
+                    elif msg == WM_EXITSIZEMOVE:
+                        self._sizemove_active = False
+                    return user32.CallWindowProcW(old, h, msg, wp, lp)
+
+                self._sizemove_wndproc_ref = _wndproc
+                self._sizemove_old_wndproc = int(old or 0)
+                user32.SetWindowLongPtrW(
+                    hwnd, GWLP_WNDPROC, ctypes.cast(_wndproc, ctypes.c_void_p)
+                )
+            except Exception:
+                self._sizemove_old_wndproc = 0
+                self._sizemove_wndproc_ref = None
+
+        self._sizemove_tick()
+
+    def _restore_sizemove_wndproc(self) -> None:
+        if sys.platform != "win32" or not self._sizemove_hwnd or not self._sizemove_old_wndproc:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.SetWindowLongPtrW.argtypes = [
+                wintypes.HWND,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            ]
+            user32.SetWindowLongPtrW(
+                self._sizemove_hwnd, -4, ctypes.c_void_p(self._sizemove_old_wndproc)
+            )
+        except Exception:
+            pass
+        self._sizemove_hwnd = 0
+        self._sizemove_old_wndproc = 0
+        self._sizemove_wndproc_ref = None
+
+    def _sizemove_tick(self) -> None:
+        self._sizemove_tick_after = None
+        if self._stop.is_set():
+            return
+        try:
+            # WndProc 실패 시 Win32 GetWindowRect로 이동 감지 (Tk winfo 호출 금지)
+            if self._sizemove_wndproc_ref is None and sys.platform == "win32":
+                self._sizemove_active = self._probe_win32_moving()
+            if self._sizemove_active:
+                if not self._move_light_on:
+                    self._enter_move_light()
+            elif self._move_light_on:
+                self._exit_move_light()
+        except Exception:
+            pass
+        if not self._stop.is_set():
+            self._sizemove_tick_after = self.after(33, self._sizemove_tick)
+
+    def _probe_win32_moving(self) -> bool:
+        """True while window position/size is changing (fallback without WndProc)."""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = self._sizemove_hwnd
+            if not hwnd:
+                try:
+                    self.update_idletasks()
+                    frame = self.wm_frame()
+                    hwnd = int(frame, 16) if frame else int(self.winfo_id())
+                    self._sizemove_hwnd = hwnd
+                except Exception:
+                    return False
+            rect = wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return False
+            cur = (rect.left, rect.top, rect.right, rect.bottom)
+            prev = getattr(self, "_sizemove_last_rect", None)
+            self._sizemove_last_rect = cur
+            if prev is None:
+                self._sizemove_idle_n = 0
+                return False
+            if cur != prev:
+                self._sizemove_idle_n = 0
+                return True
+            n = int(getattr(self, "_sizemove_idle_n", 0)) + 1
+            self._sizemove_idle_n = n
+            # still "moving" until a few stable ticks after last change
+            return n < 3 and getattr(self, "_move_light_on", False)
+        except Exception:
+            return False
+
+    def _enter_move_light(self) -> None:
+        """Blank the client area once while user drags/resizes the window."""
+        if self._move_light_on:
+            return
+        self._move_light_on = True
+        cover = self._move_cover
+        if cover is not None:
+            try:
+                cover.place(x=0, y=0, relwidth=1, relheight=1)
+                cover.lift()
+            except Exception:
+                pass
+        try:
+            if getattr(self, "_img_window", None) is not None:
+                self.img_canvas.itemconfigure(self._img_window, state="hidden")
+        except Exception:
+            pass
+
+    def _exit_move_light(self) -> None:
+        if not self._move_light_on:
+            return
+        self._move_light_on = False
+        cover = self._move_cover
+        if cover is not None:
+            try:
+                cover.place_forget()
+            except Exception:
+                pass
+        try:
+            if getattr(self, "_img_window", None) is not None:
+                self.img_canvas.itemconfigure(self._img_window, state="normal")
+                self._apply_img_scrollregion()
+        except Exception:
+            pass
+        if self._pending_catalog_pull:
+            self._pending_catalog_pull = False
+            try:
+                self._on_catalog_pulled()
+            except Exception:
+                pass
+        if self._pending_list_busy:
+            self._pending_list_busy = False
+            try:
+                self._refresh_list_busy()
+            except Exception:
+                pass
 
     def _mall_watch_seen_path(self) -> pathlib.Path:
         return pathlib.Path(data_path("mall_watch_seen.json"))
@@ -2197,6 +2776,9 @@ class ManagerApp(tk.Tk):
 
     def _on_catalog_pulled(self) -> None:
         """Refresh list after remote sync; reload open detail if DB is newer than the form."""
+        if self._move_light_on or self._sizemove_active:
+            self._pending_catalog_pull = True
+            return
         try:
             self._apply_sync_status()
         except Exception:
@@ -2208,7 +2790,7 @@ class ManagerApp(tk.Tk):
         if self._form_loading or self._ime_composing:
             return
         try:
-            if mode == "products" and cur_id is not None:
+            if mode in ("products", "publish_fail", "publishing") and cur_id is not None:
                 p = self.store.get(cur_id)
                 if p and (
                     not self._detail_loaded_at
@@ -2366,7 +2948,7 @@ class ManagerApp(tk.Tk):
             self._mark_catalog_dirty()
             self._sync.force_full_sync()
             self._apply_role_ui()
-            self._append(f"[동기화] Supabase 설정 저장 — {role_label()} · 전체 목록 맞추기")
+            self._append(f"[동기화] Supabase 설정 저장 — {role_label()} · 전체 목록 맞추기", channel=LOG_OTHER)
             win.destroy()
 
         btn = tk.Frame(win, bg="#f3efe8")
@@ -2386,7 +2968,7 @@ class ManagerApp(tk.Tk):
             btn,
             text="전체 목록 맞추기",
             command=lambda: (
-                self._append("[동기화] 전체 목록 맞추기 요청"),
+                self._append("[동기화] 전체 목록 맞추기 요청", channel=LOG_OTHER),
                 self._sync.force_full_sync(),
             ),
             font=("Malgun Gothic", 10, "bold"),
@@ -2409,7 +2991,7 @@ class ManagerApp(tk.Tk):
         )
 
     def _put_log(self, msg: str, *, channel: str | None = None) -> None:
-        """Thread-safe log enqueue. channel: collect | mall | search."""
+        """Thread-safe log enqueue."""
         self._log_q.put((channel or "", msg))
 
     def _channel_from_running_jobs(self) -> str | None:
@@ -2421,14 +3003,15 @@ class ManagerApp(tk.Tk):
         if "publish" in jobs:
             chans.append(LOG_MALL)
         if jobs & {"collect", "import", "launch"}:
-            chans.append(LOG_COLLECT)
+            chans.append(LOG_COLLECT_WEIGOU)
+        if "wecatalog" in jobs:
+            chans.append(LOG_COLLECT_WECATALOG)
         if len(chans) == 1:
             return chans[0]
         return None
 
     def _infer_log_channel(self, msg: str) -> str:
         text = msg or ""
-        # 명확한 키워드 우선
         if any(
             k in text
             for k in (
@@ -2445,6 +3028,17 @@ class ManagerApp(tk.Tk):
         if any(
             k in text
             for k in (
+                "[동기화]",
+                "동기화 설정",
+                "업로드 완료",
+                "폴더 재확인",
+                "업데이트",
+            )
+        ):
+            return LOG_OTHER
+        if any(
+            k in text
+            for k in (
                 "홈페이지 등록",
                 "홈페이지 재등록",
                 "재등록",
@@ -2457,9 +3051,20 @@ class ManagerApp(tk.Tk):
                 "등록 실패",
                 "등록 완료",
                 "등록 중",
+                "한→영",
+                "제외됨",
+                "제외 해제",
             )
         ):
             return LOG_MALL
+        if any(
+            k in text
+            for k in (
+                "wecatalog",
+                "목록 대조",
+            )
+        ):
+            return LOG_COLLECT_WECATALOG
         if any(
             k in text
             for k in (
@@ -2468,26 +3073,25 @@ class ManagerApp(tk.Tk):
                 "PageDown",
                 "목록→상세",
                 "디버그",
-                "동기화",
-                "제외됨",
-                "제외 해제",
                 "이미지 부족",
                 "세션 한도",
                 "목록 로딩",
+                "수집 계속",
+                "수집 일시정지",
+                "微购",
             )
         ):
-            return LOG_COLLECT
+            return LOG_COLLECT_WEIGOU
         job_ch = self._channel_from_running_jobs()
         if job_ch:
             return job_ch
-        return LOG_COLLECT
+        return LOG_OTHER
 
     def _append(self, msg: str, *, channel: str | None = None) -> None:
         if not msg:
             return
         ch = channel if channel in LOG_CHANNELS else self._infer_log_channel(msg)
         stamp = dt.datetime.now().strftime("%H:%M:%S")
-        # 여러 줄이면 첫 줄에만 시각 표시
         lines = msg.replace("\r\n", "\n").replace("\r", "\n")
         if not lines.endswith("\n"):
             lines += "\n"
@@ -2503,15 +3107,9 @@ class ManagerApp(tk.Tk):
             widget.see("end")
             widget.configure(state="disabled")
 
-        # 상품관리 하단 미리보기 (채널 태그 포함)
-        if self._log_recent is not None:
-            tag = LOG_CHANNEL_LABELS.get(ch, ch)
-            # 라벨이 길면 짧게
-            short = {
-                LOG_COLLECT: "수집",
-                LOG_MALL: "등록",
-                LOG_SEARCH: "검색",
-            }.get(ch, ch)
+        # 상품관리 하단 미리보기 = 수집(좌·우) 로그만
+        if self._log_recent is not None and ch in LOG_COLLECT_CHANNELS:
+            short = "微购" if ch == LOG_COLLECT_WEIGOU else "wecatalog"
             preview = body
             if preview.startswith(f"[{stamp}] "):
                 preview = f"[{stamp}][{short}] " + preview[len(f"[{stamp}] ") :]
@@ -2519,7 +3117,6 @@ class ManagerApp(tk.Tk):
                 preview = f"[{short}] {preview}"
             self._log_recent.insert("end", preview)
             self._log_recent.see("end")
-            # 미리보기는 최근 800줄만 유지
             try:
                 total = int(float(self._log_recent.index("end-1c").split(".")[0]))
                 if total > 800:
@@ -2538,10 +3135,11 @@ class ManagerApp(tk.Tk):
     def _clear_current_log_tab(self) -> None:
         try:
             idx = self.log_nb.index(self.log_nb.select())
-            ch = LOG_CHANNELS[idx]
+            channels = self._log_nb_tab_channels[idx]
         except Exception:
-            ch = LOG_COLLECT
-        self._clear_log_channel(ch)
+            channels = LOG_COLLECT_CHANNELS
+        for ch in channels:
+            self._clear_log_channel(ch)
 
     def _clear_all_logs(self) -> None:
         for ch in LOG_CHANNELS:
@@ -2550,7 +3148,6 @@ class ManagerApp(tk.Tk):
             self._log_recent.delete("1.0", "end")
 
     def _poll_log(self) -> None:
-        # channel → lines
         buckets: dict[str, list[str]] = {c: [] for c in LOG_CHANNELS}
         while True:
             try:
@@ -2575,6 +3172,9 @@ class ManagerApp(tk.Tk):
     def _status_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                if self._move_light_on or self._sizemove_active:
+                    self._stop.wait(0.5)
+                    continue
                 running = is_running()
                 cdp = is_cdp_up(DEFAULT_PORT)
                 if cdp:
@@ -2587,11 +3187,13 @@ class ManagerApp(tk.Tk):
                     album = "앨범: 미실행"
                     album_fg = "#b91c1c"
                 try:
-                    ex_n = len(self.store.list_excluded())
-                    pub_n = len(self.store.list_published())
+                    ex_n = int(self.store.count_excluded() or 0)
+                    pub_n = int(self.store.count_published() or 0)
+                    unpub_n = int(self.store.count_unpublished() or 0)
                 except Exception:
                     ex_n = 0
                     pub_n = 0
+                    unpub_n = 0
                 n = len(self.products)
                 mode = self.list_mode.get()
                 jobs = self._jobs_status_text()
@@ -2600,24 +3202,36 @@ class ManagerApp(tk.Tk):
                     counts = f"제외 목록 {ex_n}개{job_bit}"
                 elif mode == "published":
                     counts = f"등록 목록 {pub_n}개{job_bit}"
+                elif mode == "unpublished":
+                    counts = f"등록해제 보관 {unpub_n}개{job_bit}"
+                elif mode == "publish_fail":
+                    try:
+                        fail_n = int(self.store.count_publish_failures() or 0)
+                    except Exception:
+                        fail_n = n
+                    counts = f"등록실패 {fail_n}개{job_bit}"
+                elif mode == "publishing":
+                    counts = f"제품등록중 {n}개{job_bit}"
                 else:
-                    counts = f"상품 {n}개  ·  등록 {pub_n}개  ·  제외 {ex_n}개{job_bit}"
+                    counts = (
+                        f"상품 {n}개  ·  등록 {pub_n}개  ·  제외 {ex_n}개"
+                        f"  ·  등록해제 {unpub_n}개{job_bit}"
+                    )
 
                 def _apply(
                     a=album,
                     af=album_fg,
                     c=counts,
                 ) -> None:
+                    if self._move_light_on or self._sizemove_active:
+                        return
                     self.album_status.set(a)
                     try:
                         self._album_status_lbl.configure(fg=af)
                     except Exception:
                         pass
                     self.status.set(c)
-                    try:
-                        self._apply_sync_status()
-                    except Exception:
-                        pass
+                    # sync banner는 CatalogSyncService on_status에서만 갱신 (2초마다 재배치 금지)
 
                 self.after(0, _apply)
             except Exception:
@@ -2625,16 +3239,21 @@ class ManagerApp(tk.Tk):
             self._stop.wait(2.0)
 
     def _job_start(self, name: str) -> bool:
-        """Start a named job. Same name cannot overlap; different jobs can run together.
+        """Start a named job. Same name cannot overlap.
 
-        collect/import share the Weigou CDP browser — only one of them at a time.
+        - weigou ``collect`` / ``import`` share 微购 CDP → exclusive with each other
+        - ``wecatalog`` uses separate Chrome → can run alongside weigou collect
+        - publish / search always parallel with collect
         """
         with self._jobs_lock:
             if name in self._jobs:
                 return False
-            if name in ("collect", "import"):
-                if "collect" in self._jobs or "import" in self._jobs:
-                    return False
+            if name == "collect" and "import" in self._jobs:
+                return False
+            if name == "import" and (
+                "collect" in self._jobs or "import" in self._jobs
+            ):
+                return False
             self._jobs.add(name)
         self.after(0, self._refresh_job_banner)
         return True
@@ -2642,9 +3261,22 @@ class ManagerApp(tk.Tk):
     def _job_end(self, name: str) -> None:
         with self._jobs_lock:
             self._jobs.discard(name)
-        # Clear banner bit for finished job family
-        if name in ("collect", "import", "launch"):
-            self._job_banner_bits.pop(LOG_COLLECT, None)
+            clear_weigou_cancel = (
+                name in ("collect", "import")
+                and "collect" not in self._jobs
+                and "import" not in self._jobs
+            )
+            clear_wecatalog_cancel = name == "wecatalog" and "wecatalog" not in self._jobs
+            collect_family_left = bool(
+                self._jobs & {"collect", "wecatalog", "import", "launch"}
+            )
+        if clear_weigou_cancel:
+            self._cancel_job.clear()
+        if clear_wecatalog_cancel:
+            self._cancel_wecatalog.clear()
+        if name in ("collect", "wecatalog", "import", "launch") and not collect_family_left:
+            for ch in LOG_COLLECT_CHANNELS:
+                self._job_banner_bits.pop(ch, None)
         elif name == "publish":
             self._job_banner_bits.pop(LOG_MALL, None)
         elif name == "search":
@@ -2665,7 +3297,7 @@ class ManagerApp(tk.Tk):
             # Prefer live progress label (e.g. 사이트맞추기중) over generic job name
             ch = self._job_log_channel.get(n)
             bit = self._job_banner_bits.get(ch or "", "") if ch else ""
-            if bit:
+            if bit and n in ("publish", "search"):
                 parts.append(bit)
             else:
                 parts.append(f"{self._job_labels.get(n, n)} 중")
@@ -2679,8 +3311,12 @@ class ManagerApp(tk.Tk):
         except Exception:
             jobs = set()
         parts: list[str] = []
-        if jobs & {"collect", "import"}:
-            parts.append(self._job_banner_bits.get(LOG_COLLECT) or "수집진행중")
+        if "collect" in jobs:
+            parts.append("微购수집중")
+        if "wecatalog" in jobs:
+            parts.append("wecatalog수집중")
+        if "import" in jobs:
+            parts.append("가져오기중")
         if "publish" in jobs:
             parts.append(self._job_banner_bits.get(LOG_MALL) or "홈페이지등록중")
         if "search" in jobs:
@@ -2691,8 +3327,10 @@ class ManagerApp(tk.Tk):
             pass
 
     def _banner_label_for_channel(self, channel: str) -> str:
-        if channel == LOG_COLLECT:
-            return "수집진행중"
+        if channel == LOG_COLLECT_WEIGOU:
+            return "微购수집중"
+        if channel == LOG_COLLECT_WECATALOG:
+            return "wecatalog수집중"
         if channel == LOG_MALL:
             return "홈페이지등록중"
         if channel == LOG_SEARCH:
@@ -2704,10 +3342,15 @@ class ManagerApp(tk.Tk):
         extra = ""
         if name in ("collect", "import"):
             if self._job_running("collect") and name == "import":
-                label = "자동수집"
+                label = "微购 자동수집"
             elif self._job_running("import") and name == "collect":
                 label = "가져오기"
-            extra = "\n(수집·가져오기는 微购 화면을 같이 쓰므로 동시에 할 수 없습니다)"
+            extra = (
+                "\n(微购 자동수집·가져오기는 같은 앨범 화면을 쓰므로 동시에 할 수 없습니다)"
+                "\nwecatalog 수집은 별도 Chrome이라 微购 수집과 함께 실행할 수 있습니다."
+            )
+        elif name == "wecatalog":
+            extra = "\n(wecatalog 수집·목록 대조는 한 번에 하나만)"
         messagebox.showinfo(
             "진행 중",
             f"이미 [{label}] 작업이 실행 중입니다.{extra}\n"
@@ -2736,14 +3379,140 @@ class ManagerApp(tk.Tk):
 
         self._collect_refresh_after = self.after(700, _do)
 
+    def _apply_img_scrollregion(self) -> None:
+        try:
+            w = int(self.img_canvas.winfo_width() or 0)
+            if w > 40:
+                self._img_canvas_last_w = w
+                self.img_canvas.itemconfigure(self._img_window, width=w)
+            self.img_canvas.configure(scrollregion=self.img_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _schedule_img_scrollregion(self) -> None:
+        if self._img_frame_cfg_after is not None:
+            try:
+                self.after_cancel(self._img_frame_cfg_after)
+            except Exception:
+                pass
+        self._img_frame_cfg_after = self.after(50, self._finish_img_frame_configure)
+
+    def _finish_img_frame_configure(self) -> None:
+        self._img_frame_cfg_after = None
+        self._apply_img_scrollregion()
+
+    def _busy_state_key(self) -> tuple:
+        with self._publish_lock:
+            inflight = frozenset(self._publish_in_flight_ids())
+            order = tuple(self._publish_order)
+            pub_active = self._publish_active_id
+        return (
+            self.list_mode.get(),
+            inflight,
+            order,
+            pub_active,
+            self._search_active_id,
+            frozenset(self._search_queued_ids),
+            self._republish_active_id,
+            frozenset(self._republish_queued_ids),
+        )
+
+    def _list_busy_needs_full_refresh(
+        self, prev: tuple, cur: tuple
+    ) -> bool:
+        if not prev:
+            return False
+        if prev[0] != cur[0]:
+            return True
+        mode = cur[0]
+        if mode == "publishing":
+            return prev[2] != cur[2]
+        if mode in ("products", "publish_fail"):
+            return prev[1] != cur[1]
+        return False
+
+    def _update_list_lines_inplace(self) -> None:
+        """Refresh row labels/colors only — no SQLite or list rebuild."""
+        mode = self.list_mode.get()
+        try:
+            n = int(self.listbox.size())
+        except Exception:
+            return
+        if mode == "published":
+            for i, item in enumerate(self.published_items):
+                if i >= n:
+                    break
+                line = self._format_published_list_line(item)
+                try:
+                    if self.listbox.get(i) != line:
+                        self.listbox.delete(i)
+                        self.listbox.insert(i, line)
+                except Exception:
+                    pass
+            return
+        if mode not in ("products", "publish_fail", "publishing"):
+            return
+        for i, p in enumerate(self.products):
+            if i >= n:
+                break
+            line = self._format_product_list_line(p)
+            try:
+                if self.listbox.get(i) != line:
+                    self.listbox.delete(i)
+                    self.listbox.insert(i, line)
+            except Exception:
+                pass
+        self._paint_product_list_styles()
+
+    def _do_refresh_list_busy(self) -> None:
+        self._list_busy_after = None
+        if self.list_mode.get() not in (
+            "products",
+            "published",
+            "publish_fail",
+            "publishing",
+        ):
+            return
+        key = self._busy_state_key()
+        need_full = self._list_busy_needs_full_refresh(self._list_busy_last_key, key)
+        self._list_busy_last_key = key
+        if need_full:
+            self.refresh_list(reload_detail=False, quiet=True)
+        else:
+            self._update_list_lines_inplace()
+
+    def _refresh_list_busy(self) -> None:
+        """Debounced list refresh — tint busy rows without full DB reload."""
+        if self._move_light_on or self._sizemove_active:
+            self._pending_list_busy = True
+            return
+        if self._list_busy_after is not None:
+            try:
+                self.after_cancel(self._list_busy_after)
+            except Exception:
+                pass
+        self._list_busy_after = self.after(120, self._do_refresh_list_busy)
+
+    def _finish_list_mode(self) -> None:
+        self._list_mode_after = None
+        self._list_busy_last_key = ()
+        self.refresh_list()
+
     def _on_list_mode(self) -> None:
         self.current_id = None
         self.current_excluded_id = None
         self.current_published_id = None
+        self.current_unpublished_id = None
         self._sticky_selected_ids = []
         self._list_page = 0
         self._apply_mode_buttons()
-        self.refresh_list()
+        if self._list_mode_after is not None:
+            try:
+                self.after_cancel(self._list_mode_after)
+            except Exception:
+                pass
+        # 탭 전환 UI 먼저 그린 뒤 목록 로드 (체감 렉 완화)
+        self._list_mode_after = self.after_idle(self._finish_list_mode)
 
     def _reset_list_page_and_refresh(self, *_args) -> None:
         self._list_page = 0
@@ -2792,6 +3561,27 @@ class ManagerApp(tk.Tk):
             tags.append("등록대기")
         return tags
 
+    def _is_product_edit_mode(self) -> bool:
+        """상품관리 또는 등록실패 탭 — 등록/제외/검색 등 편집 가능."""
+        return self.list_mode.get() in ("products", "publish_fail")
+
+    def _is_product_form_mode(self) -> bool:
+        """상품 폼(상세)을 쓰는 탭 — 제품등록중 포함."""
+        return self.list_mode.get() in ("products", "publish_fail", "publishing")
+
+    def _publish_in_flight_ids(self) -> set[int]:
+        with self._publish_lock:
+            ids = set(self._publish_queued_ids)
+            if self._publish_active_id is not None:
+                ids.add(int(self._publish_active_id))
+            # order 에만 남은 항목도 포함 (표시 일관성)
+            ids.update(int(x) for x in self._publish_order)
+            return ids
+
+    def _publish_ordered_ids(self) -> list[int]:
+        with self._publish_lock:
+            return [int(x) for x in self._publish_order]
+
     def _format_product_list_line(self, p: Product) -> str:
         cat = p.category or "?"
         name = p.google_name or p.title or "(제목 없음)"
@@ -2800,11 +3590,47 @@ class ManagerApp(tk.Tk):
         ref = self._shared_list_ref(search_code=p.search_code, goods_id=p.goods_id)
         tags = self._product_busy_tags(p.id)
         badge = "".join(f"[{t}]" for t in tags)
-        return f"{badge}[{cat}] #{ref} {name}"
+        fail_prefix = ""
+        if self.list_mode.get() == "publish_fail":
+            err = (self.publish_fail_errors.get(p.id) or "").replace("\n", " ").strip()
+            if len(err) > 36:
+                err = err[:36] + "…"
+            fail_prefix = f"[실패{('·' + err) if err else ''}]"
+        # 이미지가 저장된 원본 폴더는 상품 DB id와 동일함: data/catalog/images/{id}
+        return f"{fail_prefix}{badge}[{cat}] #{ref} [폴더:{p.id}] {name}"
+
+    def _published_busy_tags(self, published_id: int) -> list[str]:
+        tags: list[str] = []
+        if published_id == self._republish_active_id:
+            tags.append("재등록중")
+        elif published_id in self._republish_queued_ids:
+            tags.append("재등록대기")
+        return tags
+
+    def _format_published_list_line(self, item: PublishedItem) -> str:
+        cat = item.category or "?"
+        name = item.google_name or item.title or "(제목 없음)"
+        if len(name) > 48:
+            name = name[:48] + "…"
+        ref = self._shared_list_ref(
+            search_code=item.search_code, goods_id=item.goods_id
+        )
+        color = f" · {item.colors}" if item.colors else ""
+        busy = "".join(f"[{t}]" for t in self._published_busy_tags(item.id))
+        if item.recommended:
+            slot = recommend_slots_for_category(item.category)
+            slot_ko = {"bag": "가방", "clothes": "옷", "accessory": "악세사리"}.get(
+                slot[0] if slot else "", ""
+            )
+            rec = f"[추천·{slot_ko}]" if slot_ko else "[추천]"
+        else:
+            rec = "[등록]"
+        # 등록 이미지 폴더: data/catalog/published_covers/p{id}
+        return f"{busy}{rec}[{cat}] #{ref} [폴더:p{item.id}] {name}{color}"
 
     def _paint_product_list_styles(self) -> None:
         """Tint busy rows (search=amber, publish=blue) after list rebuild."""
-        if self.list_mode.get() != "products":
+        if self.list_mode.get() not in ("products", "publish_fail", "publishing"):
             return
         try:
             n = int(self.listbox.size())
@@ -2815,10 +3641,18 @@ class ManagerApp(tk.Tk):
                 break
             tags = self._product_busy_tags(p.id)
             try:
-                if "검색중" in tags:
+                if self.list_mode.get() == "publish_fail" and not tags:
+                    self.listbox.itemconfig(i, bg="#fde8e8", fg="#5c1010")
+                elif self.list_mode.get() == "publishing" or "등록중" in tags:
+                    if "등록중" in tags or (
+                        self.list_mode.get() == "publishing"
+                        and p.id == self._publish_active_id
+                    ):
+                        self.listbox.itemconfig(i, bg="#b8d4f0", fg="#0b3d66")
+                    else:
+                        self.listbox.itemconfig(i, bg="#e3eef8", fg="#1e3a5f")
+                elif "검색중" in tags:
                     self.listbox.itemconfig(i, bg="#ffe8a3", fg="#5c4800")
-                elif "등록중" in tags:
-                    self.listbox.itemconfig(i, bg="#b8d4f0", fg="#0b3d66")
                 elif "검색대기" in tags:
                     self.listbox.itemconfig(i, bg="#fff6d9", fg="#6b5720")
                 elif "등록대기" in tags:
@@ -2827,12 +3661,6 @@ class ManagerApp(tk.Tk):
                     self.listbox.itemconfig(i, bg="#fffdf9", fg="#222222")
             except Exception:
                 pass
-
-    def _refresh_list_busy(self) -> None:
-        """Quiet list refresh so busy tags/colors stay current during jobs."""
-        if self.list_mode.get() != "products":
-            return
-        self.refresh_list(reload_detail=False, quiet=True)
 
     def _set_search_busy(
         self, active: int | None, queued: set[int] | None = None
@@ -2856,59 +3684,100 @@ class ManagerApp(tk.Tk):
 
     def _apply_mode_buttons(self) -> None:
         mode = self.list_mode.get()
-        self.btn_save.pack_forget()
-        self.btn_publish.pack_forget()
-        self.btn_exclude.pack_forget()
-        self.btn_merge_images.pack_forget()
-        self.btn_delete.pack_forget()
-        self.btn_unexclude.pack_forget()
-        self.btn_unpublish.pack_forget()
-        self.btn_republish.pack_forget()
-        self.btn_reconcile_site.pack_forget()
-        self.btn_recommend.pack_forget()
-        self.btn_unrecommend.pack_forget()
-        self.btn_ai_select.pack_forget()
-        self.btn_ai_apply.pack_forget()
+        folder_btns = [
+            self.btn_folder_open,
+            self.btn_folder_recheck,
+            self.btn_folder_copy,
+        ]
         if mode == "excluded":
-            self.btn_unexclude.pack(side="left", padx=6)
+            visible = [self.btn_unexclude, *folder_btns]
             self.listbox.configure(selectmode=tk.EXTENDED)
             self.chk_recommended_only.configure(state="disabled")
             self.chk_searched_only.configure(state="disabled")
             self.list_hint.configure(text="Ctrl·Shift 클릭으로 여러 개 선택 → 제외 해제")
+            self.btn_publish.configure(text="홈페이지 등록")
+        elif mode == "unpublished":
+            visible = [
+                self.btn_republish_unpublished,
+                self.btn_delete_unpublished,
+                *folder_btns,
+            ]
+            self.listbox.configure(selectmode=tk.EXTENDED)
+            self.chk_recommended_only.configure(state="disabled")
+            self.chk_searched_only.configure(state="disabled")
+            self.btn_publish.configure(text="홈페이지 등록")
+            self.list_hint.configure(
+                text="홈페이지에서 뺀 상품 보관함 · [다시 등록] 또는 [보관함에서 삭제]"
+            )
+        elif mode == "publish_fail":
+            visible = [
+                self.btn_save,
+                self.btn_publish,
+                self.btn_clear_publish_fail,
+                self.btn_exclude,
+                self.btn_merge_images,
+                self.btn_delete,
+                *folder_btns,
+            ]
+            self.listbox.configure(selectmode=tk.EXTENDED)
+            self.chk_recommended_only.configure(state="disabled")
+            self.chk_searched_only.configure(state="disabled")
+            self.btn_publish.configure(text="홈페이지 재등록")
+            self.list_hint.configure(
+                text="등록 실패 상품 · 수정 후 [홈페이지 재등록] · [실패목록에서 제거]로만 목록 정리"
+            )
+        elif mode == "publishing":
+            visible = [*folder_btns]
+            self.listbox.configure(selectmode=tk.EXTENDED)
+            self.chk_recommended_only.configure(state="disabled")
+            self.chk_searched_only.configure(state="disabled")
+            self.btn_publish.configure(text="홈페이지 등록")
+            self.list_hint.configure(
+                text="홈페이지 제품 등록중 · 완료되면 [등록] 또는 [실패] 탭으로 이동합니다"
+            )
         elif mode == "published":
-            self.btn_republish.pack(side="left", padx=6)
-            self.btn_merge_images.pack(side="left", padx=6)
-            self.btn_reconcile_site.pack(side="left", padx=6)
-            self.btn_recommend.pack(side="left", padx=6)
-            self.btn_unrecommend.pack(side="left", padx=6)
-            self.btn_unpublish.pack(side="left", padx=6)
-            self.btn_ai_select.pack(side="left", padx=6)
-            self.btn_ai_apply.pack(side="left", padx=6)
-            # 일반 클릭=1개, Ctrl/Shift=다중 (MULTIPLE 토글 방식 아님)
+            visible = [
+                self.btn_republish,
+                self.btn_merge_images,
+                self.btn_reconcile_site,
+                self.btn_recommend,
+                self.btn_unrecommend,
+                self.btn_unpublish,
+                self.btn_ai_select,
+                self.btn_ai_apply,
+                self.btn_find_by_image,
+                *folder_btns,
+            ]
             self.listbox.configure(selectmode=tk.EXTENDED)
             self.chk_recommended_only.configure(state="normal")
             self.chk_searched_only.configure(state="disabled")
+            self.btn_publish.configure(text="홈페이지 등록")
             if self.filter_recommended_only.get():
                 self.list_hint.configure(
                     text="추천 상품만 표시 중 · [추천 해제]로 목록에서 빠짐"
                 )
             else:
                 self.list_hint.configure(
-                    text="먼저 클릭한 상품이 기준 · Ctrl/Shift 추가 → 이미지 합치기/재등록/추천"
+                    text="먼저 클릭한 상품이 기준 · [이미지로 찾기]=등록폴더 검색 · Ctrl/Shift 추가"
                 )
         else:
-            self.btn_save.pack(side="left")
-            self.btn_publish.pack(side="left", padx=6)
-            self.btn_exclude.pack(side="left", padx=6)
-            self.btn_merge_images.pack(side="left", padx=6)
-            self.btn_delete.pack(side="left", padx=6)
+            visible = [
+                self.btn_save,
+                self.btn_publish,
+                self.btn_exclude,
+                self.btn_merge_images,
+                self.btn_delete,
+                *folder_btns,
+            ]
             self.listbox.configure(selectmode=tk.EXTENDED)
             self.chk_recommended_only.configure(state="disabled")
             self.chk_searched_only.configure(state="normal")
+            self.btn_publish.configure(text="홈페이지 등록")
             hint = "먼저 클릭한 상품이 기준(상세) · Ctrl/Shift로 추가 → 등록/제외/이미지 합치기"
             if self.filter_searched_only.get():
                 hint = "검색완료(제품명 있음)만 표시 중 · " + hint
             self.list_hint.configure(text=hint)
+        self.btn_bar.set_visible(visible)
 
     def _list_entity_ids(self) -> list[int]:
         """Current listbox row → entity ids for active mode."""
@@ -2917,6 +3786,8 @@ class ManagerApp(tk.Tk):
             return [int(x.id) for x in self.excluded_items]
         if mode == "published":
             return [int(x.id) for x in self.published_items]
+        if mode == "unpublished":
+            return [int(x.id) for x in self.unpublished_items]
         return [int(x.id) for x in self.products]
 
     def _ids_from_listbox_selection(self) -> list[int]:
@@ -2954,6 +3825,8 @@ class ManagerApp(tk.Tk):
             current = self.current_excluded_id
         elif mode == "published":
             current = self.current_published_id
+        elif mode == "unpublished":
+            current = self.current_unpublished_id
         else:
             current = self.current_id
         # 포커스 중인 항목은 선택에 꼭 포함
@@ -3037,7 +3910,9 @@ class ManagerApp(tk.Tk):
                 return
             if mode == "published" and self.current_published_id == current:
                 return
-            if mode == "products" and self.current_id == current:
+            if mode == "unpublished" and self.current_unpublished_id == current:
+                return
+            if mode in ("products", "publish_fail", "publishing") and self.current_id == current:
                 return
             # quiet + reload_detail 이더라도 선택만 복원하고 상세는 건드리지 않음
             return
@@ -3046,6 +3921,8 @@ class ManagerApp(tk.Tk):
             self._show_excluded(self.excluded_items[activate_idx])
         elif mode == "published":
             self._show_published(self.published_items[activate_idx])
+        elif mode == "unpublished":
+            self._show_unpublished(self.unpublished_items[activate_idx])
         else:
             self._show_product(self.products[activate_idx])
 
@@ -3111,6 +3988,7 @@ class ManagerApp(tk.Tk):
             self._update_list_page_label(len(self.excluded_items))
             self.products = []
             self.published_items = []
+            self.unpublished_items = []
             for item in self.excluded_items:
                 cat = item.category or "?"
                 name = item.title or "(제목 없음)"
@@ -3159,31 +4037,16 @@ class ManagerApp(tk.Tk):
             self._update_list_page_label(len(self.published_items))
             self.products = []
             self.excluded_items = []
+            self.unpublished_items = []
             for item in self.published_items:
-                cat = item.category or "?"
-                name = item.google_name or item.title or "(제목 없음)"
-                if len(name) > 52:
-                    name = name[:52] + "…"
-                ref = self._shared_list_ref(
-                    search_code=item.search_code, goods_id=item.goods_id
-                )
-                color = f" · {item.colors}" if item.colors else ""
-                if item.recommended:
-                    slot = recommend_slots_for_category(item.category)
-                    slot_ko = {"bag": "가방", "clothes": "옷", "accessory": "악세사리"}.get(
-                        slot[0] if slot else "", ""
-                    )
-                    rec = f"[추천·{slot_ko}]" if slot_ko else "[추천]"
-                else:
-                    rec = "[등록]"
-                self.listbox.insert(tk.END, f"{rec}[{cat}] #{ref} {name}{color}")
+                self.listbox.insert(tk.END, self._format_published_list_line(item))
             if rec_only:
                 self.list_hint.configure(
                     text=f"추천 상품만 {len(self.published_items)}건 · 체크 해제 시 전체 등록 목록"
                 )
             else:
                 self.list_hint.configure(
-                    text="클릭=1개 · [재등록]/[추천]/[추천 해제] · 「추천만」체크 가능"
+                    text="클릭=1개 · [폴더 재확인]→[재등록] · [추천] · 「추천만」체크 가능"
                 )
             if self.published_items:
                 self._restore_list_ui_state(
@@ -3204,11 +4067,154 @@ class ManagerApp(tk.Tk):
                     self._clear_detail()
             return
 
+        if mode == "unpublished":
+            _clamp_page(
+                self.store.count_unpublished(
+                    self.query.get(), category=self.filter_category.get()
+                )
+            )
+            self.unpublished_items = self.store.list_unpublished(
+                self.query.get(),
+                category=self.filter_category.get(),
+                limit=self._list_page_size,
+                offset=self._list_page * self._list_page_size,
+            )
+            self._update_list_page_label(len(self.unpublished_items))
+            self.products = []
+            self.excluded_items = []
+            self.published_items = []
+            self.unpublished_items = []
+            for item in self.unpublished_items:
+                cat = item.category or "?"
+                name = (item.google_name or item.title or "(제목 없음)").strip()
+                if len(name) > 48:
+                    name = name[:48] + "…"
+                ref = self._shared_list_ref(
+                    search_code=item.search_code, goods_id=item.goods_id
+                )
+                self.listbox.insert(tk.END, f"[등록해제][{cat}] #{ref} {name}")
+            if self.unpublished_items:
+                self._restore_list_ui_state(
+                    ui,
+                    preserve_yview=preserve_yview,
+                    reload_detail=reload_detail,
+                    quiet=quiet,
+                    focus_list=focus_list,
+                )
+                if not self._sticky_selected_ids and not quiet:
+                    self._focus_list_at(
+                        0, preserve_yview=preserve_yview, grab_focus=focus_list
+                    )
+                    if reload_detail:
+                        self._show_unpublished(self.unpublished_items[0])
+            else:
+                self.current_unpublished_id = None
+                self._sticky_selected_ids = []
+                if reload_detail and not quiet:
+                    self._clear_detail()
+            return
+
+        if mode == "publish_fail":
+            exclude_ids = self._publish_in_flight_ids()
+            _clamp_page(
+                self.store.count_publish_failures(
+                    self.query.get(),
+                    category=self.filter_category.get(),
+                    exclude_ids=exclude_ids,
+                )
+            )
+            self.products = self.store.list_publish_failures(
+                self.query.get(),
+                category=self.filter_category.get(),
+                limit=self._list_page_size,
+                offset=self._list_page * self._list_page_size,
+                exclude_ids=exclude_ids,
+            )
+            self.publish_fail_errors = self.store.publish_failure_errors(
+                [p.id for p in self.products]
+            )
+            self._update_list_page_label(len(self.products))
+            self.excluded_items = []
+            self.published_items = []
+            self.unpublished_items = []
+            for p in self.products:
+                self.listbox.insert(tk.END, self._format_product_list_line(p))
+            self._paint_product_list_styles()
+            if self.products:
+                self._restore_list_ui_state(
+                    ui,
+                    preserve_yview=preserve_yview,
+                    reload_detail=reload_detail,
+                    quiet=quiet,
+                    focus_list=focus_list,
+                )
+                if not self._sticky_selected_ids and not quiet:
+                    self._focus_list_at(
+                        0, preserve_yview=preserve_yview, grab_focus=focus_list
+                    )
+                    if reload_detail:
+                        self._show_product(self.products[0])
+            else:
+                if not quiet:
+                    self._sticky_selected_ids = []
+                    self.current_id = None
+                if reload_detail and not quiet:
+                    self._clear_detail()
+            return
+
+        if mode == "publishing":
+            order = self._publish_ordered_ids()
+            self._list_total = len(order)
+            self._list_page = 0
+            self.products = []
+            for pid in order:
+                p = self.store.get(pid)
+                if p:
+                    self.products.append(p)
+            self._update_list_page_label(len(self.products))
+            self.excluded_items = []
+            self.published_items = []
+            self.unpublished_items = []
+            for p in self.products:
+                self.listbox.insert(tk.END, self._format_product_list_line(p))
+            self._paint_product_list_styles()
+            if self.products:
+                self._restore_list_ui_state(
+                    ui,
+                    preserve_yview=preserve_yview,
+                    reload_detail=reload_detail,
+                    quiet=quiet,
+                    focus_list=focus_list,
+                )
+                if not self._sticky_selected_ids and not quiet:
+                    # 진행 중인 항목을 우선 표시
+                    focus_id = self._publish_active_id
+                    idx = 0
+                    if focus_id is not None:
+                        for i, p in enumerate(self.products):
+                            if p.id == focus_id:
+                                idx = i
+                                break
+                    self._focus_list_at(
+                        idx, preserve_yview=preserve_yview, grab_focus=focus_list
+                    )
+                    if reload_detail:
+                        self._show_product(self.products[idx])
+            else:
+                if not quiet:
+                    self._sticky_selected_ids = []
+                    self.current_id = None
+                if reload_detail and not quiet:
+                    self._clear_detail()
+            return
+
+        exclude_ids = self._publish_in_flight_ids()
         _clamp_page(
             self.store.count_products(
                 self.query.get(),
                 category=self.filter_category.get(),
                 searched_only=bool(self.filter_searched_only.get()),
+                exclude_ids=exclude_ids,
             )
         )
         self.products = self.store.list_products(
@@ -3217,10 +4223,12 @@ class ManagerApp(tk.Tk):
             limit=self._list_page_size,
             offset=self._list_page * self._list_page_size,
             searched_only=bool(self.filter_searched_only.get()),
+            exclude_ids=exclude_ids,
         )
         self._update_list_page_label(len(self.products))
         self.excluded_items = []
         self.published_items = []
+        self.unpublished_items = []
         for p in self.products:
             self.listbox.insert(tk.END, self._format_product_list_line(p))
         self._paint_product_list_styles()
@@ -3250,6 +4258,7 @@ class ManagerApp(tk.Tk):
             self.current_id = None
             self.current_excluded_id = None
             self.current_published_id = None
+            self.current_unpublished_id = None
             self._detail_loaded_at = ""
             self.title_var.set("")
             self.google_name_var.set("")
@@ -3305,6 +4314,9 @@ class ManagerApp(tk.Tk):
         elif mode == "published":
             current = self.current_published_id
             items_len = len(self.published_items)
+        elif mode == "unpublished":
+            current = self.current_unpublished_id
+            items_len = len(self.unpublished_items)
         else:
             current = self.current_id
             items_len = len(self.products)
@@ -3316,6 +4328,9 @@ class ManagerApp(tk.Tk):
                         return i
                 elif mode == "published":
                     if 0 <= i < items_len and self.published_items[i].id == current:
+                        return i
+                elif mode == "unpublished":
+                    if 0 <= i < items_len and self.unpublished_items[i].id == current:
                         return i
                 else:
                     if 0 <= i < items_len and self.products[i].id == current:
@@ -3349,6 +4364,12 @@ class ManagerApp(tk.Tk):
                 if self.current_published_id == item.id:
                     return
                 self._show_published(item)
+        elif mode == "unpublished":
+            if 0 <= idx < len(self.unpublished_items):
+                item = self.unpublished_items[idx]
+                if self.current_unpublished_id == item.id:
+                    return
+                self._show_unpublished(item)
         else:
             # 다른 항목 클릭 전 한글 조합 확정 + 현재 입력값 즉시 저장
             if self.current_id is not None:
@@ -3360,8 +4381,9 @@ class ManagerApp(tk.Tk):
                 if self.current_id == p.id:
                     return
                 self._show_product(p)
+
     def _selected_product_ids(self) -> list[int]:
-        if self.list_mode.get() != "products":
+        if not self._is_product_form_mode():
             return []
         sel = self.listbox.curselection()
         out: list[int] = []
@@ -3371,6 +4393,23 @@ class ManagerApp(tk.Tk):
         if not out and self.current_id is not None:
             out = [self.current_id]
         return out
+
+    def _on_clear_publish_fail(self) -> None:
+        if self.list_mode.get() != "publish_fail":
+            return
+        ids = self._selected_product_ids()
+        if not ids:
+            messagebox.showwarning("선택", "실패 목록에서 제거할 상품을 선택하세요.")
+            return
+        if not messagebox.askyesno(
+            "실패목록에서 제거",
+            f"선택한 {len(ids)}건을 실패 목록에서만 뺄까요?\n"
+            "(상품 자체는 상품 탭에 그대로 남습니다)",
+        ):
+            return
+        n = self.store.clear_publish_failures(ids)
+        self._append(f"등록 실패 목록에서 {n}건 제거", channel=LOG_MALL)
+        self.refresh_list(reload_detail=True)
 
     def _selected_published_ids(self) -> list[int]:
         if self.list_mode.get() != "published":
@@ -3395,6 +4434,210 @@ class ManagerApp(tk.Tk):
         if not out and self.current_excluded_id is not None:
             out = [self.current_excluded_id]
         return out
+
+    def _selected_unpublished_ids(self) -> list[int]:
+        if self.list_mode.get() != "unpublished":
+            return []
+        sel = self.listbox.curselection()
+        out: list[int] = []
+        for i in sel:
+            if 0 <= i < len(self.unpublished_items):
+                out.append(self.unpublished_items[i].id)
+        if not out and self.current_unpublished_id is not None:
+            out = [self.current_unpublished_id]
+        return out
+
+    def _selected_folder_labels(self) -> list[str]:
+        """목록에서 선택된 항목의 이미지 폴더명 (상품=숫자, 등록=p숫자)."""
+        mode = self.list_mode.get()
+        if mode == "published":
+            return [f"p{i}" for i in self._selected_published_ids()]
+        if mode == "unpublished":
+            return [f"u{i}" for i in self._selected_unpublished_ids()]
+        if mode in ("products", "publish_fail", "publishing"):
+            return [str(i) for i in self._selected_product_ids()]
+        if mode == "excluded":
+            # 제외 커버는 excluded_covers/{id}.* — id만 복사
+            return [str(i) for i in self._selected_excluded_ids()]
+        return []
+
+    def _on_copy_folder_numbers(self, _event: tk.Event | None = None) -> str | None:
+        """다중 선택한 폴더번호를 클립보드에 복사 (한 줄에 하나)."""
+        labels = self._selected_folder_labels()
+        if not labels:
+            messagebox.showwarning(
+                "폴더번호 복사",
+                "목록에서 상품을 선택하세요.\n(Ctrl·Shift로 여러 개 선택 가능)",
+            )
+            return "break"
+        text = "\n".join(labels)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+        except Exception as e:
+            messagebox.showerror("폴더번호 복사", f"클립보드 복사 실패: {e}")
+            return "break"
+        self.status.set(f"폴더번호 {len(labels)}개 복사됨")
+        self._put_log(
+            f"폴더번호 복사 ({len(labels)}): {', '.join(labels[:20])}"
+            + ("…" if len(labels) > 20 else ""),
+            channel=LOG_OTHER,
+        )
+        return "break"
+
+    def _jump_to_published(self, pub_id: int) -> bool:
+        """등록 목록에서 해당 id로 이동·상세 표시."""
+        item = self.store.get_published(pub_id)
+        if not item:
+            return False
+        if self.list_mode.get() != "published":
+            self.list_mode.set("published")
+        try:
+            self.filter_recommended_only.set(False)
+        except Exception:
+            pass
+        # 검색칸에 코드 넣어 목록에 나오게
+        q = (item.search_code or item.mall_id or "").strip()
+        if q:
+            self.query.set(q)
+        self._list_page = 0
+        self._apply_mode_buttons()
+        self.refresh_list(reload_detail=False, quiet=True)
+        for i, p in enumerate(self.published_items):
+            if p.id == pub_id:
+                self._focus_list_at(i, grab_focus=True)
+                self._show_published(p)
+                return True
+        # 필터에 안 걸려도 상세는 표시
+        self._show_published(item)
+        return True
+
+    def _on_find_published_by_image(self) -> None:
+        """로컬 등록 폴더(published_covers)에서 유사 이미지 상품 찾기 — 구글 아님."""
+        if self.list_mode.get() != "published":
+            self.list_mode.set("published")
+            self._apply_mode_buttons()
+            self.refresh_list(reload_detail=False, quiet=True)
+
+        path = filedialog.askopenfilename(
+            title="찾을 이미지 선택 (등록 폴더 내 검색)",
+            filetypes=[
+                ("이미지", "*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif"),
+                ("모든 파일", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        cancel = threading.Event()
+        self.status.set("등록 폴더 이미지 검색 중…")
+        self._put_log(
+            f"이미지로 찾기 시작: {pathlib.Path(path).name}",
+            channel=LOG_OTHER,
+        )
+
+        def work() -> None:
+            try:
+                hits = find_local_matches(
+                    path,
+                    self.store.published_img_root,
+                    cache_path=self.store.root / "local_image_index.json",
+                    top_n=20,
+                    max_distance=14,
+                    on_progress=lambda m: self._put_log(m, channel=LOG_OTHER),
+                    cancel=cancel,
+                )
+            except Exception as e:
+                self.after(
+                    0,
+                    lambda: messagebox.showerror("이미지로 찾기", str(e)),
+                )
+                self.after(0, lambda: self.status.set("이미지 검색 실패"))
+                return
+
+            def done() -> None:
+                self.status.set(f"이미지 검색 완료 · {len(hits)}건")
+                if not hits:
+                    messagebox.showinfo(
+                        "이미지로 찾기",
+                        "등록 폴더에서 비슷한 이미지를 찾지 못했습니다.\n"
+                        "다른 사진으로 다시 시도해 보세요.",
+                    )
+                    return
+                self._show_local_image_match_results(path, hits)
+
+            self.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_local_image_match_results(self, query_path: str, hits: list) -> None:
+        win = tk.Toplevel(self)
+        win.title("이미지로 찾기 — 등록 폴더")
+        win.geometry("720x480")
+        win.transient(self)
+        tk.Label(
+            win,
+            text=f"검색 이미지: {pathlib.Path(query_path).name}  ·  결과 {len(hits)}건",
+            font=("Malgun Gothic", 10, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(
+            win,
+            text="더블클릭 또는 [이동] → 등록 목록에서 해당 상품 열기",
+            font=("Malgun Gothic", 9),
+            fg="#666",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 6))
+
+        box = tk.Listbox(win, font=("Malgun Gothic", 10), activestyle="dotbox")
+        box.pack(fill="both", expand=True, padx=12, pady=4)
+        rows: list[int] = []
+        for h in hits:
+            item = self.store.get_published(h.published_id)
+            name = ""
+            code = ""
+            if item:
+                name = (item.google_name or item.title or "")[:40]
+                code = (item.search_code or "").strip()
+            label = (
+                f"[{h.score_label}] 폴더:{h.folder}"
+                + (f"  #{code}" if code else "")
+                + (f"  {name}" if name else "")
+            )
+            box.insert(tk.END, label)
+            rows.append(int(h.published_id))
+
+        def go(_event=None) -> None:
+            sel = box.curselection()
+            if not sel:
+                return
+            pub_id = rows[int(sel[0])]
+            ok = self._jump_to_published(pub_id)
+            if ok:
+                win.destroy()
+            else:
+                messagebox.showwarning("이동", f"등록 #{pub_id} 를 찾지 못했습니다.", parent=win)
+
+        box.bind("<Double-Button-1>", go)
+        btn = tk.Frame(win)
+        btn.pack(fill="x", padx=12, pady=10)
+        tk.Button(
+            btn,
+            text="이동",
+            command=go,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#0e7490",
+            fg="white",
+            relief="flat",
+            padx=14,
+        ).pack(side="left")
+        tk.Button(btn, text="닫기", command=win.destroy, bg="#ebe4da", relief="flat").pack(
+            side="right"
+        )
+        if rows:
+            box.selection_set(0)
+            box.activate(0)
 
     def _bind_ime_safe_entry(self, entry: tk.Entry) -> None:
         entry._ime_composing = False  # type: ignore[attr-defined]
@@ -3472,7 +4715,7 @@ class ManagerApp(tk.Tk):
         w = self.focus_get() or self._ime_focus_widget
         if w is not None:
             self._finalize_ime(w)
-            if self.current_id is not None and self.list_mode.get() == "products":
+            if self.current_id is not None and self._is_product_edit_mode():
                 self._schedule_soft_save(delay_ms=30)
 
     def _on_composition_start(self, event=None) -> None:
@@ -3514,6 +4757,8 @@ class ManagerApp(tk.Tk):
         mode = self.list_mode.get()
         if mode == "products" and self.current_id is not None:
             self._schedule_soft_save(delay_ms=50)
+        elif mode == "publish_fail" and self.current_id is not None:
+            self._schedule_soft_save(delay_ms=50)
         elif mode == "published" and self.current_published_id is not None:
             self._schedule_soft_save(delay_ms=50)
 
@@ -3538,7 +4783,7 @@ class ManagerApp(tk.Tk):
             sku = effective_price_code(self.sku_var.get())
             if not self.sku_var.get().strip():
                 self.sku_var.set(sku)
-            if mode == "products" and self.current_id is not None:
+            if mode in ("products", "publish_fail") and self.current_id is not None:
                 db = self.store.get(self.current_id)
                 if db and self._db_newer_than_form(db.updated_at):
                     # B(또는 원격)가 이미 저장함 — 낡은 폼으로 덮지 말고 화면만 맞춤
@@ -3605,7 +4850,7 @@ class ManagerApp(tk.Tk):
         self._photo_cache.clear()
         self._photo_refs.clear()
 
-    def _thumb(self, path: str, size: tuple[int, int] = (180, 180)) -> tk.PhotoImage | None:
+    def _thumb(self, path: str, size: tuple[int, int] = (120, 120)) -> tk.PhotoImage | None:
         p = pathlib.Path(path)
         if not p.is_file():
             return None
@@ -3631,7 +4876,7 @@ class ManagerApp(tk.Tk):
         except Exception:
             return None
 
-    def _thumb_from_url(self, url: str, size: tuple[int, int] = (180, 180)) -> tk.PhotoImage | None:
+    def _thumb_from_url(self, url: str, size: tuple[int, int] = (120, 120)) -> tk.PhotoImage | None:
         """Load remote preview via disk cache + CDN resize (may hit network)."""
         if Image is None or ImageTk is None:
             return None
@@ -3680,6 +4925,7 @@ class ManagerApp(tk.Tk):
         try:
             self.current_id = None
             self.current_published_id = None
+            self.current_unpublished_id = None
             self.current_excluded_id = item.id
             self.color_var.set("")
             self.size_var.set("")
@@ -3721,6 +4967,7 @@ class ManagerApp(tk.Tk):
         try:
             self.current_id = None
             self.current_excluded_id = None
+            self.current_unpublished_id = None
             self.current_published_id = item.id
             self.title_var.set(item.title)
             self.google_name_var.set(item.google_name)
@@ -3790,6 +5037,74 @@ class ManagerApp(tk.Tk):
             (fresh.updated_at if fresh else None) or item.updated_at
         )
 
+    def _show_unpublished(self, item: UnpublishedItem) -> None:
+        self._begin_form_load()
+        try:
+            self.current_id = None
+            self.current_excluded_id = None
+            self.current_published_id = None
+            self.current_unpublished_id = item.id
+            self.title_var.set(item.title)
+            self.google_name_var.set(item.google_name)
+            self.name_en_var.set(item.name_en)
+            self.code_var.set(item.search_code)
+            sku = (item.sku_no or "").strip() or DEFAULT_PRICE_TEXT
+            self.sku_var.set(sku)
+            self.tags_var.set(item.tags)
+            self.color_var.set(item.colors)
+            self.size_var.set(item.sizes)
+            if item.category:
+                self.category_var.set(item.category)
+            self.desc.delete("1.0", tk.END)
+            body = item.description.strip() if item.description else ""
+            meta = "\n".join(
+                x
+                for x in (
+                    "[등록해제 보관함]",
+                    "※ 홈페이지에서는 삭제된 상태입니다",
+                    "※ [홈페이지 다시 등록]으로 등록 목록에 되돌릴 수 있습니다",
+                    f"mall_id: {item.mall_id}" if item.mall_id else "",
+                    f"goods_id: {item.goods_id}" if item.goods_id else "",
+                    f"등록일: {item.created_at}" if item.created_at else "",
+                    f"해제일: {item.removed_at}" if item.removed_at else "",
+                    item.note,
+                )
+                if x
+            )
+            self.desc.insert("1.0", (body + "\n\n" + meta).strip() if body else meta)
+            self.price_preview.set(
+                preview_price(sku) + "  ·  등록해제 보관 — 홈페이지에는 없음"
+            )
+            self._clear_images()
+            try:
+                existing = self.store.ensure_unpublished_images(item.id)
+            except Exception:
+                existing = []
+            if not existing:
+                paths = list(item.image_paths) if item.image_paths else []
+                if not paths and item.cover_path:
+                    paths = [item.cover_path]
+                for pth in paths:
+                    if pth and pathlib.Path(pth).exists():
+                        existing.append(pth)
+            fresh_item = self.store.get_unpublished(item.id) or item
+            existing = self._order_cover_first(
+                existing, fresh_item.cover_path or ""
+            )
+            gen = self._select_gen
+            self._schedule_thumbs(
+                existing,
+                gen,
+                cover_only=True,
+                urls=list(fresh_item.image_urls or []),
+                cover_path=fresh_item.cover_path
+                or (existing[0] if existing else ""),
+                allow_set_cover=False,
+            )
+        finally:
+            self._end_form_load()
+        self._remember_detail_loaded(item.removed_at or item.updated_at)
+
     def _schedule_url_thumbs(self, urls: list[str], gen: int) -> None:
         """Fallback preview from remote image_urls — used before images are downloaded locally.
 
@@ -3800,8 +5115,8 @@ class ManagerApp(tk.Tk):
             tk.Label(self.img_frame, text="이미지 없음", bg="#fffdf9", fg="#888").pack(pady=20)
             return
 
-        # Cap preview count; cover first, rest in parallel.
-        urls = list(urls)[:24]
+        # Cap preview count; cover first.
+        urls = list(urls)[:1]
         placeholders: list[tk.Label] = []
         for index, _url in enumerate(urls):
             cell = tk.Frame(self.img_frame, bg="#fffdf9", padx=4, pady=4)
@@ -3919,77 +5234,146 @@ class ManagerApp(tk.Tk):
                 existing = []
         if not existing:
             if urls:
-                self._schedule_url_thumbs(list(urls)[:24], gen)
+                self._schedule_url_thumbs(list(urls)[:1], gen)
                 return
             tk.Label(self.img_frame, text="이미지 없음", bg="#fffdf9", fg="#888").pack(pady=20)
             return
 
         cover = (cover_path or "").strip() or (existing[0] if existing else "")
-        paths = self._order_cover_first(existing[:40], cover)
+        all_paths = self._order_cover_first(existing, cover)
+        # 창 이동 렉 방지: 기본은 대표 1장만 PhotoImage로 올림
+        self._gallery_paths = all_paths
+        self._gallery_cover = cover
+        self._gallery_gen = gen
+        self._gallery_allow_set_cover = allow_set_cover
+        self._gallery_expanded = False
+        show_paths = all_paths[:1] if not cover_only else all_paths[:1]
+        extra_n = max(0, len(all_paths) - 1)
 
-        def load_one(index: int = 0) -> None:
+        def _bind_thumb_widgets(cell: tk.Widget, lbl: tk.Widget, path: str, is_cover: bool) -> None:
+            if allow_set_cover and not cover_only:
+                def _set_cover(_e=None, pth=path, already=is_cover) -> None:
+                    if already:
+                        return
+                    self._on_set_cover_image(pth)
+
+                for w in (cell, lbl):
+                    w.bind("<Button-1>", _set_cover)
+                    w.configure(cursor="hand2")
+            handler = getattr(self, "_bind_img_mousewheel", None)
+            enter = getattr(self, "_img_wheel_bind", None)
+            leave = getattr(self, "_img_wheel_unbind", None)
+            for w in (cell, lbl):
+                if handler is not None:
+                    w.bind("<MouseWheel>", handler)
+                    w.bind("<Button-4>", handler)
+                    w.bind("<Button-5>", handler)
+                if enter is not None:
+                    w.bind("<Enter>", enter)
+                if leave is not None:
+                    w.bind("<Leave>", leave)
+
+        def _add_thumb(i: int, path: str) -> None:
+            if gen != self._select_gen:
+                return
+            is_cover = bool(cover) and self.store._same_image_file(path, cover)
+            cell_bg = "#ecfdf5" if is_cover else "#fffdf9"
+            cell = tk.Frame(self.img_frame, bg=cell_bg, padx=4, pady=4)
+            cell.grid(row=i // 3, column=i % 3, sticky="n")
+            if is_cover:
+                tk.Label(
+                    cell,
+                    text="대표",
+                    bg="#166534",
+                    fg="white",
+                    font=("Malgun Gothic", 8, "bold"),
+                    padx=6,
+                ).pack(anchor="w", pady=(0, 2))
+            photo = self._thumb(path, (100, 100))
+            if photo:
+                lbl = tk.Label(cell, image=photo, bg=cell_bg, cursor="hand2")
+                lbl.pack()
+            else:
+                lbl = tk.Label(
+                    cell,
+                    text="열기 실패",
+                    bg=cell_bg,
+                    fg="#888",
+                    font=("Consolas", 8),
+                )
+                lbl.pack()
+            _bind_thumb_widgets(cell, lbl, path, is_cover)
+
+        for i, path in enumerate(show_paths):
+            _add_thumb(i, path)
+
+        if extra_n > 0 and not cover_only:
+            more = tk.Button(
+                self.img_frame,
+                text=f"이미지 더보기 (+{extra_n})",
+                font=("Malgun Gothic", 9),
+                command=self._on_expand_gallery,
+                relief="groove",
+                bg="#f3efe8",
+            )
+            more.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=8)
+
+        self._schedule_img_scrollregion()
+
+    def _on_expand_gallery(self) -> None:
+        """대표 외 이미지를 최대 8장까지 추가 로드 (요청 시에만)."""
+        if self._gallery_expanded:
+            return
+        gen = self._gallery_gen
+        if gen != self._select_gen:
+            return
+        paths = list(self._gallery_paths or [])
+        if len(paths) <= 1:
+            return
+        self._gallery_expanded = True
+        # 더보기 버튼 제거
+        for w in list(self.img_frame.winfo_children()):
+            if isinstance(w, tk.Button) and "더보기" in (w.cget("text") or ""):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+        cover = self._gallery_cover
+        allow_set_cover = self._gallery_allow_set_cover
+        rest = paths[1:9]
+
+        def load_rest(index: int = 0) -> None:
             self._thumb_after = None
             if gen != self._select_gen:
                 return
-            if index >= len(paths) or (cover_only and index >= 1):
+            if index >= len(rest):
+                self._schedule_img_scrollregion()
                 return
-            batch = 1 if index == 0 else 3
-            end = min(len(paths), index + batch)
-            for i in range(index, end):
-                if gen != self._select_gen:
-                    return
-                path = paths[i]
-                is_cover = bool(cover) and self.store._same_image_file(path, cover)
-                cell_bg = "#ecfdf5" if is_cover else "#fffdf9"
-                cell = tk.Frame(self.img_frame, bg=cell_bg, padx=4, pady=4)
-                cell.grid(row=i // 3, column=i % 3, sticky="n")
-                if is_cover:
-                    tk.Label(
-                        cell,
-                        text="대표",
-                        bg="#166534",
-                        fg="white",
-                        font=("Malgun Gothic", 8, "bold"),
-                        padx=6,
-                    ).pack(anchor="w", pady=(0, 2))
-                photo = self._thumb(path)
-                if photo:
-                    lbl = tk.Label(cell, image=photo, bg=cell_bg, cursor="hand2")
-                    lbl.pack()
-                else:
-                    lbl = tk.Label(
-                        cell,
-                        text="열기 실패",
-                        bg=cell_bg,
-                        fg="#888",
-                        font=("Consolas", 8),
-                    )
-                    lbl.pack()
-                if allow_set_cover and not cover_only:
-                    def _set_cover(_e=None, pth=path, already=is_cover) -> None:
-                        if already:
-                            return
-                        self._on_set_cover_image(pth)
+            path = rest[index]
+            i = index + 1  # 0 is cover already shown
+            is_cover = False
+            cell_bg = "#fffdf9"
+            cell = tk.Frame(self.img_frame, bg=cell_bg, padx=4, pady=4)
+            cell.grid(row=i // 3, column=i % 3, sticky="n")
+            photo = self._thumb(path, (120, 120))
+            if photo:
+                lbl = tk.Label(cell, image=photo, bg=cell_bg, cursor="hand2")
+                lbl.pack()
+            else:
+                lbl = tk.Label(
+                    cell, text="열기 실패", bg=cell_bg, fg="#888", font=("Consolas", 8)
+                )
+                lbl.pack()
+            if allow_set_cover:
+                def _set_cover(_e=None, pth=path) -> None:
+                    self._on_set_cover_image(pth)
 
-                    for w in (cell, lbl):
-                        w.bind("<Button-1>", _set_cover)
-                        w.configure(cursor="hand2")
-                handler = getattr(self, "_bind_img_mousewheel", None)
-                enter = getattr(self, "_img_wheel_bind", None)
-                leave = getattr(self, "_img_wheel_unbind", None)
                 for w in (cell, lbl):
-                    if handler is not None:
-                        w.bind("<MouseWheel>", handler)
-                        w.bind("<Button-4>", handler)
-                        w.bind("<Button-5>", handler)
-                    if enter is not None:
-                        w.bind("<Enter>", enter)
-                    if leave is not None:
-                        w.bind("<Leave>", leave)
-            if end < len(paths) and not cover_only:
-                self._thumb_after = self.after(1, lambda: load_one(end))
+                    w.bind("<Button-1>", _set_cover)
+                    w.configure(cursor="hand2")
+            self._thumb_after = self.after(10, lambda: load_rest(index + 1))
 
-        load_one(0)
+        load_rest(0)
 
     def _on_set_cover_image(self, image_path: str) -> None:
         """Make clicked gallery image the cover (front of folder + DB)."""
@@ -4014,7 +5398,7 @@ class ManagerApp(tk.Tk):
                     "대표 이미지를 바꿨습니다.\n"
                     "홈페이지에 반영하려면 [재등록]을 눌러 주세요.",
                 )
-            elif mode == "products" and self.current_id is not None:
+            elif mode in ("products", "publish_fail") and self.current_id is not None:
                 pid = int(self.current_id)
                 self.store.set_product_cover(pid, path)
                 self._mark_catalog_dirty(push_now=True)
@@ -4039,6 +5423,7 @@ class ManagerApp(tk.Tk):
         try:
             self.current_excluded_id = None
             self.current_published_id = None
+            self.current_unpublished_id = None
             self.current_id = p.id
             self.title_var.set(p.title)
             self.google_name_var.set(p.google_name)
@@ -4062,6 +5447,14 @@ class ManagerApp(tk.Tk):
             self.desc.delete("1.0", tk.END)
             self.desc.insert("1.0", p.description)
             self._refresh_price_preview()
+            if self.list_mode.get() == "publish_fail":
+                err = (
+                    self.publish_fail_errors.get(p.id)
+                    or self.store.get_publish_failure_error(p.id)
+                    or ""
+                ).strip()
+                if err:
+                    self.status.set(f"등록 실패 사유: {err[:200]}")
             self._clear_images()
             gen = self._select_gen
             paths = self.store.resolve_local_images(
@@ -4090,8 +5483,7 @@ class ManagerApp(tk.Tk):
         # Heavy color/size fill only if missing — background, cancellable
         need_color = not p.colors.strip()
         need_size = not p.sizes.strip()
-        need_cat = not p.category.strip()
-        if need_color or need_size or need_cat:
+        if need_color or need_size:
             self.after(30, lambda: self._fill_missing_attrs(p.id, gen))
 
     def _fill_missing_attrs(self, product_id: int, gen: int) -> None:
@@ -4115,8 +5507,6 @@ class ManagerApp(tk.Tk):
         try:
             if not self.size_var.get().strip() and attrs.sizes:
                 self.size_var.set(", ".join(attrs.sizes))
-            if not self.category_var.get().strip() and attrs.category:
-                self.category_var.set(attrs.category)
         finally:
             self._form_loading = False
 
@@ -4196,10 +5586,10 @@ class ManagerApp(tk.Tk):
         상품관리·등록 목록 모두 지원. 등록 목록에서는 적용 후 재등록 가능.
         """
         mode = self.list_mode.get()
-        if mode not in ("products", "published"):
+        if mode not in ("products", "published", "publish_fail"):
             messagebox.showinfo(
                 "일괄수정",
-                "상품 목록 또는 등록된 상품 목록에서만 사용할 수 있습니다.",
+                "상품·등록·실패 목록에서만 사용할 수 있습니다.",
             )
             return
 
@@ -4209,7 +5599,7 @@ class ManagerApp(tk.Tk):
                 cur = self.store.get_published(self.current_published_id)
                 if cur:
                     tag = (cur.tags or "").strip()
-            elif mode == "products" and self.current_id is not None:
+            elif mode in ("products", "publish_fail") and self.current_id is not None:
                 cur = self.store.get(self.current_id)
                 if cur:
                     tag = (cur.tags or "").strip()
@@ -4305,7 +5695,7 @@ class ManagerApp(tk.Tk):
                 self._mark_catalog_dirty()
                 self._append(
                     f"같은 태그 일괄수정: 「{tag}」 → {cat} ({n}개)",
-                    channel=LOG_COLLECT,
+                    channel=LOG_OTHER,
                 )
 
             self.category_var.set(cat)
@@ -4354,7 +5744,7 @@ class ManagerApp(tk.Tk):
             messagebox.showwarning("번역", "영어로 변환하지 못했습니다. 제품명(한)을 확인하세요.")
             return
         self.name_en_var.set(en)
-        self._append(f"한→영: {ko}\n  → {en}")
+        self._append(f"한→영: {ko}\n  → {en}", channel=LOG_MALL)
 
     def _split_csv(self, raw: str) -> list[str]:
         return re_split_csv(raw)
@@ -4654,7 +6044,10 @@ class ManagerApp(tk.Tk):
                 pid = int(job[0].id)
                 if pid == self._publish_active_id or pid in self._publish_queued_ids:
                     continue
+                if pid in self._publish_order:
+                    continue
                 self._publish_queued_ids.add(pid)
+                self._publish_order.append(pid)
                 self._publish_q.put(job)
                 self._publish_total += 1
                 added += 1
@@ -4676,12 +6069,14 @@ class ManagerApp(tk.Tk):
         return added
 
     def _on_publish(self) -> None:
-        if self.list_mode.get() != "products":
+        if not self._is_product_edit_mode():
             return
         ids = self._selected_product_ids()
         if not ids:
             messagebox.showwarning("선택", "등록할 상품을 선택하세요.")
             return
+
+        from_fail = self.list_mode.get() == "publish_fail"
 
         # 현재 편집 중인 항목은 폼 값 먼저 저장 (빈 가격코드 → 자동 문구)
         if self.current_id is not None and self.current_id in ids:
@@ -4712,9 +6107,16 @@ class ManagerApp(tk.Tk):
             ):
                 return
         elif len(ids) > 1 and not messagebox.askyesno(
-            "일괄 등록",
-            f"선택한 {len(ids)}개 상품을 홈페이지에 등록할까요?\n"
-            "진행 중에도 다른 상품을 추가 등록할 수 있습니다.",
+            "일괄 재등록" if from_fail else "일괄 등록",
+            (
+                f"실패 목록의 {len(ids)}개 상품을 다시 홈페이지에 등록할까요?\n"
+                "진행 중에도 다른 상품을 추가할 수 있습니다."
+                if from_fail
+                else (
+                    f"선택한 {len(ids)}개 상품을 홈페이지에 등록할까요?\n"
+                    "진행 중에도 다른 상품을 추가 등록할 수 있습니다."
+                )
+            ),
         ):
             return
 
@@ -4772,8 +6174,18 @@ class ManagerApp(tk.Tk):
                 messagebox.showinfo(
                     "등록 추가",
                     f"{added}개를 등록 대기열에 넣었습니다.\n"
-                    f"현재 총 {self._publish_total}개 진행·대기 중.",
+                    f"현재 총 {self._publish_total}개 진행·대기 중.\n"
+                    "(진행 현황은 [제품등록중] 탭에서 볼 수 있습니다)",
                 )
+            # 상품/실패 목록에 남는 항목으로 다시 채움
+            if next_id is not None:
+                self.current_id = next_id
+                self._sticky_selected_ids = [next_id]
+            self.refresh_list(
+                preserve_yview=(y0, y1),
+                reload_detail=True,
+                quiet=False,
+            )
             return
 
         if not self._job_start("publish"):
@@ -4784,8 +6196,17 @@ class ManagerApp(tk.Tk):
                     f"등록 대기열에 {added}개 추가 (총 {self._publish_total}개)",
                     channel=LOG_MALL,
                 )
+                if next_id is not None:
+                    self.current_id = next_id
+                    self._sticky_selected_ids = [next_id]
+                self.refresh_list(
+                    preserve_yview=(y0, y1),
+                    reload_detail=True,
+                    quiet=False,
+                )
             return
 
+        self._publish_mode = "publish"
         with self._publish_lock:
             self._publish_total = 0
             self._publish_done = 0
@@ -4793,6 +6214,7 @@ class ManagerApp(tk.Tk):
             self._publish_fail = 0
             self._publish_lines = []
             self._publish_queued_ids.clear()
+            self._publish_order.clear()
             self._publish_active_id = None
             # drain stale queue
             while True:
@@ -4812,8 +6234,23 @@ class ManagerApp(tk.Tk):
         total = self._publish_total
         prog = self._open_publish_progress(total)
         self._publish_prog = prog
-        self._append(f"----- 홈페이지 등록 {total}개 (실시간 · 추가등록 가능) -----")
+        self._append(
+            f"----- 홈페이지 등록 {total}개 (실시간 · 추가등록 가능) -----",
+            channel=LOG_MALL,
+        )
         self.status.set(f"홈페이지 등록 중 0/{total}")
+        # 상품 목록에 남기며, 등록중 항목은 목록에서 제외되고 다음 상품이 채워짐
+        if next_id is not None:
+            self.current_id = next_id
+            self._sticky_selected_ids = [next_id]
+        else:
+            self.current_id = None
+            self._sticky_selected_ids = []
+        self.refresh_list(
+            preserve_yview=(y0, y1),
+            reload_detail=True,
+            quiet=False,
+        )
         threading.Thread(target=self._publish_worker_loop, daemon=True).start()
 
     def _publish_worker_loop(self) -> None:
@@ -4891,6 +6328,10 @@ class ManagerApp(tk.Tk):
                     )
                     # Push each success so the other PC sees 등록 list promptly.
                     self._mark_catalog_dirty(push_now=True)
+                    try:
+                        self.store.clear_publish_failure(product.id)
+                    except Exception:
+                        pass
                     line = (
                         f"  ✓ 성공 → 등록 #{archived} / {item.get('name') or ''} "
                         f"/ {result.get('priceLabel') or ''} / {result.get('api') or ''}"
@@ -4914,6 +6355,10 @@ class ManagerApp(tk.Tk):
                     )
                 except Exception as e:
                     err = str(e)
+                    try:
+                        self.store.record_publish_failure(product.id, err)
+                    except Exception:
+                        pass
                     with self._publish_lock:
                         self._publish_fail += 1
                         self._publish_lines.append(f"#{product.id} 실패: {err}")
@@ -4926,6 +6371,10 @@ class ManagerApp(tk.Tk):
                 with self._publish_lock:
                     self._publish_done += 1
                     self._publish_active_id = None
+                    try:
+                        self._publish_order.remove(pid)
+                    except ValueError:
+                        pass
                     done = self._publish_done
                     total = self._publish_total
                     ok_n = self._publish_ok
@@ -4970,10 +6419,12 @@ class ManagerApp(tk.Tk):
                     self._publish_prog = None
                     self._publish_active_id = None
                     self._publish_queued_ids.clear()
+                    self._publish_order.clear()
+                    self._publish_mode = None
 
                 self._mark_catalog_dirty(push_now=True)
                 mode = self.list_mode.get()
-                if mode == "products":
+                if mode in ("products", "publish_fail"):
                     if next_id is not None:
                         self.current_id = next_id
                         self._sticky_selected_ids = [next_id]
@@ -4986,20 +6437,60 @@ class ManagerApp(tk.Tk):
                         )
                     else:
                         self.refresh_list(reload_detail=True, quiet=False)
+                elif mode == "publishing":
+                    self.current_id = None
+                    self._sticky_selected_ids = []
+                    self.refresh_list(reload_detail=True, quiet=False)
                 else:
                     self.refresh_list(reload_detail=False, quiet=True)
                 self.status.set(
                     f"홈페이지 등록 완료 — 성공 {ok_final} / 실패 {fail_final}"
                 )
                 self._job_end("publish")
+                fail_n_db = 0
+                try:
+                    fail_n_db = int(self.store.count_publish_failures() or 0)
+                except Exception:
+                    fail_n_db = fail_final
                 if fail_final and ok_final == 0:
                     messagebox.showerror("등록 실패", summary)
+                    if fail_n_db and mode != "publish_fail":
+                        if messagebox.askyesno(
+                            "실패 탭",
+                            f"실패한 {fail_n_db}건을 [실패] 탭에서 확인하고\n"
+                            "수정 후 다시 등록할까요?",
+                        ):
+                            self.list_mode.set("publish_fail")
+                            self._on_list_mode()
                 else:
-                    messagebox.showinfo(
-                        "홈페이지 등록",
+                    msg = (
                         f"완료: 성공 {ok_final} / 실패 {fail_final}\n\n{summary}\n\n"
-                        "쇼핑몰을 새로고침하면 반영됩니다.",
+                        "쇼핑몰을 새로고침하면 반영됩니다."
                     )
+                    if fail_final:
+                        msg += (
+                            f"\n\n실패 {fail_final}건은 [실패] 탭에서 "
+                            "수정·재등록할 수 있습니다."
+                        )
+                    messagebox.showinfo("홈페이지 등록", msg)
+                    if fail_final and mode != "publish_fail" and fail_n_db:
+                        if messagebox.askyesno(
+                            "실패 탭",
+                            "실패한 상품을 [실패] 탭으로 이동할까요?",
+                        ):
+                            self.list_mode.set("publish_fail")
+                            self._on_list_mode()
+                    elif (
+                        ok_final
+                        and not fail_final
+                        and mode == "publishing"
+                    ):
+                        if messagebox.askyesno(
+                            "등록 탭",
+                            "등록이 완료되었습니다.\n[등록] 탭으로 이동할까요?",
+                        ):
+                            self.list_mode.set("published")
+                            self._on_list_mode()
 
             self.after(0, finish)
         except Exception as e:
@@ -5012,6 +6503,8 @@ class ManagerApp(tk.Tk):
                 self._publish_prog = None
                 self._publish_active_id = None
                 self._publish_queued_ids.clear()
+                self._publish_order.clear()
+                self._publish_mode = None
             self.after(0, lambda: self._job_end("publish"))
         # 정상 완료는 finish()에서 job_end
 
@@ -5131,6 +6624,7 @@ class ManagerApp(tk.Tk):
         if not self._job_start("publish"):
             self._warn_job_busy("publish")
             return
+        self._publish_mode = "reconcile"
         total = 0
         try:
             total = int(self.store.count_published() or 0)
@@ -5166,6 +6660,7 @@ class ManagerApp(tk.Tk):
                 )
 
                 def done_ui() -> None:
+                    self._publish_mode = None
                     self._job_end("publish")
                     self.refresh_list(reload_detail=False, quiet=True)
                     self.status.set(f"사이트 맞추기 완료 — {summary}")
@@ -5180,6 +6675,7 @@ class ManagerApp(tk.Tk):
                 prog["finish"](f"실패: {err}", 0, 1)
 
                 def fail() -> None:
+                    self._publish_mode = None
                     self._job_end("publish")
                     self._put_log(f"[맞추기] 오류: {err}", channel=LOG_MALL)
                     if confirm:
@@ -5202,34 +6698,18 @@ class ManagerApp(tk.Tk):
         except Exception:
             pass
 
-    def _republish_ids(self, ids: list[int], *, confirm: bool = True) -> None:
-        """Re-push given published ids to the homepage."""
-        if not ids:
-            messagebox.showwarning("선택", "재등록할 상품을 선택하세요.")
-            return
-        if not self._job_start("publish"):
-            self._warn_job_busy("publish")
-            return
-
-        # Persist current form onto the focused published row
+    def _build_republish_jobs(
+        self, ids: list[int]
+    ) -> list[tuple[PublishedItem, Product, list[str], list[str], str | None]]:
+        """Build republish jobs from published ids (form values for focused row)."""
         if self.current_published_id is not None and self.current_published_id in ids:
             self._soft_save_current(force=True)
-
-        if confirm and not messagebox.askyesno(
-            "재등록",
-            f"선택한 {len(ids)}개 상품을 수정된 정보로\n"
-            "홈페이지에 다시 올릴까요?\n\n"
-            "같은 상품(mall_id)을 덮어씁니다.",
-        ):
-            self._job_end("publish")
-            return
 
         jobs: list[tuple[PublishedItem, Product, list[str], list[str], str | None]] = []
         for pub_id in ids:
             item = self.store.get_published(pub_id)
             if not item:
                 continue
-            # Empty price → default label
             if not (item.sku_no or "").strip():
                 self.store.update_published(pub_id, sku_no=DEFAULT_PRICE_TEXT)
                 item = self.store.get_published(pub_id) or item
@@ -5238,7 +6718,6 @@ class ManagerApp(tk.Tk):
                 colors = re_split_colors(self.color_var.get())
                 sizes = self._split_csv(self.size_var.get())
                 category = self.category_var.get().strip() or None
-                # Prefer live form values for the focused row
                 product.google_name = self.google_name_var.get().strip()
                 product.name_en = self.name_en_var.get().strip()
                 product.search_code = self.code_var.get().strip()
@@ -5254,123 +6733,339 @@ class ManagerApp(tk.Tk):
                 sizes = self._split_csv(item.sizes)
                 category = item.category or None
             jobs.append((item, product, colors, sizes, category))
+        return jobs
 
+    def _republish_enqueue_jobs(
+        self,
+        jobs: list[tuple[PublishedItem, Product, list[str], list[str], str | None]],
+    ) -> int:
+        """Add republish jobs while a republish run is active. Returns added count."""
+        added = 0
+        with self._publish_lock:
+            for job in jobs:
+                pid = int(job[0].id)
+                if pid == self._republish_active_id or pid in self._republish_queued_ids:
+                    continue
+                self._republish_queued_ids.add(pid)
+                self._republish_q.put(job)
+                self._publish_total += 1
+                added += 1
+            total = self._publish_total
+            prog = self._publish_prog
+        if added and prog is not None:
+            try:
+                prog["set_total"](total)
+            except Exception:
+                pass
+            self.after(
+                0,
+                lambda t=total, a=added: self.status.set(
+                    f"재등록 대기열 +{a} · 총 {t}개"
+                ),
+            )
+        if added:
+            self.after(0, self._refresh_list_busy)
+        return added
+
+    def _republish_ids(self, ids: list[int], *, confirm: bool = True) -> None:
+        """Re-push given published ids to the homepage (queueable while republish runs)."""
+        if not ids:
+            messagebox.showwarning("선택", "재등록할 상품을 선택하세요.")
+            return
+
+        jobs = self._build_republish_jobs(ids)
         if not jobs:
+            messagebox.showwarning("없음", "재등록할 상품이 없습니다.")
+            return
+
+        running = self._job_running("publish")
+        if running:
+            if self._publish_mode != "republish":
+                self._warn_job_busy("publish")
+                return
+            if confirm and not messagebox.askyesno(
+                "재등록 추가",
+                f"홈페이지 재등록이 진행 중입니다.\n"
+                f"선택한 {len(ids)}개를 이어서 재등록할까요?",
+            ):
+                return
+            added = self._republish_enqueue_jobs(jobs)
+            if added <= 0:
+                if confirm:
+                    messagebox.showinfo(
+                        "재등록 추가",
+                        "선택한 상품은 이미 재등록 대기 중이거나 처리 중입니다.",
+                    )
+            else:
+                self._append(
+                    f"재등록 대기열에 {added}개 추가 (총 {self._publish_total}개)",
+                    channel=LOG_MALL,
+                )
+                if confirm:
+                    messagebox.showinfo(
+                        "재등록 추가",
+                        f"{added}개를 재등록 대기열에 넣었습니다.\n"
+                        f"현재 총 {self._publish_total}개 진행·대기 중.",
+                    )
+                else:
+                    self.status.set(
+                        f"재등록 대기열 +{added} · 총 {self._publish_total}개"
+                    )
+            return
+
+        if confirm and not messagebox.askyesno(
+            "재등록",
+            f"선택한 {len(ids)}개 상품을 수정된 정보로\n"
+            "홈페이지에 다시 올릴까요?\n\n"
+            "같은 상품(mall_id)을 덮어씁니다.\n"
+            "진행 중에도 다른 상품을 추가 재등록할 수 있습니다.",
+        ):
+            return
+
+        if not self._job_start("publish"):
+            if self._publish_mode == "republish":
+                added = self._republish_enqueue_jobs(jobs)
+                if added:
+                    self._append(
+                        f"재등록 대기열에 {added}개 추가 (총 {self._publish_total}개)",
+                        channel=LOG_MALL,
+                    )
+            else:
+                self._warn_job_busy("publish")
+            return
+
+        self._publish_mode = "republish"
+        with self._publish_lock:
+            self._publish_total = 0
+            self._publish_done = 0
+            self._publish_ok = 0
+            self._publish_fail = 0
+            self._publish_lines = []
+            self._republish_queued_ids.clear()
+            self._republish_active_id = None
+            while True:
+                try:
+                    self._republish_q.get_nowait()
+                except queue.Empty:
+                    break
+
+        added = self._republish_enqueue_jobs(jobs)
+        if added <= 0:
+            self._publish_mode = None
             self._job_end("publish")
             messagebox.showwarning("없음", "재등록할 상품이 없습니다.")
             return
 
-        total = len(jobs)
+        total = self._publish_total
         prog = self._open_publish_progress(total, action="홈페이지재등록중")
-        self._append(f"----- 홈페이지 재등록 {total}개 -----")
+        self._publish_prog = prog
+        self._append(
+            f"----- 홈페이지 재등록 {total}개 (실시간 · 추가재등록 가능) -----",
+            channel=LOG_MALL,
+        )
         self.status.set(f"재등록 중 0/{total}")
+        threading.Thread(target=self._republish_worker_loop, daemon=True).start()
 
-        def work() -> None:
-            ok_n = 0
-            fail_n = 0
-            lines: list[str] = []
-            try:
-                for i, (item, product, colors, sizes, category) in enumerate(jobs, start=1):
-                    name_hint = (
-                        (product.google_name or product.title or f"#{item.id}").strip()
-                    )[:36]
-                    mall_id = (item.mall_id or "").strip() or f"wg-{product.id}"
+    def _republish_worker_loop(self) -> None:
+        """Drain homepage-republish queue until empty (supports mid-run enqueue)."""
+        prog = self._publish_prog
+        idle_rounds = 0
+        try:
+            while True:
+                try:
+                    job = self._republish_q.get(timeout=0.35)
+                    idle_rounds = 0
+                except queue.Empty:
+                    idle_rounds += 1
+                    if idle_rounds >= 2:
+                        with self._publish_lock:
+                            if (
+                                self._republish_q.empty()
+                                and self._republish_active_id is None
+                            ):
+                                break
+                    continue
+
+                item, product, colors, sizes, category = job
+                pid = int(item.id)
+                with self._publish_lock:
+                    self._republish_active_id = pid
+                    self._republish_queued_ids.discard(pid)
+                    done_before = self._publish_done
+                    total = self._publish_total
+                    ok_n = self._publish_ok
+                    fail_n = self._publish_fail
+                self.after(0, self._refresh_list_busy)
+
+                name_hint = (
+                    (product.google_name or product.title or f"#{item.id}").strip()
+                )[:36]
+                mall_id = (item.mall_id or "").strip() or f"wg-{product.id}"
+                i = done_before + 1
+                if prog:
                     prog["progress"](
-                        i - 1,
+                        done_before,
                         f"[{i}/{total}] 재등록 중… #{item.id} {name_hint}",
                         ok_n,
                         fail_n,
                     )
-                    prog["line"](f"→ [{i}/{total}] 등록#{item.id} → {mall_id} · {name_hint}")
-                    self._put_log(f"[{i}/{total}] 재등록 중… 등록#{item.id}", channel=LOG_MALL)
-                    try:
-                        self._ensure_images_for_action(published_id=item.id)
-                        fresh_item = self.store.get_published(item.id)
-                        if fresh_item:
-                            product.image_paths = fresh_item.image_paths
-                            product.cover_path = fresh_item.cover_path
-                            product.image_urls = list(fresh_item.image_urls or [])
-                    except Exception:
-                        pass
-                    try:
-                        result = publish_product(
-                            product,
-                            colors=colors,
-                            sizes=sizes,
-                            category=category,
-                            push_api=True,
-                            mall_id=mall_id,
+                    prog["line"](
+                        f"→ [{i}/{total}] 등록#{item.id} → {mall_id} · {name_hint}"
+                    )
+                self._put_log(
+                    f"[{i}/{total}] 재등록 중… 등록#{item.id}",
+                    channel=LOG_MALL,
+                )
+                self.after(
+                    0,
+                    lambda i=i, t=total: self.status.set(f"재등록 중 {i}/{t}"),
+                )
+
+                try:
+                    self._ensure_images_for_action(published_id=item.id)
+                    fresh_item = self.store.get_published(item.id)
+                    if fresh_item:
+                        product.image_paths = fresh_item.image_paths
+                        product.cover_path = fresh_item.cover_path
+                        product.image_urls = list(fresh_item.image_urls or [])
+                        if (fresh_item.mall_id or "").strip():
+                            mall_id = fresh_item.mall_id.strip()
+                except Exception:
+                    pass
+
+                try:
+                    result = publish_product(
+                        product,
+                        colors=colors,
+                        sizes=sizes,
+                        category=category,
+                        push_api=True,
+                        mall_id=mall_id,
+                    )
+                    new_mall = str(
+                        (result.get("product") or {}).get("id") or mall_id
+                    )
+                    self.store.update_published(
+                        item.id,
+                        mall_id=new_mall,
+                        note=result.get("priceLabel") or item.note,
+                        google_name=product.google_name,
+                        name_en=product.name_en,
+                        search_code=product.search_code,
+                        sku_no=product.sku_no,
+                        title=product.title,
+                        tags=product.tags,
+                        description=product.description,
+                        category=product.category,
+                        colors=product.colors,
+                        sizes=product.sizes,
+                    )
+                    self._mark_catalog_dirty(push_now=True)
+                    brand = (result.get("product") or {}).get("brand") or ""
+                    line = (
+                        f"  ✓ 재등록 성공 / {brand} / "
+                        f"{result.get('priceLabel') or ''} / {result.get('api') or ''}"
+                    )
+                    with self._publish_lock:
+                        self._publish_ok += 1
+                        self._publish_lines.append(
+                            f"등록#{item.id} → {new_mall} ({brand})"
                         )
-                        new_mall = str((result.get("product") or {}).get("id") or mall_id)
-                        self.store.update_published(
-                            item.id,
-                            mall_id=new_mall,
-                            note=result.get("priceLabel") or item.note,
-                            google_name=product.google_name,
-                            name_en=product.name_en,
-                            search_code=product.search_code,
-                            sku_no=product.sku_no,
-                            title=product.title,
-                            tags=product.tags,
-                            description=product.description,
-                            category=product.category,
-                            colors=product.colors,
-                            sizes=product.sizes,
-                        )
-                        ok_n += 1
-                        brand = (result.get("product") or {}).get("brand") or ""
-                        line = (
-                            f"  ✓ 재등록 성공 / {brand} / "
-                            f"{result.get('priceLabel') or ''} / {result.get('api') or ''}"
-                        )
-                        lines.append(f"등록#{item.id} → {new_mall} ({brand})")
+                        ok_n = self._publish_ok
+                        fail_n = self._publish_fail
+                    if prog:
                         prog["line"](line)
-                        self._put_log(f"재등록 완료: {new_mall} / {brand}", channel=LOG_MALL)
-                    except Exception as e:
-                        fail_n += 1
-                        err = str(e)
-                        lines.append(f"등록#{item.id} 실패: {err}")
+                    self._put_log(
+                        f"재등록 완료: {new_mall} / {brand}", channel=LOG_MALL
+                    )
+                except Exception as e:
+                    err = str(e)
+                    with self._publish_lock:
+                        self._publish_fail += 1
+                        self._publish_lines.append(f"등록#{item.id} 실패: {err}")
+                        ok_n = self._publish_ok
+                        fail_n = self._publish_fail
+                    if prog:
                         prog["line"](f"  ✗ 실패: {err}")
-                        self._put_log(f"재등록 실패 #{item.id}: {err}", channel=LOG_MALL)
+                    self._put_log(
+                        f"재등록 실패 #{item.id}: {err}", channel=LOG_MALL
+                    )
+
+                with self._publish_lock:
+                    self._publish_done += 1
+                    self._republish_active_id = None
+                    done = self._publish_done
+                    total = self._publish_total
+                    ok_n = self._publish_ok
+                    fail_n = self._publish_fail
+                self.after(0, self._refresh_list_busy)
+
+                if prog:
                     prog["progress"](
-                        i,
-                        f"[{i}/{total}] 완료 — 성공 {ok_n} · 실패 {fail_n}",
+                        done,
+                        f"[{done}/{total}] 완료 — 성공 {ok_n} · 실패 {fail_n}",
                         ok_n,
                         fail_n,
                     )
 
-                summary = "\n".join(lines[:14])
-                if len(lines) > 14:
-                    summary += f"\n… 외 {len(lines) - 14}건"
-                ok_final, fail_final = ok_n, fail_n
-                prog["finish"](f"성공 {ok_final} / 실패 {fail_final}", ok_final, fail_final)
+            with self._publish_lock:
+                ok_final = self._publish_ok
+                fail_final = self._publish_fail
+                lines = list(self._publish_lines)
+                if not self._republish_q.empty():
+                    threading.Thread(
+                        target=self._republish_worker_loop, daemon=True
+                    ).start()
+                    return
 
-                def finish() -> None:
-                    self._mark_catalog_dirty()
-                    # 등록 목록 선택·다중선택·상세 유지
-                    self.refresh_list(reload_detail=False, quiet=True)
-                    self.status.set(
-                        f"재등록 완료 — 성공 {ok_final} / 실패 {fail_final}"
+            summary = "\n".join(lines[:14])
+            if len(lines) > 14:
+                summary += f"\n… 외 {len(lines) - 14}건"
+            if prog:
+                prog["finish"](
+                    f"성공 {ok_final} / 실패 {fail_final}", ok_final, fail_final
+                )
+
+            def finish() -> None:
+                with self._publish_lock:
+                    if not self._republish_q.empty():
+                        threading.Thread(
+                            target=self._republish_worker_loop, daemon=True
+                        ).start()
+                        return
+                    self._publish_prog = None
+                    self._republish_active_id = None
+                    self._republish_queued_ids.clear()
+                    self._publish_mode = None
+
+                self._mark_catalog_dirty(push_now=True)
+                self.refresh_list(reload_detail=False, quiet=True)
+                self.status.set(
+                    f"재등록 완료 — 성공 {ok_final} / 실패 {fail_final}"
+                )
+                self._job_end("publish")
+                if fail_final and ok_final == 0:
+                    messagebox.showerror("재등록 실패", summary)
+                else:
+                    messagebox.showinfo(
+                        "재등록",
+                        f"완료: 성공 {ok_final} / 실패 {fail_final}\n\n{summary}\n\n"
+                        "쇼핑몰을 새로고침하면 반영됩니다.",
                     )
-                    if fail_final and ok_final == 0:
-                        messagebox.showerror("재등록 실패", summary)
-                    else:
-                        messagebox.showinfo(
-                            "재등록",
-                            f"완료: 성공 {ok_final} / 실패 {fail_final}\n\n{summary}\n\n"
-                            "쇼핑몰을 새로고침하면 반영됩니다.",
-                        )
 
-                self.after(0, finish)
-            except Exception as e:
-                self._put_log(f"재등록 오류: {e}", channel=LOG_MALL)
+            self.after(0, finish)
+        except Exception as e:
+            self._put_log(f"재등록 오류: {e}", channel=LOG_MALL)
+            if prog:
                 prog["line"](f"오류: {e}")
-                prog["finish"]("오류로 중단", ok_n, fail_n)
-                self.after(0, lambda: messagebox.showerror("재등록 실패", str(e)))
-            finally:
-                self.after(0, lambda: self._job_end("publish"))
-
-        threading.Thread(target=work, daemon=True).start()
+                prog["finish"]("오류로 중단", self._publish_ok, self._publish_fail)
+            self.after(0, lambda: messagebox.showerror("재등록 실패", str(e)))
+            with self._publish_lock:
+                self._publish_prog = None
+                self._republish_active_id = None
+                self._republish_queued_ids.clear()
+                self._publish_mode = None
+            self.after(0, lambda: self._job_end("publish"))
 
     def _on_recommend(self) -> None:
         """Mark selected published products as homepage recommended carousel items."""
@@ -5379,6 +7074,106 @@ class ManagerApp(tk.Tk):
     def _on_unrecommend(self) -> None:
         """Remove selected products from homepage recommended carousel."""
         self._set_recommended_for_selection(False)
+
+    def _ask_recommend_slots(
+        self, selected: list
+    ) -> list[str] | None:
+        """Modal: pick homepage recommend section(s). None = cancel."""
+        suggested: set[str] = set()
+        for p in selected:
+            for s in recommend_slots_for_category(getattr(p, "category", "") or ""):
+                suggested.add(s)
+        if not suggested:
+            suggested.add("accessory")
+
+        win = tk.Toplevel(self)
+        win.title("추천 상품 위치 선택")
+        win.geometry("440x360")
+        win.configure(bg="#f3efe8")
+        win.transient(self)
+        win.grab_set()
+        win.focus_force()
+
+        tk.Label(
+            win,
+            text="홈페이지 추천 상품 — 어디에 올릴까요?",
+            bg="#f3efe8",
+            font=("Malgun Gothic", 12, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(16, 4))
+        tk.Label(
+            win,
+            text=f"선택한 {len(selected)}개 상품을 올릴 추천 칸을 고르세요.\n"
+            "여러 칸을 동시에 선택할 수 있습니다.",
+            bg="#f3efe8",
+            font=("Malgun Gothic", 9),
+            fg="#555",
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(0, 10))
+
+        vars_by_slot: dict[str, tk.BooleanVar] = {}
+        box = tk.Frame(win, bg="#fffdf9", relief="solid", borderwidth=1)
+        box.pack(fill="both", expand=True, padx=18, pady=4)
+        for sid in RECOMMEND_SLOT_IDS:
+            var = tk.BooleanVar(value=sid in suggested)
+            vars_by_slot[sid] = var
+            hint = "  ← 카테고리 기본" if sid in suggested else ""
+            tk.Checkbutton(
+                box,
+                text=f"{RECOMMEND_SLOT_LABELS.get(sid, sid)}{hint}",
+                variable=var,
+                bg="#fffdf9",
+                activebackground="#fffdf9",
+                font=("Malgun Gothic", 11),
+                anchor="w",
+                padx=12,
+                pady=8,
+            ).pack(fill="x")
+
+        result: dict[str, list[str] | None] = {"slots": None}
+
+        def on_ok() -> None:
+            picked = [sid for sid, v in vars_by_slot.items() if v.get()]
+            picked = normalize_recommend_slots(picked)
+            if not picked:
+                messagebox.showwarning(
+                    "선택",
+                    "추천 칸을 하나 이상 선택하세요.",
+                    parent=win,
+                )
+                return
+            result["slots"] = picked
+            win.destroy()
+
+        def on_cancel() -> None:
+            result["slots"] = None
+            win.destroy()
+
+        btns = tk.Frame(win, bg="#f3efe8")
+        btns.pack(fill="x", padx=18, pady=14)
+        tk.Button(
+            btns,
+            text="취소",
+            command=on_cancel,
+            font=("Malgun Gothic", 10),
+            width=10,
+        ).pack(side="right", padx=(8, 0))
+        tk.Button(
+            btns,
+            text="이 위치에 올리기",
+            command=on_ok,
+            font=("Malgun Gothic", 10, "bold"),
+            bg="#166534",
+            fg="white",
+            activebackground="#14532d",
+            activeforeground="white",
+            width=16,
+        ).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+        win.bind("<Escape>", lambda _e: on_cancel())
+        win.wait_window()
+        return result["slots"]
 
     def _set_recommended_for_selection(self, want: bool) -> None:
         if self.list_mode.get() != "published":
@@ -5404,20 +7199,10 @@ class ManagerApp(tk.Tk):
             messagebox.showwarning("없음", "선택한 등록 상품을 찾을 수 없습니다.")
             return
 
+        choose_slots: list[str] | None = None
         if want:
-            from collections import Counter
-
-            counts = Counter(recommend_slot_label(p.category) for p in selected)
-            detail = "\n".join(f"· {name}  {n}개" for name, n in counts.items())
-            if not messagebox.askyesno(
-                "추천상품으로 재등록하기",
-                f"선택한 {len(selected)}개를 분류에 맞는\n"
-                "홈 추천 칸에 올릴까요?\n\n"
-                f"{detail}\n\n"
-                "가방 → 가방 추천상품\n"
-                "여성옷/남성옷 → 옷 추천상품\n"
-                "그 외 → 악세사리 추천상품",
-            ):
+            choose_slots = self._ask_recommend_slots(selected)
+            if not choose_slots:
                 self._job_end("publish")
                 return
         else:
@@ -5430,7 +7215,7 @@ class ManagerApp(tk.Tk):
                 self._job_end("publish")
                 return
 
-        jobs: list[tuple[PublishedItem, str]] = []
+        jobs: list[tuple] = []
         for item in selected:
             mall_id = resolve_mall_id(
                 mall_id=item.mall_id,
@@ -5446,8 +7231,15 @@ class ManagerApp(tk.Tk):
                     pass
             jobs.append((item, mall_id))
 
+        slot_names = ""
+        if want and choose_slots:
+            slot_names = ", ".join(
+                RECOMMEND_SLOT_LABELS.get(s, s) for s in choose_slots
+            )
         self._append(
-            f"----- 추천 상품 {'등록' if want else '해제'} {len(jobs)}개 -----"
+            f"----- 추천 상품 {'등록' if want else '해제'} {len(jobs)}개"
+            + (f" → {slot_names}" if slot_names else "")
+            + " -----"
         )
         self.status.set(f"추천 반영 중… 0/{len(jobs)}")
 
@@ -5465,7 +7257,10 @@ class ManagerApp(tk.Tk):
                 ok_malls: set[str] = set()
                 if mall_ids:
                     result = set_products_recommended(
-                        mall_ids, recommended=want, push_api=True
+                        mall_ids,
+                        recommended=want,
+                        push_api=True,
+                        slots=choose_slots if want else None,
                     )
                     for p in result.get("products") or []:
                         if isinstance(p, dict) and p.get("id"):
@@ -5478,7 +7273,7 @@ class ManagerApp(tk.Tk):
                 # Missing on homepage → publish with recommended flag in one shot.
                 if want and (missing or unknown):
                     miss_set = set(missing)
-                    need_items: list[PublishedItem] = []
+                    need_items: list = []
                     for it, mid in jobs:
                         if not mid or mid in miss_set:
                             need_items.append(it)
@@ -5506,13 +7301,17 @@ class ManagerApp(tk.Tk):
                                 push_api=True,
                                 mall_id=force_mid,
                                 recommended=True,
+                                recommend_slots=choose_slots,
                             )
                             new_mid = str((pub.get("product") or {}).get("id") or "")
                             api_note = str(pub.get("api") or "")
                             if new_mid and not _api_failed(api_note):
                                 # Confirm homepage flag
                                 confirm = set_products_recommended(
-                                    [new_mid], recommended=True, push_api=True
+                                    [new_mid],
+                                    recommended=True,
+                                    push_api=True,
+                                    slots=choose_slots,
                                 )
                                 if int(confirm.get("updated") or 0) < 1:
                                     raise RuntimeError(
@@ -5562,6 +7361,10 @@ class ManagerApp(tk.Tk):
                         f"{label} 완료: {updated}개\n"
                         f"API: {result.get('api') or ''}"
                     )
+                    if want and choose_slots:
+                        msg += "\n위치: " + ", ".join(
+                            RECOMMEND_SLOT_LABELS.get(s, s) for s in choose_slots
+                        )
                     if republished:
                         msg += f"\n홈 재등록 후 추천: {republished}개"
                     msg += "\n\n쇼핑몰을 새로고침하면 반영됩니다."
@@ -5579,6 +7382,7 @@ class ManagerApp(tk.Tk):
                         messagebox.showinfo("추천 상품", msg)
                     self._append(
                         f"추천 {'ON' if want else 'OFF'} {updated}개"
+                        + (f" / {slot_names}" if slot_names else "")
                         + (f" / 재등록 {republished}" if republished else "")
                         + (f" / 누락 {len(still_missing)}" if still_missing else "")
                     )
@@ -5601,8 +7405,9 @@ class ManagerApp(tk.Tk):
         if not messagebox.askyesno(
             "등록목록에서 제거",
             f"선택한 {len(ids)}개를 등록 목록에서 제거하고\n"
-            "상품 관리 목록으로 되돌릴까요?\n\n"
-            "※ 홈페이지에 등록된 상품도 함께 삭제됩니다.",
+            "「등록해제」 보관함으로 옮길까요?\n\n"
+            "※ 홈페이지에 등록된 상품도 함께 삭제됩니다.\n"
+            "※ 상품 관리 목록으로는 돌아가지 않습니다.",
         ):
             return
 
@@ -5639,34 +7444,152 @@ class ManagerApp(tk.Tk):
                 )
                 return
 
-            last_restored: int | None = None
+            last_archived: int | None = None
             for pub_id in ids:
-                restored_id = self.store.unpublish(pub_id)
+                archived_id = self.store.unpublish(pub_id)
                 self._put_log(
-                    f"등록목록 제거 #{pub_id} → 상품관리 #{restored_id}",
+                    f"등록목록 제거 #{pub_id} → 등록해제 보관 #{archived_id}",
                     channel=LOG_MALL,
                 )
-                if restored_id is not None:
-                    last_restored = restored_id
+                if archived_id is not None:
+                    last_archived = archived_id
             self._mark_catalog_dirty()
 
             def finish() -> None:
                 self.current_published_id = None
-                if last_restored is not None:
-                    self.current_id = last_restored
-                    self.list_mode.set("products")
+                if last_archived is not None:
+                    self.current_unpublished_id = last_archived
+                    self.list_mode.set("unpublished")
                     self._apply_mode_buttons()
                     self.refresh_list()
                 else:
-                    self.current_id = None
+                    self.current_unpublished_id = None
                     self.refresh_list()
                 messagebox.showinfo(
                     "완료",
-                    f"등록 목록에서 제거했습니다.\n"
+                    f"등록해제 보관함으로 옮겼습니다 ({len(ids)}개).\n"
                     f"홈페이지 상품도 삭제했습니다 ({len(mall_ids)}건).",
                 )
 
             self.after(0, finish)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_delete_unpublished(self) -> None:
+        if self.list_mode.get() != "unpublished":
+            return
+        ids = self._selected_unpublished_ids()
+        if not ids:
+            messagebox.showwarning("선택", "삭제할 보관 상품을 선택하세요.")
+            return
+        if not messagebox.askyesno(
+            "보관함에서 삭제",
+            f"선택한 {len(ids)}개를 등록해제 보관함에서\n"
+            "완전히 삭제할까요?\n\n"
+            "이미지·기록도 함께 지워지며 복구할 수 없습니다.",
+        ):
+            return
+        for uid in ids:
+            self.store.delete_unpublished(uid)
+            self._put_log(f"등록해제 보관 삭제 #{uid}", channel=LOG_MALL)
+        self.current_unpublished_id = None
+        self._mark_catalog_dirty()
+        self.refresh_list()
+
+    def _on_republish_unpublished(self) -> None:
+        """Re-publish archived items to homepage and move back to 등록 목록."""
+        if self.list_mode.get() != "unpublished":
+            return
+        if not self._job_start("publish"):
+            self._warn_job_busy("publish")
+            return
+        ids = self._selected_unpublished_ids()
+        if not ids:
+            self._job_end("publish")
+            messagebox.showwarning("선택", "다시 등록할 보관 상품을 선택하세요.")
+            return
+        if not messagebox.askyesno(
+            "홈페이지 다시 등록",
+            f"선택한 {len(ids)}개를 홈페이지에 다시 등록하고\n"
+            "등록 목록으로 옮길까요?",
+        ):
+            self._job_end("publish")
+            return
+
+        items = [self.store.get_unpublished(i) for i in ids]
+        items = [x for x in items if x]
+        self._append(f"----- 등록해제 → 홈 다시등록 {len(items)}개 -----")
+
+        def work() -> None:
+            ok = 0
+            fail = 0
+            last_pub: int | None = None
+            try:
+                for it in items:
+                    try:
+                        self.store.ensure_unpublished_images(it.id)
+                        fresh = self.store.get_unpublished(it.id) or it
+                        product = self.store.unpublished_to_product(fresh)
+                        colors = re_split_colors(fresh.colors)
+                        sizes = self._split_csv(fresh.sizes)
+                        force_mid = (fresh.mall_id or "").strip() or None
+                        if not force_mid:
+                            gid = (fresh.goods_id or "").strip()
+                            code = (fresh.search_code or "").strip()
+                            if gid:
+                                force_mid = f"wg-{gid}"
+                            elif code:
+                                force_mid = f"wg-sc-{code}"
+                        pub = publish_product(
+                            product,
+                            colors=colors or None,
+                            sizes=sizes or None,
+                            category=fresh.category or None,
+                            push_api=True,
+                            mall_id=force_mid,
+                            recommended=False,
+                        )
+                        new_mid = str((pub.get("product") or {}).get("id") or "")
+                        api_note = str(pub.get("api") or "")
+                        if not new_mid or _api_failed(api_note):
+                            raise RuntimeError(api_note or "API 실패")
+                        pub_id = self.store.restore_unpublished_to_published(
+                            it.id, mall_id=new_mid
+                        )
+                        ok += 1
+                        if pub_id is not None:
+                            last_pub = pub_id
+                        self._put_log(
+                            f"등록해제→등록 완료 #{it.id} → 등록#{pub_id} / {new_mid}",
+                            channel=LOG_MALL,
+                        )
+                    except Exception as e:
+                        fail += 1
+                        self._put_log(
+                            f"등록해제→등록 실패 #{it.id}: {e}",
+                            channel=LOG_MALL,
+                        )
+
+                def finish() -> None:
+                    self._mark_catalog_dirty(push_now=True)
+                    if last_pub is not None and ok:
+                        self.current_unpublished_id = None
+                        self.current_published_id = last_pub
+                        self.list_mode.set("published")
+                        self._apply_mode_buttons()
+                    self.refresh_list()
+                    msg = f"다시 등록 완료: 성공 {ok} · 실패 {fail}"
+                    if fail and not ok:
+                        messagebox.showerror("다시 등록 실패", msg)
+                    else:
+                        messagebox.showinfo("다시 등록", msg)
+
+                self.after(0, finish)
+            except Exception as e:
+                self._put_log(f"등록해제→등록 오류: {e}", channel=LOG_MALL)
+                self.after(0, lambda: messagebox.showerror("다시 등록 실패", str(e)))
+            finally:
+                self.after(0, lambda: self._job_end("publish"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -5676,7 +7599,7 @@ class ManagerApp(tk.Tk):
         if code:
             return code
         code = (item.sku_no or "").strip()
-        if code and not code.startswith("88880"):
+        if code and not code.startswith("8888"):
             return code
         mall = (item.mall_id or "").strip()
         if mall.startswith("wg-"):
@@ -5868,7 +7791,7 @@ class ManagerApp(tk.Tk):
             return
         merged = self._merge_ai_items(picked, replace=False)
         codes = ", ".join(r["code"] for r in merged)
-        self._append(f"AI 상품선택: {len(picked)}개 추가 → 총 {len(merged)}개 ({codes})")
+        self._append(f"AI 상품선택: {len(picked)}개 추가 → 총 {len(merged)}개 ({codes})", channel=LOG_MALL)
         self.status.set(f"AI 코디 상품 {len(merged)}개 선택됨")
         messagebox.showinfo(
             "AI 상품선택",
@@ -6842,7 +8765,7 @@ class ManagerApp(tk.Tk):
             self.after(0, lambda: self._job_end("search"))
 
     def _start_google_search(self, *, image_index: int = 0) -> None:
-        if self.list_mode.get() != "products":
+        if not self._is_product_edit_mode():
             messagebox.showwarning("선택", "상품 목록에서 선택하세요.")
             return
         ids = self._selected_product_ids()
@@ -6860,7 +8783,7 @@ class ManagerApp(tk.Tk):
 
     def _on_google_selected(self, *, image_index: int = 0) -> None:
         """목록에서 선택한 상품을 이미지 검색 대기열에 넣어 제품명을 갱신."""
-        if self.list_mode.get() != "products":
+        if not self._is_product_edit_mode():
             messagebox.showwarning("선택", "상품 목록에서 선택하세요.")
             return
         ids = self._selected_product_ids()
@@ -6874,7 +8797,7 @@ class ManagerApp(tk.Tk):
         )
 
     def _on_exclude(self) -> None:
-        if self.list_mode.get() != "products":
+        if not self._is_product_edit_mode():
             return
         ids = self._selected_product_ids()
         if not ids:
@@ -6906,7 +8829,7 @@ class ManagerApp(tk.Tk):
 
         for pid in ids:
             eid = self.store.exclude_product(pid)
-            self._append(f"제외됨 #{pid} → 제외 목록 #{eid}")
+            self._append(f"제외됨 #{pid} → 제외 목록 #{eid}", channel=LOG_MALL)
         self._mark_catalog_dirty()
         self.current_excluded_id = None
         self.current_id = next_id
@@ -6930,7 +8853,7 @@ class ManagerApp(tk.Tk):
             return
         for eid in ids:
             self.store.unexclude(eid)
-            self._append(f"제외 해제 #{eid}")
+            self._append(f"제외 해제 #{eid}", channel=LOG_MALL)
         self._mark_catalog_dirty()
         self.current_excluded_id = None
         self.refresh_list()
@@ -6941,7 +8864,7 @@ class ManagerApp(tk.Tk):
         if mode == "published":
             self._on_merge_published_images()
             return
-        if mode != "products":
+        if mode not in ("products", "publish_fail"):
             return
         ids = self._selected_product_ids()
         if len(ids) < 2:
@@ -7135,7 +9058,7 @@ class ManagerApp(tk.Tk):
             after_site_cleanup()
 
     def _on_delete(self) -> None:
-        if self.list_mode.get() != "products":
+        if not self._is_product_edit_mode():
             return
         if self.current_id is None:
             return
@@ -7159,11 +9082,261 @@ class ManagerApp(tk.Tk):
             mode = self.list_mode.get()
             if mode == "published" and self.current_published_id is not None:
                 self._ensure_published_txt(path, self.current_published_id)
-            elif mode == "products" and self.current_id is not None:
+            elif mode in ("products", "publish_fail", "publishing") and self.current_id is not None:
                 self.store.write_product_txt(self.current_id, path)
         except Exception:
             pass
         os.startfile(str(path))  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _parse_analysis_result_txt(text: str) -> dict[str, str]:
+        """Parse analysis_result.txt → title/google_name/name_en/colors/sizes/tags."""
+        out: dict[str, str] = {}
+        fields: dict[str, str] = {}
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            m = re.match(r"^([^:：]{1,20})\s*[:：]\s*(.+)$", line)
+            if not m:
+                continue
+            key = re.sub(r"\s+", "", m.group(1)).lower()
+            fields[key] = m.group(2).strip()
+
+        name_raw = (
+            fields.get("상품명")
+            or fields.get("제품명")
+            or fields.get("productname")
+            or ""
+        ).strip()
+        if name_raw:
+            if " / " in name_raw:
+                ko, en = name_raw.split(" / ", 1)
+                out["title"] = ko.strip()
+                out["google_name"] = ko.strip()
+                if en.strip():
+                    out["name_en"] = en.strip()
+            else:
+                out["title"] = name_raw
+                out["google_name"] = name_raw
+
+        size_raw = (
+            fields.get("사이즈")
+            or fields.get("크기")
+            or fields.get("size")
+            or ""
+        ).strip()
+        if size_raw:
+            out["sizes"] = size_raw
+
+        color_raw = (
+            fields.get("컬러")
+            or fields.get("색상")
+            or fields.get("color")
+            or ""
+        ).strip()
+        if color_raw:
+            out["colors"] = color_raw
+
+        tag_raw = (
+            fields.get("태그")
+            or fields.get("상품태그")
+            or fields.get("标签")
+            or fields.get("tags")
+            or fields.get("tag")
+            or ""
+        ).strip()
+        if tag_raw:
+            out["tags"] = tag_raw
+        return out
+
+    def _on_folder_recheck(self) -> None:
+        """폴더의 analysis_result.txt → 제목·제품명·컬러·사이즈·태그·카테고리 반영.
+
+        상품 관리(images/{id}) · 등록 목록(published_covers/p{id}) 모두 지원.
+        등록 목록에서 반영 후 홈페이지 재등록을 바로 이어서 할 수 있음.
+        """
+        mode = self.list_mode.get()
+        if mode == "excluded":
+            messagebox.showinfo(
+                "폴더 재확인",
+                "제외 목록에서는 사용할 수 없습니다.\n상품 관리 또는 등록 목록에서 선택하세요.",
+            )
+            return
+        if mode == "unpublished":
+            messagebox.showinfo(
+                "폴더 재확인",
+                "등록해제 보관함에서는 사용할 수 없습니다.\n"
+                "다시 등록한 뒤 등록 목록에서 사용하세요.",
+            )
+            return
+        if mode == "publishing":
+            messagebox.showinfo(
+                "폴더 재확인",
+                "홈페이지 제품 등록중에는 사용할 수 없습니다.\n"
+                "등록이 끝난 뒤 상품·등록 탭에서 다시 시도하세요.",
+            )
+            return
+
+        is_published = mode == "published"
+        if is_published:
+            ids = self._selected_published_ids()
+            scope = "등록"
+        else:
+            ids = self._selected_product_ids()
+            scope = "상품"
+        if not ids:
+            messagebox.showwarning("폴더 재확인", "목록에서 상품을 선택하세요.")
+            return
+        if not messagebox.askyesno(
+            "폴더 재확인",
+            f"선택한 {scope} {len(ids)}건의 폴더에서 analysis_result.txt를 읽어\n"
+            "제목·제품명·컬러·사이즈·태그·카테고리를 반영할까요?"
+            + (
+                "\n\n반영 후 홈페이지 [재등록]으로 수정 내용을 올릴 수 있습니다."
+                if is_published
+                else ""
+            ),
+        ):
+            return
+
+        ok_n = 0
+        miss_n = 0
+        fail_n = 0
+        tag_n = 0
+        cat_n = 0
+        ok_ids: list[int] = []
+        miss_label = "analysis_result.txt 없음"
+
+        for oid in ids:
+            try:
+                if is_published:
+                    folder = self.store.published_img_root / f"p{oid}"
+                    prev = self.store.get_published(oid)
+                else:
+                    folder = self.store.img_root / str(oid)
+                    prev = self.store.get(oid)
+                txt_path = folder / "analysis_result.txt"
+                if not txt_path.is_file():
+                    if is_published:
+                        self.store.update_published(oid, title=miss_label)
+                    else:
+                        self.store.update_description(oid, title=miss_label)
+                    miss_n += 1
+                    self._put_log(
+                        f"폴더 재확인 #{oid}: {miss_label}",
+                        channel=LOG_OTHER,
+                    )
+                    continue
+                raw = txt_path.read_text(encoding="utf-8-sig")
+                parsed = self._parse_analysis_result_txt(raw)
+                if (
+                    not parsed.get("title")
+                    and not parsed.get("google_name")
+                    and not parsed.get("tags")
+                ):
+                    if is_published:
+                        self.store.update_published(oid, title=miss_label)
+                    else:
+                        self.store.update_description(oid, title=miss_label)
+                    miss_n += 1
+                    self._put_log(
+                        f"폴더 재확인 #{oid}: txt에 상품명/태그 없음 → 제목 표시",
+                        channel=LOG_OTHER,
+                    )
+                    continue
+
+                prev_title = (prev.title if prev else "") or ""
+                prev_google = (prev.google_name if prev else "") or ""
+                prev_en = (prev.name_en if prev else "") or ""
+                prev_cat = (prev.category if prev else "") or ""
+
+                tags = (parsed.get("tags") or "").strip() or None
+                category = None
+                if tags:
+                    tag_n += 1
+                    category = resolve_product_category(
+                        tags=tags,
+                        title=parsed.get("title") or prev_title,
+                        google_name=parsed.get("google_name") or prev_google,
+                        name_en=parsed.get("name_en") or prev_en,
+                        existing=prev_cat,
+                    )
+                    if category and category != prev_cat.strip():
+                        cat_n += 1
+
+                if is_published:
+                    self.store.update_published(
+                        oid,
+                        title=parsed.get("title"),
+                        google_name=parsed.get("google_name"),
+                        name_en=parsed.get("name_en"),
+                        colors=parsed.get("colors"),
+                        sizes=parsed.get("sizes"),
+                        tags=tags,
+                        category=category,
+                    )
+                else:
+                    self.store.update_description(
+                        oid,
+                        title=parsed.get("title"),
+                        google_name=parsed.get("google_name"),
+                        name_en=parsed.get("name_en"),
+                        colors=parsed.get("colors"),
+                        sizes=parsed.get("sizes"),
+                        tags=tags,
+                        category=category,
+                    )
+                ok_n += 1
+                ok_ids.append(oid)
+                cat_bit = f" → {category}" if category else ""
+                tag_bit = f" · 태그 {tags[:30]}" if tags else ""
+                self._put_log(
+                    f"폴더 재확인 #{oid}: {parsed.get('title', '')[:40]}{tag_bit}{cat_bit}",
+                    channel=LOG_OTHER,
+                )
+            except Exception as e:
+                fail_n += 1
+                self._put_log(f"폴더 재확인 #{oid} 실패: {e}", channel=LOG_OTHER)
+
+        self._mark_catalog_dirty()
+        self.refresh_list()
+        if is_published:
+            if (
+                self.current_published_id is not None
+                and self.current_published_id in ids
+            ):
+                fresh = self.store.get_published(self.current_published_id)
+                if fresh:
+                    self._show_published(fresh)
+        elif self.current_id is not None and self.current_id in ids:
+            fresh_p = self.store.get(self.current_id)
+            if fresh_p:
+                self._show_product(fresh_p)
+
+        summary = (
+            f"완료 — 반영 {ok_n}건"
+            + (f" · 태그 {tag_n}건" if tag_n else "")
+            + (f" · 카테고리변경 {cat_n}건" if cat_n else "")
+            + (f" · txt없음 {miss_n}건" if miss_n else "")
+            + (f" · 실패 {fail_n}건" if fail_n else "")
+        )
+        if is_published and ok_ids:
+            if messagebox.askyesno(
+                "폴더 재확인",
+                summary
+                + "\n\n반영된 "
+                + f"{len(ok_ids)}건을 홈페이지에 재등록(수정 반영)할까요?"
+                + "\n(이미 재등록 중이면 대기열에 추가됩니다)",
+            ):
+                self._republish_ids(ok_ids, confirm=False)
+            else:
+                messagebox.showinfo(
+                    "폴더 재확인",
+                    summary + "\n\n나중에 [재등록]을 누르면 홈페이지에 반영됩니다.",
+                )
+        else:
+            messagebox.showinfo("폴더 재확인", summary)
 
     def _resolve_image_folder(self) -> pathlib.Path:
         """Open the folder where product images were originally saved."""
@@ -7179,6 +9352,15 @@ class ManagerApp(tk.Tk):
                     images = list(item.image_paths or [])
                     break
             pack = self.store.published_img_root / f"p{self.current_published_id}"
+            if pack.is_dir():
+                return pack
+        elif mode == "unpublished" and self.current_unpublished_id is not None:
+            for item in self.unpublished_items:
+                if item.id == self.current_unpublished_id:
+                    cover = item.cover_path or ""
+                    images = list(item.image_paths or [])
+                    break
+            pack = self.store.unpublished_img_root / f"u{self.current_unpublished_id}"
             if pack.is_dir():
                 return pack
         elif mode == "excluded" and self.current_excluded_id is not None:
@@ -7229,7 +9411,7 @@ class ManagerApp(tk.Tk):
         def work() -> None:
             try:
                 ok, msg = start_debug(DEFAULT_PORT)
-                self._put_log(msg, channel=LOG_COLLECT)
+                self._put_log(msg, channel=LOG_COLLECT_WEIGOU)
                 self.after(
                     0,
                     lambda: messagebox.showinfo("실행", msg)
@@ -7241,7 +9423,32 @@ class ManagerApp(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _reset_collect_button(self) -> None:
+    def _on_wecatalog_chrome(self) -> None:
+        if is_manager_role():
+            messagebox.showinfo(
+                "관리(B) 모드", "관리(B) PC에서는 wecatalog Chrome을 사용하지 않습니다."
+            )
+            return
+        if not self._job_start("launch"):
+            self._warn_job_busy("launch")
+            return
+
+        def work() -> None:
+            try:
+                ok, msg = start_wecatalog_chrome()
+                self._put_log(msg, channel=LOG_COLLECT_WECATALOG)
+                self.after(
+                    0,
+                    lambda: messagebox.showinfo("wecatalog Chrome", msg)
+                    if ok
+                    else messagebox.showerror("실패", msg),
+                )
+            finally:
+                self.after(0, lambda: self._job_end("launch"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _reset_weigou_collect_button(self) -> None:
         try:
             self.btn_auto_collect.configure(
                 text="목록→상세 자동수집",
@@ -7253,18 +9460,425 @@ class ManagerApp(tk.Tk):
             pass
         self._collect_pause.clear()
 
+    def _reset_wecatalog_collect_button(self) -> None:
+        try:
+            self.btn_wecatalog_collect.configure(
+                text="wecatalog 수집",
+                bg="#0f766e",
+                fg="white",
+                activebackground="#115e59",
+            )
+        except Exception:
+            pass
+        self._wecatalog_pause.clear()
+
+    def _reset_collect_button(self) -> None:
+        """Reset both collect buttons (legacy callers / full stop)."""
+        self._reset_weigou_collect_button()
+        self._reset_wecatalog_collect_button()
+
+    def _wecatalog_failed_indices(self, tag_id: str | None) -> set[str]:
+        raw = self.store.get_setting(wecatalog_fail_setting_key(tag_id), "[]")
+        try:
+            data = json.loads(raw or "[]")
+        except Exception:
+            return set()
+        if not isinstance(data, list):
+            return set()
+        return {str(x).strip() for x in data if str(x).strip().isdigit()}
+
+    def _save_wecatalog_failed_indices(
+        self, tag_id: str | None, indices: list[str]
+    ) -> None:
+        uniq = sorted(set(indices), key=lambda x: int(x) if x.isdigit() else x)
+        self.store.set_setting(
+            wecatalog_fail_setting_key(tag_id),
+            json.dumps(uniq, ensure_ascii=False),
+        )
+
+    def _show_wecatalog_audit_report(self, text: str) -> None:
+        win = tk.Toplevel(self)
+        win.title("wecatalog 목록 대조 (index)")
+        win.geometry("760x540")
+        win.transient(self)
+        frm = tk.Frame(win)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+        box = scrolledtext.ScrolledText(
+            frm,
+            font=("Malgun Gothic", 10),
+            wrap=tk.WORD,
+        )
+        box.pack(fill="both", expand=True)
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        btn_row = tk.Frame(win)
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Button(
+            btn_row,
+            text="닫기",
+            command=win.destroy,
+            font=("Malgun Gothic", 10),
+        ).pack(side="right")
+
+    def _on_wecatalog_audit(self) -> None:
+        if is_manager_role():
+            messagebox.showinfo(
+                "관리(B) 모드", "관리(B) PC에서는 wecatalog 목록 대조를 사용하지 않습니다."
+            )
+            return
+        if self._job_running("wecatalog"):
+            messagebox.showwarning(
+                "작업 중",
+                "wecatalog 수집·대조가 이미 진행 중입니다. 완료 후 다시 시도해 주세요.",
+            )
+            return
+        if not is_wecatalog_cdp_up():
+            messagebox.showwarning(
+                "연결 없음",
+                "wecatalog Chrome(CDP)에 연결되지 않았습니다.\n"
+                "[wecatalog Chrome] 실행 후 목록 URL을 열어 주세요.",
+            )
+            return
+        href, parsed, err = preview_wecatalog_screen()
+        if err:
+            messagebox.showwarning("화면 확인", err)
+            return
+        if not messagebox.askyesno(
+            "목록 대조",
+            "현재 wecatalog Chrome 화면의 목록을 끝까지 스캔하고\n"
+            "프로그램 DB(지금까지 수집·등록·제외)와 index 번호별로 대조합니다.\n\n"
+            f"화면: {href[:80]}{'…' if len(href) > 80 else ''}\n\n"
+            "진행할까요?",
+        ):
+            return
+        if not self._job_start("wecatalog"):
+            self._warn_job_busy("wecatalog")
+            return
+        tag_id = parsed.tag_id if parsed else None
+        # 이전 대조에서 [중지]를 눌렀어도 새 대조는 정상적으로 시작해야 한다.
+        self._cancel_wecatalog.clear()
+        self._append("----- wecatalog 목록 대조 -----", channel=LOG_COLLECT_WECATALOG)
+        self._set_channel_progress(
+            LOG_COLLECT_WECATALOG,
+            done=0,
+            total=0,
+            action="wecatalog 대조",
+            detail="목록 스캔…",
+            indeterminate=True,
+        )
+        report_dir = str(default_root() / "logs" / "wecatalog_audit")
+
+        def work() -> None:
+            def on_progress(m: str) -> None:
+                self.after(0, lambda msg=m: self._put_log(msg, channel=LOG_COLLECT_WECATALOG))
+
+            try:
+                audit_db = build_wecatalog_audit_db(self.store)
+                report, msg = audit_wecatalog_list(
+                    on_progress=on_progress,
+                    cancel=self._cancel_wecatalog,
+                    audit_db=audit_db,
+                    failed_indices=self._wecatalog_failed_indices(tag_id),
+                    report_dir=report_dir,
+                )
+                self._put_log(msg, channel=LOG_COLLECT_WECATALOG)
+                self._finish_channel_progress(
+                    LOG_COLLECT_WECATALOG,
+                    summary=msg.split("\n")[0][:120] if msg else "대조 완료",
+                    done=1,
+                    total=1,
+                    ok=1,
+                    fail=0,
+                )
+                if not report:
+                    self.after(
+                        0,
+                        lambda: messagebox.showwarning("목록 대조", msg),
+                    )
+                    return
+                self.after(0, lambda t=report.text: self._show_wecatalog_audit_report(t))
+            except Exception as e:
+                err_msg = format_wecatalog_error(e)
+                self._put_log(f"대조 오류: {err_msg}", channel=LOG_COLLECT_WECATALOG)
+                self._finish_channel_progress(
+                    LOG_COLLECT_WECATALOG,
+                    summary=err_msg.split("\n")[0][:120],
+                    done=0,
+                    total=1,
+                    fail=1,
+                )
+                self.after(0, lambda m=err_msg: messagebox.showerror("오류", m))
+            finally:
+                self.after(0, lambda: self._job_end("wecatalog"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_wecatalog_collect(self) -> None:
+        if is_manager_role():
+            messagebox.showinfo(
+                "관리(B) 모드", "관리(B) PC에서는 wecatalog 수집을 사용하지 않습니다."
+            )
+            return
+        if self._job_running("wecatalog"):
+            if self._wecatalog_pause.is_set():
+                self._wecatalog_pause.clear()
+                self.btn_wecatalog_collect.configure(
+                    text="일시정지",
+                    bg="#b45309",
+                    fg="white",
+                    activebackground="#92400e",
+                )
+                self._append("wecatalog 수집 계속", channel=LOG_COLLECT_WECATALOG)
+                self.status.set("wecatalog 수집 재개")
+            else:
+                self._wecatalog_pause.set()
+                self.btn_wecatalog_collect.configure(
+                    text="수집 계속",
+                    bg="#15803d",
+                    fg="white",
+                    activebackground="#166534",
+                )
+                self._append("wecatalog 수집 일시정지", channel=LOG_COLLECT_WECATALOG)
+                self.status.set("wecatalog 수집 일시정지")
+            return
+
+        if not self._job_start("wecatalog"):
+            self._warn_job_busy("wecatalog")
+            return
+        if not is_wecatalog_cdp_up():
+            self._job_end("wecatalog")
+            messagebox.showwarning(
+                "연결 없음",
+                "wecatalog Chrome(CDP)에 연결되지 않았습니다.\n"
+                "[wecatalog Chrome] 실행 후 목록 URL을 열어 주세요.\n"
+                "(목록→상세 자동수집의 [디버그 실행]과는 별개입니다)",
+            )
+            return
+
+        href, parsed, err = preview_wecatalog_screen()
+        if err:
+            if messagebox.askyesno(
+                "화면 확인",
+                err
+                + "\n\n"
+                "wecatalog Chrome 창에 목록 URL을 열까요?\n"
+                "(일반 크롬 주소창 URL을 붙여넣으면 됩니다)",
+            ):
+                url = simpledialog.askstring(
+                    "wecatalog URL",
+                    "목록 URL (goods_list 또는 store + tagId):",
+                    parent=self,
+                )
+                if url:
+                    ok, open_msg = open_wecatalog_in_debug(url.strip())
+                    self._append(open_msg, channel=LOG_COLLECT_WECATALOG)
+                    if ok:
+                        href, parsed, err = preview_wecatalog_screen()
+            if err:
+                self._job_end("wecatalog")
+                messagebox.showwarning("화면 확인", err)
+                return
+
+        max_items = self._parse_collect_limit()
+        limit_txt = "무제한(화면 끝까지)" if max_items <= 0 else f"신규 {max_items}건"
+        tag_txt = f" · tagId={parsed.tag_id}" if parsed and parsed.tag_id else ""
+        if not messagebox.askyesno(
+            "wecatalog 수집",
+            "wecatalog Chrome 현재 화면에서 상품을 수집합니다.\n"
+            "맨 위부터 End 키로 확인하며 신규만 수집합니다 (전체 사전스캔 없음).\n"
+            "다른 URL로 이동하지 않습니다.\n\n"
+            f"· 현재 화면: {href[:85]}{'…' if len(href) > 85 else ''}{tag_txt}\n"
+            f"· 이번 수집 한도: {limit_txt}\n"
+            "  (이미 수집·제외·등록은 한도에 포함하지 않음)\n"
+            "· NO(搜索码) = A-검색코드 · 가격코드 = 가격문의하기\n"
+            "· 이미 수집 / 제외 / 등록 상품은 스킵\n\n"
+            "지금 화면 그대로 수집할까요?\n"
+            "(微购 자동수집과 동시에 실행할 수 있습니다)",
+        ):
+            self._job_end("wecatalog")
+            return
+
+        self._cancel_wecatalog.clear()
+        self._wecatalog_pause.clear()
+        self.btn_wecatalog_collect.configure(
+            text="일시정지",
+            bg="#b45309",
+            fg="white",
+            activebackground="#92400e",
+        )
+        self._append(
+            f"----- wecatalog 현재화면 수집 ({limit_txt}) -----",
+            channel=LOG_COLLECT_WECATALOG,
+        )
+        collect_total = max_items if max_items > 0 else 0
+        self._set_channel_progress(
+            LOG_COLLECT_WECATALOG,
+            done=0,
+            total=collect_total,
+            action="wecatalog",
+            detail=limit_txt,
+            indeterminate=collect_total <= 0,
+        )
+
+        def work() -> None:
+            ok_n = 0
+            fail_n = 0
+            auto_ex_n = 0
+            tag_id = parsed.tag_id if parsed else None
+            fail_buf: list[str] = []
+
+            def bump_collect(detail: str = "") -> None:
+                done = ok_n + auto_ex_n + fail_n
+                self._set_channel_progress(
+                    LOG_COLLECT_WECATALOG,
+                    done=done,
+                    total=collect_total,
+                    action="wecatalog",
+                    detail=detail or f"저장 {ok_n} · 제외 {auto_ex_n} · 실패 {fail_n}",
+                    ok=ok_n,
+                    fail=fail_n,
+                    indeterminate=collect_total <= 0,
+                )
+
+            def save_one(p) -> None:
+                nonlocal ok_n, fail_n, auto_ex_n
+                try:
+                    n_imgs = len(getattr(p, "image_urls", None) or [])
+                    pid = self.store.import_parsed(
+                        p, on_progress=lambda m: self._put_log(m, channel=LOG_COLLECT_WECATALOG)
+                    )
+                    if pid is not None and pid < 0:
+                        return
+                    if pid and n_imgs <= 2:
+                        eid = self.store.exclude_product(
+                            int(pid), note="자동제외: 이미지 1~2장"
+                        )
+                        auto_ex_n += 1
+                        self._put_log(
+                            f"이미지 {n_imgs}장 → 제외 목록 #{eid} "
+                            f"({getattr(p, 'title', '')[:40] or getattr(p, 'goods_id', '')})",
+                            channel=LOG_COLLECT_WECATALOG,
+                        )
+                    else:
+                        ok_n += 1
+                    bump_collect(
+                        f"#{getattr(p, 'goods_id', '') or pid} "
+                        f"저장 {ok_n} · 제외 {auto_ex_n} · 실패 {fail_n}"
+                    )
+                    self._mark_catalog_dirty()
+                    self.after(0, lambda: self._schedule_list_refresh(reload_detail=False))
+                except Exception as e:
+                    fail_n += 1
+                    bump_collect(str(e)[:80])
+                    self._put_log(f"저장 실패: {e}", channel=LOG_COLLECT_WECATALOG)
+
+            def on_collect_progress(m: str) -> None:
+                self._put_log(m, channel=LOG_COLLECT_WECATALOG)
+                if collect_total > 0:
+                    m_new = re.search(r"신규\s+(\d+)\s*/\s*(\d+)", m or "")
+                    if m_new:
+                        cur = int(m_new.group(1))
+                        tot = int(m_new.group(2))
+                        self._set_channel_progress(
+                            LOG_COLLECT_WECATALOG,
+                            done=cur,
+                            total=tot if tot > 0 else collect_total,
+                            action="wecatalog",
+                            detail=f"신규 {cur}/{tot}",
+                            ok=ok_n,
+                            fail=fail_n,
+                            indeterminate=False,
+                        )
+                        return
+                bump_collect((m or "")[:120])
+
+            try:
+                products, msg = collect_wecatalog(
+                    on_progress=on_collect_progress,
+                    on_product=save_one,
+                    cancel=self._cancel_wecatalog,
+                    pause=self._wecatalog_pause,
+                    max_items=max_items,
+                    known_goods_ids=(
+                        self.store.collected_goods_ids()
+                        | self.store.published_goods_ids()
+                        | self.store.excluded_goods_ids()
+                    ),
+                    known_image_urls=self.store.catalog_image_urls(),
+                    fail_indices_out=fail_buf,
+                )
+                if fail_buf:
+                    self._save_wecatalog_failed_indices(tag_id, fail_buf)
+                self._put_log(msg, channel=LOG_COLLECT_WECATALOG)
+                self._finish_channel_progress(
+                    LOG_COLLECT_WECATALOG,
+                    summary=msg or f"저장 {ok_n} · 제외 {auto_ex_n} · 실패 {fail_n}",
+                    done=ok_n if collect_total > 0 else ok_n + auto_ex_n + fail_n,
+                    total=collect_total if collect_total > 0 else max(ok_n + auto_ex_n + fail_n, 1),
+                    ok=ok_n,
+                    fail=fail_n,
+                )
+                if not products and ok_n == 0 and auto_ex_n == 0:
+                    self.after(
+                        0,
+                        lambda: messagebox.showwarning(
+                            "없음",
+                            msg or "수집된 상품이 없습니다.\n로그인·URL·태그를 확인해 주세요.",
+                        ),
+                    )
+                    return
+                self.after(0, lambda: self.refresh_list(reload_detail=False, quiet=True))
+                self.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "완료",
+                        f"wecatalog 수집 완료\n처리 {len(products)}건\n"
+                        f"상품관리 저장 {ok_n} · 이미지부족 제외 {auto_ex_n} · 실패 {fail_n}",
+                    ),
+                )
+            except Exception as e:
+                err = format_wecatalog_error(e)
+                self._put_log(f"오류: {err}", channel=LOG_COLLECT_WECATALOG)
+                self._finish_channel_progress(
+                    LOG_COLLECT_WECATALOG,
+                    summary=err.split("\n")[0][:120],
+                    done=ok_n + auto_ex_n + fail_n,
+                    total=collect_total if collect_total > 0 else max(ok_n + auto_ex_n + fail_n, 1),
+                    ok=ok_n,
+                    fail=fail_n,
+                )
+                self.after(0, lambda m=err: messagebox.showerror("오류", m))
+            finally:
+                self.after(0, self._reset_wecatalog_collect_button)
+                self.after(0, lambda: self._job_end("wecatalog"))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_cancel_job(self) -> None:
+        stopped_w = False
+        stopped_c = False
         if self._job_running("collect") or self._job_running("import"):
             self._collect_pause.clear()  # unblock pause wait
             self._cancel_job.set()
-            self._append("중지 요청… 수집/가져오기만 멈춥니다. (검색·등록은 계속됩니다)")
-        elif self._jobs_status_text():
-            self._append(
-                f"중지 대상 없음 — 현재: {self._jobs_status_text()} "
-                "(수집·가져오기만 중지 가능)"
-            )
-        else:
-            self._append("진행 중인 작업이 없습니다.")
+            stopped_w = True
+        if self._job_running("wecatalog"):
+            self._wecatalog_pause.clear()
+            self._cancel_wecatalog.set()
+            stopped_c = True
+        msg_stop = "중지 요청… 수집만 멈춥니다. (검색·등록은 계속됩니다)"
+        if stopped_w:
+            self._append(msg_stop, channel=LOG_COLLECT_WEIGOU)
+        if stopped_c:
+            self._append(msg_stop, channel=LOG_COLLECT_WECATALOG)
+        if not stopped_w and not stopped_c:
+            if self._jobs_status_text():
+                self._append(
+                    f"중지 대상 없음 — 현재: {self._jobs_status_text()} "
+                    "(수집만 중지 가능)",
+                    channel=LOG_OTHER,
+                )
+            else:
+                self._append("진행 중인 작업이 없습니다.", channel=LOG_OTHER)
 
     def _parse_collect_limit(self) -> int:
         """UI 수집개수 → max_items (0 = 무제한)."""
@@ -7300,7 +9914,7 @@ class ManagerApp(tk.Tk):
                     fg="white",
                     activebackground="#92400e",
                 )
-                self._append("수집 계속")
+                self._append("수집 계속", channel=LOG_COLLECT_WEIGOU)
                 self.status.set("자동수집 재개")
             else:
                 self._collect_pause.set()
@@ -7310,7 +9924,7 @@ class ManagerApp(tk.Tk):
                     fg="white",
                     activebackground="#166534",
                 )
-                self._append("수집 일시정지")
+                self._append("수집 일시정지", channel=LOG_COLLECT_WEIGOU)
                 self.status.set("자동수집 일시정지")
             return
 
@@ -7338,7 +9952,8 @@ class ManagerApp(tk.Tk):
             "· 이미 수집 / 제외 / 등록 → 상품ID로 패스\n"
             "· 하단 로딩 스피너면 기다린 뒤 계속\n"
             "· 이미지 1~2장 상품 → 제외 목록으로 자동 저장\n"
-            "· 같은 버튼 = 일시정지 / 수집 계속 · 완전 종료는 [중지]\n\n"
+            "· 같은 버튼 = 일시정지 / 수집 계속 · 완전 종료는 [중지]\n"
+            "· wecatalog 수집과 동시에 실행할 수 있습니다\n\n"
             "목록 화면을 연 상태로 두세요. 시작할까요?",
         ):
             self._job_end("collect")
@@ -7351,14 +9966,18 @@ class ManagerApp(tk.Tk):
             fg="white",
             activebackground="#92400e",
         )
-        self._append(f"----- 목록→상세 자동수집 시작 ({limit_txt}) -----")
+        self._append(
+            f"----- 목록→상세 자동수집 시작 ({limit_txt}) -----",
+            channel=LOG_COLLECT_WEIGOU,
+        )
         self._append(
             "상품ID 스킵 · 로딩 대기/회복 · 이미지 1~2장→제외 · "
-            "버튼=일시정지 · [중지]=종료"
+            "버튼=일시정지 · [중지]=종료",
+            channel=LOG_COLLECT_WEIGOU,
         )
         collect_total = max_items if max_items > 0 else 0
         self._set_channel_progress(
-            LOG_COLLECT,
+            LOG_COLLECT_WEIGOU,
             done=0,
             total=collect_total,
             action="수집중",
@@ -7374,7 +9993,7 @@ class ManagerApp(tk.Tk):
             def bump_collect(detail: str = "") -> None:
                 done = ok_n + auto_ex_n + fail_n
                 self._set_channel_progress(
-                    LOG_COLLECT,
+                    LOG_COLLECT_WEIGOU,
                     done=done,
                     total=collect_total,
                     action="수집중",
@@ -7389,7 +10008,7 @@ class ManagerApp(tk.Tk):
                 try:
                     # drop_second 전 원본 장수 기준 (배송 안내 장 제거와 무관)
                     n_imgs = len(getattr(p, "image_urls", None) or [])
-                    pid = self.store.import_parsed(p, on_progress=lambda m: self._put_log(m, channel=LOG_COLLECT))
+                    pid = self.store.import_parsed(p, on_progress=lambda m: self._put_log(m, channel=LOG_COLLECT_WEIGOU))
                     if pid is not None and pid < 0:
                         return
                     if pid and n_imgs <= 2:
@@ -7399,7 +10018,7 @@ class ManagerApp(tk.Tk):
                         auto_ex_n += 1
                         self._put_log(
                             f"이미지 {n_imgs}장 → 제외 목록 #{eid} "
-                            f"({getattr(p, 'title', '')[:40] or getattr(p, 'goods_id', '')})", channel=LOG_COLLECT)
+                            f"({getattr(p, 'title', '')[:40] or getattr(p, 'goods_id', '')})", channel=LOG_COLLECT_WEIGOU)
 
                     else:
                         ok_n += 1
@@ -7412,7 +10031,7 @@ class ManagerApp(tk.Tk):
                 except Exception as e:
                     fail_n += 1
                     bump_collect(str(e)[:80])
-                    self._put_log(f"저장 실패: {e}", channel=LOG_COLLECT)
+                    self._put_log(f"저장 실패: {e}", channel=LOG_COLLECT_WEIGOU)
             def refresh_skips():
                 return (
                     self.store.excluded_goods_ids(),
@@ -7421,7 +10040,7 @@ class ManagerApp(tk.Tk):
                 )
 
             def on_collect_progress(m: str) -> None:
-                self._put_log(m, channel=LOG_COLLECT)
+                self._put_log(m, channel=LOG_COLLECT_WEIGOU)
                 # "신규 열기 (3/100)" 형태면 게이지 동기화
                 m_open = re.search(r"신규 열기\s*\((\d+)\s*/\s*(\d+)", m or "")
                 if m_open and collect_total > 0:
@@ -7429,7 +10048,7 @@ class ManagerApp(tk.Tk):
                         cur = int(m_open.group(1))
                         tot = int(m_open.group(2))
                         self._set_channel_progress(
-                            LOG_COLLECT,
+                            LOG_COLLECT_WEIGOU,
                             done=max(0, cur - 1),
                             total=tot,
                             action="수집중",
@@ -7460,10 +10079,10 @@ class ManagerApp(tk.Tk):
                     max_items=max_items,
                     refresh_skips=refresh_skips,
                 )
-                self._put_log(msg, channel=LOG_COLLECT)
+                self._put_log(msg, channel=LOG_COLLECT_WEIGOU)
                 done_n = ok_n + auto_ex_n + fail_n
                 self._finish_channel_progress(
-                    LOG_COLLECT,
+                    LOG_COLLECT_WEIGOU,
                     summary=msg or f"저장 {ok_n} · 제외 {auto_ex_n} · 실패 {fail_n}",
                     done=done_n if collect_total <= 0 else min(done_n, collect_total) or collect_total,
                     total=collect_total if collect_total > 0 else max(done_n, 1),
@@ -7489,9 +10108,9 @@ class ManagerApp(tk.Tk):
                     ),
                 )
             except Exception as e:
-                self._put_log(f"오류: {e}", channel=LOG_COLLECT)
+                self._put_log(f"오류: {e}", channel=LOG_COLLECT_WEIGOU)
                 self._finish_channel_progress(
-                    LOG_COLLECT,
+                    LOG_COLLECT_WEIGOU,
                     summary=str(e),
                     done=ok_n + auto_ex_n + fail_n,
                     total=collect_total if collect_total > 0 else max(ok_n + auto_ex_n + fail_n, 1),
@@ -7500,7 +10119,7 @@ class ManagerApp(tk.Tk):
                 )
                 self.after(0, lambda: messagebox.showerror("오류", str(e)))
             finally:
-                self.after(0, self._reset_collect_button)
+                self.after(0, self._reset_weigou_collect_button)
                 self.after(0, lambda: self._job_end("collect"))
 
         threading.Thread(target=work, daemon=True).start()
@@ -7519,33 +10138,33 @@ class ManagerApp(tk.Tk):
         except tk.TclError:
             clip = ""
         self._cancel_job.clear()
-        self._append("----- 가져오기 시작 -----")
+        self._append("----- 가져오기 시작 -----", channel=LOG_COLLECT_WEIGOU)
 
         def work() -> None:
             try:
                 html, text, source, msg = collect_page_best(clip)
-                self._put_log(f"{msg} (source={source})", channel=LOG_COLLECT)
+                self._put_log(f"{msg} (source={source})", channel=LOG_COLLECT_WEIGOU)
                 products = parse_products(html, text)
                 if not products:
-                    self._put_log("상품을 찾지 못했습니다. 상세 화면이거나 목록을 스크롤한 뒤 다시 시도하세요.", channel=LOG_COLLECT)
+                    self._put_log("상품을 찾지 못했습니다. 상세 화면이거나 목록을 스크롤한 뒤 다시 시도하세요.", channel=LOG_COLLECT_WEIGOU)
                     self.after(0, lambda: messagebox.showwarning("없음", "상품을 찾지 못했습니다."))
                     return
-                self._put_log(f"인식된 상품 {len(products)}개", channel=LOG_COLLECT)
+                self._put_log(f"인식된 상품 {len(products)}개", channel=LOG_COLLECT_WEIGOU)
                 # 목록만 잡힌 경우(커버 위주) → 자동 상세 순회 제안은 로그로
                 if len(products) > 1:
                     avg_imgs = sum(len(p.image_urls) for p in products) / max(1, len(products))
                     if avg_imgs <= 1.5:
                         self._put_log(
-                            "목록 커버만 감지됨. 전체 갤러리는 [목록→상세 자동수집]을 사용하세요.", channel=LOG_COLLECT)
+                            "목록 커버만 감지됨. 전체 갤러리는 [목록→상세 자동수집]을 사용하세요.", channel=LOG_COLLECT_WEIGOU)
 
                 total_imp = len(products)
                 done_imp = {"n": 0}
 
                 def on_imp(m: str) -> None:
-                    self._put_log(m, channel=LOG_COLLECT)
+                    self._put_log(m, channel=LOG_COLLECT_WEIGOU)
                     done_imp["n"] = min(done_imp["n"] + 1, total_imp)
                     self._set_channel_progress(
-                        LOG_COLLECT,
+                        LOG_COLLECT_WEIGOU,
                         done=done_imp["n"],
                         total=total_imp,
                         action="가져오기중",
@@ -7553,7 +10172,7 @@ class ManagerApp(tk.Tk):
                     )
 
                 self._set_channel_progress(
-                    LOG_COLLECT,
+                    LOG_COLLECT_WEIGOU,
                     done=0,
                     total=total_imp,
                     action="가져오기중",
@@ -7561,7 +10180,7 @@ class ManagerApp(tk.Tk):
                 )
                 ok, fail = self.store.import_many(products, on_progress=on_imp)
                 self._finish_channel_progress(
-                    LOG_COLLECT,
+                    LOG_COLLECT_WEIGOU,
                     summary=f"성공 {ok} · 실패 {fail}",
                     done=total_imp,
                     total=total_imp,
@@ -7575,9 +10194,9 @@ class ManagerApp(tk.Tk):
                     lambda: messagebox.showinfo("완료", f"가져오기 완료\n성공 {ok} / 실패 {fail}"),
                 )
             except Exception as e:
-                self._put_log(f"오류: {e}", channel=LOG_COLLECT)
+                self._put_log(f"오류: {e}", channel=LOG_COLLECT_WEIGOU)
                 self._finish_channel_progress(
-                    LOG_COLLECT, summary=str(e), done=0, total=1, ok=0, fail=1
+                    LOG_COLLECT_WEIGOU, summary=str(e), done=0, total=1, ok=0, fail=1
                 )
                 self.after(0, lambda: messagebox.showerror("오류", str(e)))
             finally:

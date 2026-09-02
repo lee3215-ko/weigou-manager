@@ -20,7 +20,10 @@ BRAND_MAP = [
     ("ALAIA", "alaia", "알라이아"),
     ("ALAÏA", "alaia", "알라이아"),
     ("VALENTINO", "valentino", "발렌티노"),
-    ("MM6", "mm6", "엠엠식스"),
+    ("MAISON MARGIELA", "mm6", "메종마르지엘라"),
+    ("MAISONMARGIELA", "mm6", "메종마르지엘라"),
+    ("MARGIELA", "mm6", "메종마르지엘라"),
+    ("MM6", "mm6", "메종마르지엘라"),
     ("CHLOE", "chloe", "클로에"),
     ("CHLOÉ", "chloe", "클로에"),
     ("CHIOE", "chloe", "클로에"),
@@ -34,13 +37,91 @@ BRAND_MAP = [
     ("THEROW", "therow", "더로우"),
     ("CHROME HEARTS", "chromehearts", "크롬하츠"),
     ("CHROMHEARTS", "chromehearts", "크롬하츠"),
-    ("THOM BROWNE", "thombrowne", "톰브라운"),
+    ("THOM BROWNE", "tombrowne", "톰브라운"),
+    ("THOMBROWNE", "tombrowne", "톰브라운"),
+    ("TOMBROWNE", "tombrowne", "톰브라운"),
     ("CHANEL", "chanel", "샤넬"),
     ("CELINE", "celine", "셀린느"),
     ("GUCCI", "gucci", "구찌"),
     ("PRADA", "prada", "프라다"),
     ("FENDI", "fendi", "펜디"),
     ("DIOR", "dior", "디올"),
+    ("LOEWE", "loewe", "로에베"),
+    ("SALVATORE FERRAGAMO", "ferragamo", "페라가모"),
+    ("FERRAGAMO", "ferragamo", "페라가모"),
+    ("MONTBLANC", "montblanc", "몽블랑"),
+    ("MONT BLANC", "montblanc", "몽블랑"),
+    ("ZEGNA", "zegna", "제냐"),
+    ("ERMENEGILDO ZEGNA", "zegna", "제냐"),
+    ("CARTIER", "cartier", "까르띠에"),
+    ("MONCLER", "moncler", "몽클레르"),
+    ("LORO PIANA", "loropiana", "로로피아나"),
+    ("LOROPIANA", "loropiana", "로로피아나"),
+    ("CALVIN KLEIN", "calvin", "캘빈"),
+    ("CALVIN", "calvin", "캘빈"),
+    ("JACQUEMUS", "jacquemus", "자크뮈스"),
+    ("ACNE STUDIOS", "acnestudios", "아크네 스튜디오"),
+    ("ACNESTUDIOS", "acnestudios", "아크네 스튜디오"),
+    ("MOYNAT", "moynat", "모이나"),
+    ("GIVENCHY", "givenchy", "지방시"),
+    ("LEMAIRE", "lemaire", "르메르"),
+    ("TORY BURCH", "toryburch", "토리 버치"),
+    ("TORYBURCH", "toryburch", "토리 버치"),
+    ("VETEMENTS", "vetements", "베트멍"),
+    ("TIFFANY", "tiffany", "티파니"),
+    ("BVLGARI", "bvlgari", "불가리"),
+    ("BULGARI", "bvlgari", "불가리"),
+    ("TOM FORD", "tomford", "톰 포드"),
+    ("TOMFORD", "tomford", "톰 포드"),
+    ("COACH", "coach", "코치"),
+    ("DOLCE & GABBANA", "dolcegabbana", "돌체앤가바나"),
+    ("DOLCE GABBANA", "dolcegabbana", "돌체앤가바나"),
+    ("DOLCE&GABBANA", "dolcegabbana", "돌체앤가바나"),
+    ("D&G", "dolcegabbana", "돌체앤가바나"),
+    ("MAX MARA", "maxmara", "막스마라"),
+    ("MAXMARA", "maxmara", "막스마라"),
+    ("BALMAIN", "balmain", "발망"),
+    ("HUGO BOSS", "hugoboss", "휴고보스"),
+    ("HUGOBOSS", "hugoboss", "휴고보스"),
+    ("BRUNELLO CUCINELLI", "brunellocucinelli", "브루넬로 쿠치넬리"),
+    ("ROGER VIVIER", "rogervivier", "로저 비비에"),
+    ("ALEXANDER WANG", "alexanderwang", "알렉산더 왕"),
+    ("ALEXANDERWANG", "alexanderwang", "알렉산더 왕"),
+    ("ISABEL MARANT", "isabelmarant", "이자벨 마랑"),
+    ("ISABELMARANT", "isabelmarant", "이자벨 마랑"),
+    ("POLO RALPH LAUREN", "poloralphlauren", "폴로 랄프 로렌"),
+    ("RALPH LAUREN", "poloralphlauren", "폴로 랄프 로렌"),
+    ("POLORALPHLAUREN", "poloralphlauren", "폴로 랄프 로렌"),
+    ("RALPHLAUREN", "poloralphlauren", "폴로 랄프 로렌"),
+    ("TAG HEUER", "tagheuer", "태그호이어"),
+    ("TAGHEUER", "tagheuer", "태그호이어"),
+    ("LONGINES", "longines", "론진"),
+    ("GIORGIO ARMANI", "armani", "아르마니"),
+    ("EMPORIO ARMANI", "armani", "아르마니"),
+    ("ARMANI", "armani", "아르마니"),
+    ("VERSACE", "versace", "베르사체"),
+    ("ROLEX", "rolex", "롤렉스"),
+    ("OMEGA", "omega", "오메가"),
+    ("JIMMY CHOO", "jimmychoo", "지미추"),
+    ("JIMMYCHOO", "jimmychoo", "지미추"),
+    ("CHRISTIAN LOUBOUTIN", "christianlouboutin", "크리스찬 루부탱"),
+    ("CHRISTIANLOUBOUTIN", "christianlouboutin", "크리스찬 루부탱"),
+    ("LOUBOUTIN", "christianlouboutin", "크리스찬 루부탱"),
+    ("DAIMON LATRIE", "daimonlatrie", "다이몬 라트리"),
+    ("DAIMONLATRIE", "daimonlatrie", "다이몬 라트리"),
+    ("PHOEBE PHILO", "phoebephilo", "피비 파일로"),
+    ("PHOEBEPHILO", "phoebephilo", "피비 파일로"),
+    ("KHAITE", "khaite", "카이트"),
+    ("UNFOLIO", "unfolio", "언폴리오"),
+    ("NIKE", "nike", "나이키"),
+    ("NEW BALANCE", "newbalance", "뉴발란스"),
+    ("NEWBALANCE", "newbalance", "뉴발란스"),
+    ("NB", "newbalance", "뉴발란스"),
+    ("ADIDAS", "adidas", "아디다스"),
+    ("UGG", "ugg", "어그"),
+    ("ALEXANDER MCQUEEN", "alexandermcqueen", "알렉산더 맥퀸"),
+    ("ALEXANDERMCQUEEN", "alexandermcqueen", "알렉산더 맥퀸"),
+    ("MCQUEEN", "alexandermcqueen", "알렉산더 맥퀸"),
     ("YSL", "ysl", "생로랑"),
     ("LV", "louisvuitton", "루이비통"),
     ("루이비통", "louisvuitton", "루이비통"),
@@ -52,8 +133,9 @@ BRAND_MAP = [
     ("델보", "delvaux", "델보"),
     ("알라이아", "alaia", "알라이아"),
     ("발렌티노", "valentino", "발렌티노"),
-    ("엠엠식스", "mm6", "엠엠식스"),
-    ("MM6", "mm6", "엠엠식스"),
+    ("엠엠식스", "mm6", "메종마르지엘라"),
+    ("메종마르지엘라", "mm6", "메종마르지엘라"),
+    ("마르지엘라", "mm6", "메종마르지엘라"),
     ("클로에", "chloe", "클로에"),
     ("골든구스", "goldengoose", "골든구스"),
     ("미우미우", "miumiu", "미우미우"),
@@ -66,8 +148,83 @@ BRAND_MAP = [
     ("프라다", "prada", "프라다"),
     ("디올", "dior", "디올"),
     ("펜디", "fendi", "펜디"),
-    ("톰브라운", "thombrowne", "톰브라운"),
+    ("로에베", "loewe", "로에베"),
+    ("톰브라운", "tombrowne", "톰브라운"),
     ("크롬하츠", "chromehearts", "크롬하츠"),
+    ("페라가모", "ferragamo", "페라가모"),
+    ("페레가모", "ferragamo", "페라가모"),
+    ("몽블랑", "montblanc", "몽블랑"),
+    ("제냐", "zegna", "제냐"),
+    ("까르띠에", "cartier", "까르띠에"),
+    ("카르티에", "cartier", "까르띠에"),
+    ("몽클레르", "moncler", "몽클레르"),
+    ("로로피아나", "loropiana", "로로피아나"),
+    ("로로 피아나", "loropiana", "로로피아나"),
+    ("캘빈", "calvin", "캘빈"),
+    ("캘빈클라인", "calvin", "캘빈"),
+    ("자크뮈스", "jacquemus", "자크뮈스"),
+    ("아크네 스튜디오", "acnestudios", "아크네 스튜디오"),
+    ("아크네스튜디오", "acnestudios", "아크네 스튜디오"),
+    ("모이나", "moynat", "모이나"),
+    ("지방시", "givenchy", "지방시"),
+    ("르메르", "lemaire", "르메르"),
+    ("토리 버치", "toryburch", "토리 버치"),
+    ("토리버치", "toryburch", "토리 버치"),
+    ("베트멍", "vetements", "베트멍"),
+    ("티파니", "tiffany", "티파니"),
+    ("불가리", "bvlgari", "불가리"),
+    ("톰 포드", "tomford", "톰 포드"),
+    ("톰포드", "tomford", "톰 포드"),
+    ("코치", "coach", "코치"),
+    ("돌체앤가바나", "dolcegabbana", "돌체앤가바나"),
+    ("막스마라", "maxmara", "막스마라"),
+    ("발망", "balmain", "발망"),
+    ("휴고보스", "hugoboss", "휴고보스"),
+    ("브루넬로 쿠치넬리", "brunellocucinelli", "브루넬로 쿠치넬리"),
+    ("로저 비비에", "rogervivier", "로저 비비에"),
+    ("알렉산더 왕", "alexanderwang", "알렉산더 왕"),
+    ("알렉산더왕", "alexanderwang", "알렉산더 왕"),
+    ("이자벨 마랑", "isabelmarant", "이자벨 마랑"),
+    ("이자벨마랑", "isabelmarant", "이자벨 마랑"),
+    ("폴로 랄프 로렌", "poloralphlauren", "폴로 랄프 로렌"),
+    ("폴로랄프로렌", "poloralphlauren", "폴로 랄프 로렌"),
+    ("랄프 로렌", "poloralphlauren", "폴로 랄프 로렌"),
+    ("랄프로렌", "poloralphlauren", "폴로 랄프 로렌"),
+    ("태그호이어", "tagheuer", "태그호이어"),
+    ("태그 호이어", "tagheuer", "태그호이어"),
+    ("론진", "longines", "론진"),
+    ("아르마니", "armani", "아르마니"),
+    ("조르지오 아르마니", "armani", "아르마니"),
+    ("조르지오아르마니", "armani", "아르마니"),
+    ("엠포리오 아르마니", "armani", "아르마니"),
+    ("엠포리오아르마니", "armani", "아르마니"),
+    ("베르사체", "versace", "베르사체"),
+    ("롤렉스", "rolex", "롤렉스"),
+    ("오메가", "omega", "오메가"),
+    ("지미추", "jimmychoo", "지미추"),
+    ("지미 추", "jimmychoo", "지미추"),
+    ("크리스찬 루부탱", "christianlouboutin", "크리스찬 루부탱"),
+    ("크리스찬루부탱", "christianlouboutin", "크리스찬 루부탱"),
+    ("크리스챤 루부탱", "christianlouboutin", "크리스찬 루부탱"),
+    ("크리스챤루부탱", "christianlouboutin", "크리스찬 루부탱"),
+    ("루부탱", "christianlouboutin", "크리스찬 루부탱"),
+    ("다이몬 라트리", "daimonlatrie", "다이몬 라트리"),
+    ("다이몬라트리", "daimonlatrie", "다이몬 라트리"),
+    ("피비 파일로", "phoebephilo", "피비 파일로"),
+    ("피비파일로", "phoebephilo", "피비 파일로"),
+    ("피비 필로", "phoebephilo", "피비 파일로"),
+    ("피비필로", "phoebephilo", "피비 파일로"),
+    ("카이트", "khaite", "카이트"),
+    ("케이트", "khaite", "카이트"),
+    ("언폴리오", "unfolio", "언폴리오"),
+    ("나이키", "nike", "나이키"),
+    ("뉴발란스", "newbalance", "뉴발란스"),
+    ("뉴 발란스", "newbalance", "뉴발란스"),
+    ("아디다스", "adidas", "아디다스"),
+    ("어그", "ugg", "어그"),
+    ("알렉산더 맥퀸", "alexandermcqueen", "알렉산더 맥퀸"),
+    ("알렉산더맥퀸", "alexandermcqueen", "알렉산더 맥퀸"),
+    ("맥퀸", "alexandermcqueen", "알렉산더 맥퀸"),
     # Chinese Weigou labels
     ("路易威登", "louisvuitton", "루이비통"),
     ("圣罗兰", "ysl", "생로랑"),
@@ -98,6 +255,71 @@ BRAND_MAP = [
     ("普拉达", "prada", "프라다"),
     ("迪奥", "dior", "디올"),
     ("芬迪", "fendi", "펜디"),
+    ("罗意威", "loewe", "로에베"),
+    ("羅意威", "loewe", "로에베"),
+    ("菲拉格慕", "ferragamo", "페라가모"),
+    ("蒙布朗", "montblanc", "몽블랑"),
+    ("杰尼亚", "zegna", "제냐"),
+    ("杰尼亞", "zegna", "제냐"),
+    ("卡地亚", "cartier", "까르띠에"),
+    ("卡地亞", "cartier", "까르띠에"),
+    ("盟可睐", "moncler", "몽클레르"),
+    ("蒙口", "moncler", "몽클레르"),
+    ("诺悠翩雅", "loropiana", "로로피아나"),
+    ("諾悠翩雅", "loropiana", "로로피아나"),
+    ("洛罗皮亚纳", "loropiana", "로로피아나"),
+    ("凯文克莱", "calvin", "캘빈"),
+    ("雅格慕", "jacquemus", "자크뮈스"),
+    ("艾克妮", "acnestudios", "아크네 스튜디오"),
+    ("摩奈", "moynat", "모이나"),
+    ("纪梵希", "givenchy", "지방시"),
+    ("紀梵希", "givenchy", "지방시"),
+    ("勒梅尔", "lemaire", "르메르"),
+    ("托里伯奇", "toryburch", "토리 버치"),
+    ("维特萌", "vetements", "베트멍"),
+    ("蒂芙尼", "tiffany", "티파니"),
+    ("宝格丽", "bvlgari", "불가리"),
+    ("湯福特", "tomford", "톰 포드"),
+    ("汤姆福特", "tomford", "톰 포드"),
+    ("蔻驰", "coach", "코치"),
+    ("杜嘉班纳", "dolcegabbana", "돌체앤가바나"),
+    ("麦丝玛拉", "maxmara", "막스마라"),
+    ("巴尔曼", "balmain", "발망"),
+    ("雨果博斯", "hugoboss", "휴고보스"),
+    ("布鲁内洛库奇内利", "brunellocucinelli", "브루넬로 쿠치넬리"),
+    ("罗杰维维亚", "rogervivier", "로저 비비에"),
+    ("亚历山大王", "alexanderwang", "알렉산더 왕"),
+    ("亚历山大·王", "alexanderwang", "알렉산더 왕"),
+    ("伊莎贝尔玛兰", "isabelmarant", "이자벨 마랑"),
+    ("伊莎贝尔·玛兰", "isabelmarant", "이자벨 마랑"),
+    ("拉夫劳伦", "poloralphlauren", "폴로 랄프 로렌"),
+    ("拉尔夫劳伦", "poloralphlauren", "폴로 랄프 로렌"),
+    ("保罗拉尔夫劳伦", "poloralphlauren", "폴로 랄프 로렌"),
+    ("泰格豪雅", "tagheuer", "태그호이어"),
+    ("浪琴", "longines", "론진"),
+    ("阿玛尼", "armani", "아르마니"),
+    ("阿瑪尼", "armani", "아르마니"),
+    ("范思哲", "versace", "베르사체"),
+    ("劳力士", "rolex", "롤렉스"),
+    ("勞力士", "rolex", "롤렉스"),
+    ("欧米茄", "omega", "오메가"),
+    ("歐米茄", "omega", "오메가"),
+    ("周仰杰", "jimmychoo", "지미추"),
+    ("克里斯提鲁布托", "christianlouboutin", "크리스찬 루부탱"),
+    ("克里斯提·鲁布托", "christianlouboutin", "크리스찬 루부탱"),
+    ("克里斯提安鲁布托", "christianlouboutin", "크리스찬 루부탱"),
+    ("克里斯提安·鲁布托", "christianlouboutin", "크리스찬 루부탱"),
+    ("菲比菲罗", "phoebephilo", "피비 파일로"),
+    ("菲比·菲罗", "phoebephilo", "피비 파일로"),
+    ("菲比菲洛", "phoebephilo", "피비 파일로"),
+    ("耐克", "nike", "나이키"),
+    ("新百伦", "newbalance", "뉴발란스"),
+    ("新百倫", "newbalance", "뉴발란스"),
+    ("阿迪达斯", "adidas", "아디다스"),
+    ("阿迪達斯", "adidas", "아디다스"),
+    ("UGG", "ugg", "어그"),
+    ("亚历山大麦昆", "alexandermcqueen", "알렉산더 맥퀸"),
+    ("亚历山大·麦昆", "alexandermcqueen", "알렉산더 맥퀸"),
 ]
 
 COLOR_WORDS = [
@@ -257,7 +479,8 @@ def _detect_brand(text: str) -> tuple[str, str]:
     for key, bid, name in sorted(BRAND_MAP, key=lambda x: -len(x[0])):
         if key.isascii():
             if len(key) <= 3:
-                if re.search(rf"\b{re.escape(key)}\b", upper):
+                # Latin-only boundaries so "UGG雪地靴" still matches (Unicode \b does not).
+                if re.search(rf"(?<![A-Z0-9]){re.escape(key)}(?![A-Z0-9])", upper):
                     return bid, name
             elif key in upper:
                 return bid, name
@@ -559,12 +782,37 @@ def _shoe_sizes(start: int, end: int) -> list[str]:
 
 
 def _parse_bag_dimension(text: str) -> str:
-    """size 21*11.5*4.5 / 21x11.5x4.5 / bare 21*11.5*4.5"""
+    """size 21*11.5*4.5 / 长53.8✖️高33✖️宽19.8cm / bare 21*11.5*4.5"""
+    cn_patterns = (
+        (
+            r"长\s*(\d+(?:\.\d+)?)\s*(?:cm|CM)?\s*"
+            r"(?:[×xX*✖\uFE0F]|✖️)\s*"
+            r"高\s*(\d+(?:\.\d+)?)\s*(?:cm|CM)?\s*"
+            r"(?:[×xX*✖\uFE0F]|✖️)\s*"
+            r"宽\s*(\d+(?:\.\d+)?)\s*(?:cm|CM)?"
+        ),
+        (
+            r"长\s*(\d+(?:\.\d+)?)\s*(?:cm|CM)?\s*"
+            r"(?:[×xX*✖\uFE0F]|✖️)\s*"
+            r"宽\s*(\d+(?:\.\d+)?)\s*(?:cm|CM)?\s*"
+            r"(?:[×xX*✖\uFE0F]|✖️)\s*"
+            r"高\s*(\d+(?:\.\d+)?)\s*(?:cm|CM)?"
+        ),
+    )
+    for pat in cn_patterns:
+        m = re.search(pat, text, re.I)
+        if not m:
+            continue
+        nums = [float(m.group(i)) for i in range(1, 4)]
+        if any(n >= 150 for n in nums):
+            continue
+        return "*".join(m.group(i) for i in range(1, 4))
+
     patterns = [
-        r"(?:size|사이즈|치수)\s*[：:\s]*"
-        r"(\d+(?:\.\d+)?\s*[xX*×]\s*\d+(?:\.\d+)?(?:\s*[xX*×]\s*\d+(?:\.\d+)?)?)",
-        r"(?<![\d.])(\d+(?:\.\d+)?\s*[xX*×]\s*\d+(?:\.\d+)?\s*[xX*×]\s*\d+(?:\.\d+)?)(?![\d.])",
-        r"(?<![\d.])(\d+(?:\.\d+)?\s*[xX*×]\s*\d+(?:\.\d+)?)(?![\d.\-])",
+        r"(?:size|사이즈|치수|크기|尺寸)\s*[：:\s]*"
+        r"(\d+(?:\.\d+)?\s*[xX*×✖\uFE0F]\s*\d+(?:\.\d+)?(?:\s*[xX*×✖\uFE0F]\s*\d+(?:\.\d+)?)?)",
+        r"(?<![\d.])(\d+(?:\.\d+)?\s*[xX*×✖\uFE0F]\s*\d+(?:\.\d+)?\s*[xX*×✖\uFE0F]\s*\d+(?:\.\d+)?)(?![\d.])",
+        r"(?<![\d.])(\d+(?:\.\d+)?\s*[xX*×✖\uFE0F]\s*\d+(?:\.\d+)?)(?![\d.\-])",
     ]
     for pat in patterns:
         m = re.search(pat, text, re.I)
@@ -575,6 +823,7 @@ def _parse_bag_dimension(text: str) -> str:
         if "-" in raw or "～" in raw:
             continue
         dim = re.sub(r"\s+", "", raw).replace("×", "*").replace("x", "*").replace("X", "*")
+        dim = dim.replace("✖", "*").replace("\ufe0f", "")
         parts = dim.split("*")
         # bag dims are usually small numbers (<100), not shoe mm
         try:
@@ -902,6 +1151,24 @@ def _shop_tag_category(tags: str) -> str | None:
     ):
         return "벨트"
 
+    if _has_any(
+        text,
+        lower,
+        (
+            "시계",
+            "손목시계",
+            "워치",
+            "手表",
+            "腕表",
+            "watch",
+            "watches",
+            "wristwatch",
+            "腕時計",
+            "クロノグラフ",
+        ),
+    ):
+        return "시계"
+
     if _has_scarf_cue(text, lower) or _has_any(
         text,
         lower,
@@ -910,8 +1177,6 @@ def _shop_tag_category(tags: str) -> str | None:
             "钱包",
             "wallet",
             "卡包",
-            "watch",
-            "시계",
             "목걸이",
             "귀걸이",
             "팔찌",
@@ -1111,6 +1376,25 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
     ):
         return "벨트"
 
+    # 5b) Watches
+    if _has_any(
+        text,
+        lower,
+        (
+            "시계",
+            "손목시계",
+            "워치",
+            "手表",
+            "腕表",
+            "watch",
+            "watches",
+            "wristwatch",
+            "腕時計",
+            "クロノグラフ",
+        ),
+    ):
+        return "시계"
+
     # 6) Other accessories
     if _has_any(
         text,
@@ -1120,8 +1404,6 @@ def _detect_category(text: str, is_shoes: bool, dimension: str = "") -> str:
             "钱包",
             "wallet",
             "卡包",
-            "watch",
-            "시계",
             "목걸이",
             "귀걸이",
             "팔찌",

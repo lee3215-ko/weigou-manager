@@ -1,4 +1,4 @@
-﻿{
+{
   "github_owner": "lee3215-ko",
   "github_repo": "weigou-manager",
   "release_asset": "WeigouManager.zip",
@@ -32,6 +32,7 @@
     "price_codec.py",
     "ime_win.py",
     "auto_collect.py",
+    "wecatalog_collect.py",
     "collector.py",
     "launcher.py",
     "image_enhance.py",

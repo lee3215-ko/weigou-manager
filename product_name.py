@@ -21,7 +21,11 @@ _BRANDS = [
     (r"德尔沃|德尔福|DELVAUX|델보", "델보", "Delvaux"),
     (r"阿莱娅|阿拉亚|ALA[IÏ]A|알라이아", "알라이아", "Alaïa"),
     (r"华伦天奴|瓦伦蒂诺|VALENTINO|발렌티노", "발렌티노", "Valentino"),
-    (r"\bMM6\b|엠엠식스", "엠엠식스", "MM6"),
+    (
+        r"MAISON\s*MARGIELA|MARGIELA|\bMM6\b|메종마르지엘라|마르지엘라|엠엠식스",
+        "메종마르지엘라",
+        "Maison Margiela",
+    ),
     (r"蔻依|克洛伊|CHLO[EÉ]|CHIOE|클로에", "클로에", "Chloé"),
     (r"小鹅|金鹅|GOLDEN\s*GOOSE|\bGGDB\b|골든구스", "골든구스", "Golden Goose"),
     (r"缪缪|MIU\s*MIU|미우미우", "미우미우", "Miu Miu"),
@@ -34,6 +38,120 @@ _BRANDS = [
     (r"迪奥|DIOR|디올", "디올", "Dior"),
     (r"古驰|GUCCI|구찌", "구찌", "Gucci"),
     (r"芬迪|FENDI|펜디", "펜디", "Fendi"),
+    (r"罗意威|羅尼威|LOEWE|로에베", "로에베", "Loewe"),
+    (
+        r"诺悠翩雅|諾悠翩雅|洛罗皮亚纳|LORO\s*PIANA|로로\s*피아나|로로피아나",
+        "로로피아나",
+        "Loro Piana",
+    ),
+    (r"盟可睐|蒙口|MONCLER|몽클레르", "몽클레르", "Moncler"),
+    (r"凯文克莱|CALVIN(?:\s*KLEIN)?|캘빈(?:\s*클라인)?", "캘빈", "Calvin"),
+    (r"雅格慕|JACQUEMUS|자크뮈스", "자크뮈스", "Jacquemus"),
+    (r"艾克妮|ACNE\s*STUDIOS|아크네\s*스튜디오", "아크네 스튜디오", "Acne Studios"),
+    (r"摩奈|MOYNAT|모이나", "모이나", "Moynat"),
+    (r"纪梵希|紀梵希|GIVENCHY|지방시", "지방시", "Givenchy"),
+    (r"勒梅尔|LEMAIRE|르메르", "르메르", "Lemaire"),
+    (r"托里伯奇|TORY\s*BURCH|토리\s*버치|토리버치", "토리 버치", "Tory Burch"),
+    (r"维特萌|VETEMENTS|베트멍", "베트멍", "Vetements"),
+    (r"蒂芙尼|TIFFANY|티파니", "티파니", "Tiffany"),
+    (r"宝格丽|BVLGARI|BULGARI|불가리", "불가리", "Bvlgari"),
+    (r"汤姆福特|湯福特|TOM\s*FORD|톰\s*포드|톰포드", "톰 포드", "Tom Ford"),
+    (r"蔻驰|COACH|코치", "코치", "Coach"),
+    (
+        r"杜嘉班纳|DOLCE\s*&\s*GABBANA|DOLCE\s*GABBANA|\bD&G\b|돌체앤가바나",
+        "돌체앤가바나",
+        "Dolce & Gabbana",
+    ),
+    (r"麦丝玛拉|MAX\s*MARA|막스마라", "막스마라", "Max Mara"),
+    (r"巴尔曼|BALMAIN|발망", "발망", "Balmain"),
+    (r"雨果博斯|HUGO\s*BOSS|휴고보스", "휴고보스", "Hugo Boss"),
+    (
+        r"布鲁内洛库奇内利|BRUNELLO\s*CUCINELLI|브루넬로\s*쿠치넬리",
+        "브루넬로 쿠치넬리",
+        "Brunello Cucinelli",
+    ),
+    (r"罗杰维维亚|ROGER\s*VIVIER|로저\s*비비에", "로저 비비에", "Roger Vivier"),
+    (
+        r"亚历山大王|亚历山大·王|ALEXANDER\s*WANG|알렉산더\s*왕|알렉산더왕",
+        "알렉산더 왕",
+        "Alexander Wang",
+    ),
+    (
+        r"伊莎贝尔玛兰|伊莎贝尔·玛兰|ISABEL\s*MARANT|이자벨\s*마랑|이자벨마랑",
+        "이자벨 마랑",
+        "Isabel Marant",
+    ),
+    (
+        r"拉夫劳伦|拉尔夫劳伦|保罗拉尔夫劳伦|POLO\s*RALPH\s*LAUREN|RALPH\s*LAUREN|"
+        r"폴로\s*랄프\s*로렌|폴로랄프로렌|랄프\s*로렌|랄프로렌",
+        "폴로 랄프 로렌",
+        "Polo Ralph Lauren",
+    ),
+    (
+        r"泰格豪雅|TAG\s*HEUER|태그\s*호이어|태그호이어",
+        "태그호이어",
+        "TAG Heuer",
+    ),
+    (r"浪琴|LONGINES|론진", "론진", "Longines"),
+    (
+        r"阿玛尼|阿瑪尼|GIORGIO\s*ARMANI|EMPORIO\s*ARMANI|ARMANI|"
+        r"조르지오\s*아르마니|엠포리오\s*아르마니|아르마니",
+        "아르마니",
+        "Armani",
+    ),
+    (r"范思哲|VERSACE|베르사체", "베르사체", "Versace"),
+    (r"劳力士|勞力士|ROLEX|롤렉스", "롤렉스", "Rolex"),
+    (r"欧米茄|歐米茄|OMEGA|오메가", "오메가", "Omega"),
+    (
+        r"周仰杰|JIMMY\s*CHOO|지미\s*추|지미추",
+        "지미추",
+        "Jimmy Choo",
+    ),
+    (
+        r"克里斯提(?:安)?[·・]?\s*鲁布托|CHRISTIAN\s*LOUBOUTIN|LOUBOUTIN|"
+        r"크리스찬\s*루부탱|크리스찬루부탱|크리스챤\s*루부탱|크리스챤루부탱|루부탱",
+        "크리스찬 루부탱",
+        "Christian Louboutin",
+    ),
+    (
+        r"DAIMON\s*LATRIE|다이몬\s*라트리|다이몬라트리",
+        "다이몬 라트리",
+        "Daimon Latrie",
+    ),
+    (
+        r"菲比[·・]?\s*菲罗|菲比菲洛|PHOEBE\s*PHILO|"
+        r"피비\s*파일로|피비파일로|피비\s*필로|피비필로",
+        "피비 파일로",
+        "Phoebe Philo",
+    ),
+    (r"KHAITE|카이트|케이트", "카이트", "Khaite"),
+    (r"UNFOLIO|언폴리오", "언폴리오", "Unfolio"),
+    (r"耐克|\bNIKE\b|나이키", "나이키", "Nike"),
+    (
+        r"新百[伦倫]|NEW\s*BALANCE|\bNB\b|뉴\s*발란스|뉴발란스",
+        "뉴발란스",
+        "New Balance",
+    ),
+    (r"阿迪达斯|阿迪達斯|\bADIDAS\b|아디다스", "아디다스", "Adidas"),
+    (r"(?<![A-Za-z0-9])UGG(?![A-Za-z0-9])|어그", "어그", "UGG"),
+    (
+        r"亚历山大麦昆|亚历山大·麦昆|ALEXANDER\s*MCQUEEN|MCQUEEN|"
+        r"알렉산더\s*맥퀸|알렉산더맥퀸|맥퀸",
+        "알렉산더 맥퀸",
+        "Alexander McQueen",
+    ),
+    (
+        r"菲拉格慕|SALVATORE\s*FERRAGAMO|FERRAGAMO|페라가모|페레가모",
+        "페라가모",
+        "Ferragamo",
+    ),
+    (r"蒙布朗|MONT\s*BLANC|MONTBLANC|몽블랑", "몽블랑", "Montblanc"),
+    (
+        r"杰尼亚|杰尼亞|ERMENEGILDO\s*ZEGNA|ZEGNA|제냐",
+        "제냐",
+        "Zegna",
+    ),
+    (r"卡地亚|卡地亞|CARTIER|까르띠에|카르티에", "까르띠에", "Cartier"),
     (r"THOM\s*BROWNE|톰브라운", "톰브라운", "Thom Browne"),
     (r"CHROME\s*HEARTS|크롬하츠", "크롬하츠", "Chrome Hearts"),
 ]
@@ -134,6 +252,7 @@ _TYPES = [
     (r"선글라스|선글래스|sunglasses?|墨镜|太阳镜|太陽鏡", "선글라스", "Sunglasses"),
     (r"眼镜|glasses|아이웨어|eyewear", "안경", "Glasses"),
     (r"벨트|belts?|腰带|皮带|皮帶|ベルト", "벨트", "Belt"),
+    (r"시계|手表|腕表|watches?|腕時計", "시계", "Watch"),
     (r"包|bags?", "백", "Bag"),
 ]
 
@@ -437,12 +556,62 @@ def _extract_parts(raw: str, hint: str = "") -> NameParts:
             "delvaux": "Delvaux",
             "alaia": "Alaïa",
             "valentino": "Valentino",
-            "mm6": "MM6",
+            "mm6": "Maison Margiela",
             "chloe": "Chloé",
             "goldengoose": "Golden Goose",
+            "miumiu": "Miu Miu",
+            "burberry": "Burberry",
+            "therow": "The Row",
+            "chromehearts": "Chrome Hearts",
+            "fendi": "Fendi",
             "balenciaga": "Balenciaga",
             "bottega": "Bottega Veneta",
-            "fendi": "Fendi",
+            "ferragamo": "Ferragamo",
+            "montblanc": "Montblanc",
+            "zegna": "Zegna",
+            "cartier": "Cartier",
+            "moncler": "Moncler",
+            "loropiana": "Loro Piana",
+            "calvin": "Calvin",
+            "jacquemus": "Jacquemus",
+            "acnestudios": "Acne Studios",
+            "moynat": "Moynat",
+            "givenchy": "Givenchy",
+            "lemaire": "Lemaire",
+            "loewe": "Loewe",
+            "toryburch": "Tory Burch",
+            "tombrowne": "Thom Browne",
+            "vetements": "Vetements",
+            "tiffany": "Tiffany",
+            "bvlgari": "Bvlgari",
+            "tomford": "Tom Ford",
+            "coach": "Coach",
+            "dolcegabbana": "Dolce & Gabbana",
+            "maxmara": "Max Mara",
+            "balmain": "Balmain",
+            "hugoboss": "Hugo Boss",
+            "brunellocucinelli": "Brunello Cucinelli",
+            "rogervivier": "Roger Vivier",
+            "alexanderwang": "Alexander Wang",
+            "isabelmarant": "Isabel Marant",
+            "poloralphlauren": "Polo Ralph Lauren",
+            "tagheuer": "TAG Heuer",
+            "longines": "Longines",
+            "armani": "Armani",
+            "versace": "Versace",
+            "rolex": "Rolex",
+            "omega": "Omega",
+            "jimmychoo": "Jimmy Choo",
+            "christianlouboutin": "Christian Louboutin",
+            "daimonlatrie": "Daimon Latrie",
+            "phoebephilo": "Phoebe Philo",
+            "khaite": "Khaite",
+            "unfolio": "Unfolio",
+            "nike": "Nike",
+            "newbalance": "New Balance",
+            "adidas": "Adidas",
+            "ugg": "UGG",
+            "alexandermcqueen": "Alexander McQueen",
         }
         brand_en = en_map.get(attrs.brand_id, attrs.brand_id.title())
 
@@ -471,6 +640,7 @@ def _extract_parts(raw: str, hint: str = "") -> NameParts:
             "악세사리": ("액세서리", "Accessory"),
             "선글라스": ("선글라스", "Sunglasses"),
             "벨트": ("벨트", "Belt"),
+            "시계": ("시계", "Watch"),
             "여성옷": ("여성옷", "Womenswear"),
             "남성옷": ("남성옷", "Menswear"),
             "기타": ("아이템", "Item"),
@@ -483,6 +653,8 @@ def _extract_parts(raw: str, hint: str = "") -> NameParts:
             type_ko, type_en = "선글라스", "Sunglasses"
         elif re.search(r"벨트|belt|腰带|皮带", low):
             type_ko, type_en = "벨트", "Belt"
+        elif re.search(r"시계|手表|腕表|watch|腕時計", low):
+            type_ko, type_en = "시계", "Watch"
         elif re.search(r"신발|shoe|sneaker|靴|鞋", low):
             type_ko, type_en = "신발", "Shoes"
         else:
@@ -625,8 +797,17 @@ def normalize_ai_color(raw: str) -> str:
 
 _AI_BRANDS_KO = (
     "샤넬|디올|구찌|프라다|에르메스|루이비통|생로랑|셀린느|펜디|미우미우|"
-    "고야드|델보|알라이아|발렌티노|엠엠식스|클로에|골든구스|"
-    "발렌시아가|보테가|톰브라운|크롬하츠"
+    "고야드|델보|알라이아|발렌티노|메종마르지엘라|마르지엘라|엠엠식스|클로에|골든구스|"
+    "발렌시아가|보테가|톰브라운|크롬하츠|로에베|몽클레르|로로피아나|캘빈|자크뮈스|"
+    "아크네 스튜디오|아크네스튜디오|모이나|지방시|르메르|토리 버치|토리버치|베트멍|티파니|불가리|"
+    "톰 포드|톰포드|코치|돌체앤가바나|막스마라|발망|휴고보스|브루넬로 쿠치넬리|로저 비비에|"
+    "알렉산더 왕|알렉산더왕|이자벨 마랑|이자벨마랑|폴로 랄프 로렌|폴로랄프로렌|랄프 로렌|랄프로렌|"
+    "태그호이어|태그 호이어|론진|아르마니|베르사체|롤렉스|오메가|"
+    "지미추|지미 추|크리스찬 루부탱|크리스찬루부탱|크리스챤 루부탱|크리스챤루부탱|루부탱|"
+    "다이몬 라트리|다이몬라트리|피비 파일로|피비파일로|피비 필로|피비필로|"
+    "카이트|케이트|언폴리오|나이키|뉴발란스|뉴 발란스|아디다스|어그|"
+    "알렉산더 맥퀸|알렉산더맥퀸|맥퀸|"
+    "페라가모|몽블랑|제냐|까르띠에|버버리|더로우|더 로우"
 )
 _AI_TYPE_TAIL = (
     r"(?:선글라스|선글래스|sunglasses?|"

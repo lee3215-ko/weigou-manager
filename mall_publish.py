@@ -20,6 +20,7 @@ from price_codec import (
 from product_attrs import _detect_brand, extract_attrs
 from product_store import Product, ProductStore, PublishedItem
 from image_enhance import enhance_image_file
+from watermark import apply_watermark_file
 from mall_cloud import (
     _supabase_rest,
     cloud_enabled,
@@ -89,6 +90,17 @@ def _copy_images(product: Product, folder_key: str) -> list[str]:
         shutil.copy2(src_path, dest)
         # Auto upscale / sharpen low-quality photos
         enhanced = enhance_image_file(dest)
+        # Homepage only: diagonal shoot-repl watermark (local collect originals untouched)
+        if enhanced.suffix.lower() != ".gif":
+            try:
+                apply_watermark_file(
+                    enhanced,
+                    enhanced,
+                    text="shoot-repl",
+                    style="diagonal",
+                )
+            except Exception:
+                pass
         # If enhancer rewrote to .jpg, prefer that filename
         final_name = enhanced.name
         if use_cloud:
@@ -175,7 +187,7 @@ def build_mall_product(
         else:
             raise ValueError(
                 f"가격 코드를 해석할 수 없습니다: NO(가격)={price_code or '(없음)'}\n"
-                "예: 8888033 → 원가 33만원 / 00008 → 원가 8만원 / 8888033.5 → 33.5만원\n"
+                "예: 8888033 → 33만원 / 888832.5 → 32.5만원 / 00008 → 8만원\n"
                 f"또는 한글 문구: {DEFAULT_PRICE_TEXT}\n"
                 "검색코드(搜索码)는 제품명 아래 NO로 표시됩니다."
             )
@@ -518,11 +530,15 @@ def set_products_recommended(
     *,
     recommended: bool = True,
     push_api: bool = True,
+    slots: list[str] | None = None,
 ) -> dict[str, Any]:
     """Mark existing mall products as homepage recommended (or clear).
 
     Fetches each product by id (not the paginated list) so older items
     still get the flag on the live homepage.
+
+    ``slots`` — optional homepage recommend section ids
+    (bag / clothes / accessory / watch). When omitted, slots follow category.
     """
     ids = [str(x).strip() for x in mall_ids if str(x).strip()]
     if not ids:
@@ -541,6 +557,7 @@ def set_products_recommended(
             row,
             recommended=bool(recommended),
             category=str(row.get("category") or ""),
+            slots=slots,
         )
         if recommended:
             row["recommendedAt"] = now
@@ -582,11 +599,24 @@ def site_category(category: str | None) -> str:
     return c
 
 
+RECOMMEND_SLOT_IDS = ("bag", "clothes", "accessory", "watch")
+
 RECOMMEND_SLOT_LABELS = {
     "bag": "가방 추천상품",
     "clothes": "옷 추천상품",
     "accessory": "악세사리 추천상품",
+    "watch": "시계 추천상품",
 }
+
+
+def normalize_recommend_slots(slots: list[str] | None) -> list[str]:
+    """Keep known homepage recommend section ids, stable order, unique."""
+    out: list[str] = []
+    for raw in slots or []:
+        sid = str(raw or "").strip().lower()
+        if sid in RECOMMEND_SLOT_IDS and sid not in out:
+            out.append(sid)
+    return out
 
 
 def recommend_slots_for_category(category: str | None) -> list[str]:
@@ -596,6 +626,8 @@ def recommend_slots_for_category(category: str | None) -> list[str]:
         return ["bag"]
     if c in {"여성옷", "남성옷"}:
         return ["clothes"]
+    if c == "시계":
+        return ["watch"]
     # 신발·선글라스·벨트·악세사리 → 악세사리 추천 칸
     return ["accessory"]
 
@@ -605,22 +637,34 @@ def recommend_slot_label(category: str | None) -> str:
     return RECOMMEND_SLOT_LABELS.get(slots[0] if slots else "", "추천상품")
 
 
-def _apply_recommend_flags(row: dict[str, Any], *, recommended: bool, category: str | None = None) -> None:
-    """Set homepage recommend flag + the matching 가방/옷/악세사리 slot."""
+def _apply_recommend_flags(
+    row: dict[str, Any],
+    *,
+    recommended: bool,
+    category: str | None = None,
+    slots: list[str] | None = None,
+) -> None:
+    """Set homepage recommend flag + 가방/옷/악세사리/시계 slot(s)."""
     cat = category if category is not None else str(row.get("category") or "")
     if recommended:
-        slots = recommend_slots_for_category(cat)
+        use = normalize_recommend_slots(slots)
+        if not use:
+            use = recommend_slots_for_category(cat)
         row["recommended"] = True
-        row["recommendSlots"] = slots
-        row["recommendedBag"] = "bag" in slots
-        row["recommendedClothes"] = "clothes" in slots
-        row["recommendedAccessory"] = "accessory" in slots
+        row["recommendSlots"] = use
+        row["recommendSlot"] = use[0] if use else None
+        row["recommendedBag"] = "bag" in use
+        row["recommendedClothes"] = "clothes" in use
+        row["recommendedAccessory"] = "accessory" in use
+        row["recommendedWatch"] = "watch" in use
     else:
         row["recommended"] = False
         row["recommendSlots"] = []
+        row["recommendSlot"] = None
         row["recommendedBag"] = False
         row["recommendedClothes"] = False
         row["recommendedAccessory"] = False
+        row["recommendedWatch"] = False
         row.pop("recommendedAt", None)
 
 
@@ -790,6 +834,7 @@ def publish_product(
     push_api: bool = True,
     mall_id: str | None = None,
     recommended: bool | None = None,
+    recommend_slots: list[str] | None = None,
     verify_live: bool = True,
 ) -> dict[str, Any]:
     item = build_mall_product(
@@ -814,7 +859,10 @@ def publish_product(
         item["createdAt"] = now
     if recommended is not None:
         _apply_recommend_flags(
-            item, recommended=bool(recommended), category=str(item.get("category") or "")
+            item,
+            recommended=bool(recommended),
+            category=str(item.get("category") or ""),
+            slots=recommend_slots,
         )
         if recommended:
             item["recommendedAt"] = now
@@ -825,6 +873,7 @@ def publish_product(
                 item,
                 recommended=True,
                 category=str(item.get("category") or existing_remote.get("category") or ""),
+                slots=list(existing_remote.get("recommendSlots") or []) or None,
             )
             if existing_remote.get("recommendedAt"):
                 item["recommendedAt"] = existing_remote.get("recommendedAt")
@@ -1195,4 +1244,7 @@ def preview_price(sku_no: str) -> str:
     if is_text_price_label(code) or code == DEFAULT_PRICE_TEXT:
         note = "" if (sku_no or "").strip() else " (빈칸→자동)"
         return f"가격 표시: {code}{note}"
-    return f"가격코드 예: 8888033 → 33만원 / 00008 → 8만원 / 또는 한글: {DEFAULT_PRICE_TEXT}"
+    return (
+        f"가격코드 예: 8888033 → 33만원 / 888832.5 → 32.5만원 / 00008 → 8만원"
+        f" / 또는 한글: {DEFAULT_PRICE_TEXT}"
+    )
