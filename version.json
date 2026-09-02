@@ -1,12 +1,12 @@
 {
-    "version":  "1.0.43",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540906649",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.43/WeigouManager.zip",
-    "notes":  "실행 오류 일괄 수정: product_attrs 누락 함수 복구",
-    "asset_id":  540906649,
+    "version":  "1.0.44",
+    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540917318",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.44/WeigouManager.zip",
+    "notes":  "추천상품으로 재등록 시 홈페이지 상품 내용도 함께 갱신",
+    "asset_id":  540917318,
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540906649",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.43/WeigouManager.zip",
+                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540917318",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.44/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }
