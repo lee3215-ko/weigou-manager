@@ -1,12 +1,12 @@
 {
-    "version":  "1.0.44",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540917318",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.44/WeigouManager.zip",
-    "notes":  "추천상품으로 재등록 시 홈페이지 상품 내용도 함께 갱신",
-    "asset_id":  540917318,
+    "version":  "1.0.45",
+    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540927559",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.45/WeigouManager.zip",
+    "notes":  "재등록 이미지 화질 개선: 억지 업스케일/이중 JPEG 압축 제거",
+    "asset_id":  540927559,
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540917318",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.44/WeigouManager.zip",
+                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540927559",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.45/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }
