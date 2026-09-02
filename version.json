@@ -1,12 +1,12 @@
 {
-    "version":  "1.0.40",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540824927",
-    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.40/WeigouManager.zip",
-    "notes":  "재등록 시 응답없음 수정: 상품마다 sync 스레드 중복 생성 제거",
-    "asset_id":  540824927,
+    "version":  "1.0.41",
+    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540833879",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.41/WeigouManager.zip",
+    "notes":  "실행 오류 수정: 누락된 wecatalog_browser/local_image_match 복구 (+재등록 응답없음 수정 포함)",
+    "asset_id":  540833879,
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540824927",
-                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.40/WeigouManager.zip",
+                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540833879",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.41/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }
