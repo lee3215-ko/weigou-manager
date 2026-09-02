@@ -1,12 +1,12 @@
 {
     "version":  "1.0.40",
-    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/",
-    "download_url":  null,
+    "url":  "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540824927",
+    "download_url":  "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.40/WeigouManager.zip",
     "notes":  "재등록 시 응답없음 수정: 상품마다 sync 스레드 중복 생성 제거",
-    "asset_id":  null,
+    "asset_id":  540824927,
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/",
-                          null,
+                          "https://api.github.com/repos/lee3215-ko/weigou-manager/releases/assets/540824927",
+                          "https://github.com/lee3215-ko/weigou-manager/releases/download/v1.0.40/WeigouManager.zip",
                           "https://github.com/lee3215-ko/weigou-manager/releases/latest/download/WeigouManager.zip"
                       ]
 }
