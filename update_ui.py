@@ -18,6 +18,7 @@ from updater import (
     download_file_with_fallbacks,
     fetch_version_payload,
     format_network_error,
+    get_update_data_log_path,
     get_update_log_path,
     get_update_temp_dir,
     prepare_for_update_exit,
@@ -152,6 +153,7 @@ def _auto_update(
     def worker() -> None:
         zip_path = get_update_temp_dir() / f"{app_name}-{info.version}.zip"
         log_path = get_update_log_path(app_name)
+        data_log_path = get_update_data_log_path()
         try:
             log(f"[업데이트] 다운로드 시작: {info.version}")
             urls = list(info.download_urls) if info.download_urls else [info.url]
@@ -190,7 +192,7 @@ def _auto_update(
                     zip_inner_folder=zip_inner_folder,
                     app_slug=app_name,
                 )
-                log(f"[업데이트] 설치 스크립트 실행 (로그: {log_path})")
+                log(f"[업데이트] 설치 스크립트 실행 (로그: {log_path}, {data_log_path})")
             except (RuntimeError, OSError) as exec_exc:
                 messagebox.showerror("업데이트 실패", str(exec_exc), parent=root)
                 dialog.destroy()

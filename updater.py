@@ -233,6 +233,54 @@ def get_update_log_path(app_slug: str = DEFAULT_APP_SLUG) -> Path:
     return get_update_temp_dir() / f"{app_slug}_update.log"
 
 
+def get_update_data_log_path(install_dir: Path | None = None) -> Path:
+    """Persistent update log next to user data (survives temp cleanup)."""
+    root = install_dir or get_install_dir()
+    return root / "data" / "update.log"
+
+
+def get_update_failure_marker_path(install_dir: Path | None = None) -> Path:
+    root = install_dir or get_install_dir()
+    return root / "data" / "update_failed.txt"
+
+
+def read_update_failure_notice(install_dir: Path | None = None) -> str:
+    """Return failure text from last update attempt, then clear the marker."""
+    marker = get_update_failure_marker_path(install_dir)
+    try:
+        if not marker.is_file():
+            return ""
+        text = marker.read_text(encoding="utf-8-sig", errors="replace").strip()
+        marker.unlink(missing_ok=True)
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    log_hint = get_update_data_log_path(install_dir)
+    return (
+        f"이전 자동 업데이트가 완료되지 않았습니다.\n\n{text}\n\n"
+        f"로그: {log_hint}\n"
+        f"임시 로그: {get_update_log_path()}\n\n"
+        "· 설치 폴더가 Program Files 등 쓰기 제한 경로면\n"
+        "  바탕화면 등 사용자 폴더로 옮긴 뒤 다시 시도하세요.\n"
+        "· GitHub Releases에서 zip을 받아 덮어쓰기(data 폴더 유지)도 가능합니다."
+    )
+
+
+def resolve_zip_inner_folder(staging_dir: Path, exe_name: str, fallback: str) -> str:
+    hits = list(staging_dir.rglob(exe_name))
+    if not hits:
+        return fallback
+    parent = hits[0].parent
+    try:
+        rel = parent.relative_to(staging_dir)
+    except ValueError:
+        return fallback
+    if not rel.parts:
+        return fallback
+    return rel.parts[0] if len(rel.parts) == 1 else str(rel).split("\\")[0].split("/")[0] or fallback
+
+
 def get_update_running_path(app_slug: str = DEFAULT_APP_SLUG) -> Path:
     return get_update_temp_dir() / f"{app_slug}_update.started"
 
@@ -497,6 +545,7 @@ def launch_detached_updater(
     inner: str,
     wait_pid: int,
     app_slug: str = DEFAULT_APP_SLUG,
+    data_log_path: Path | None = None,
 ) -> None:
     """Start the update PowerShell so it survives GUI ``os._exit``.
 
@@ -507,8 +556,14 @@ def launch_detached_updater(
     """
     running = get_update_running_path(app_slug)
     log_path = get_update_log_path(app_slug)
+    data_log = data_log_path or get_update_data_log_path(install_dir)
     try:
         running.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        data_log.parent.mkdir(parents=True, exist_ok=True)
+        data_log.write_text("", encoding="utf-8")
     except OSError:
         pass
 
@@ -541,6 +596,8 @@ def launch_detached_updater(
             str(running),
             "-LogFile",
             str(log_path),
+            "-DataLogFile",
+            str(data_log),
         ],
         startupinfo=startupinfo,
         creationflags=flags,
@@ -578,7 +635,6 @@ def schedule_apply_update(
     validate_zip_file(zip_path)
 
     target_dir = install_dir or get_install_dir()
-    inner = zip_inner_folder or target_dir.name
     exe_path = target_dir / exe_name
     slug = (app_slug or DEFAULT_APP_SLUG).strip() or DEFAULT_APP_SLUG
     staging_dir = get_update_temp_dir() / f"{slug}_staging_{os.getpid()}"
@@ -596,6 +652,13 @@ def schedule_apply_update(
             f"업데이트 zip 안에 {exe_name} 이(가) 없습니다. 배포 zip 구조를 확인하세요."
         )
 
+    inner = resolve_zip_inner_folder(
+        staging_dir,
+        exe_name,
+        zip_inner_folder or target_dir.name,
+    )
+    data_log = get_update_data_log_path(target_dir)
+
     script_path = get_update_temp_dir() / f"{slug}_update_{os.getpid()}.ps1"
     _write_update_script(script_path, app_slug=slug)
     launch_detached_updater(
@@ -606,6 +669,7 @@ def schedule_apply_update(
         inner=inner,
         wait_pid=os.getpid(),
         app_slug=slug,
+        data_log_path=data_log,
     )
 
     try:

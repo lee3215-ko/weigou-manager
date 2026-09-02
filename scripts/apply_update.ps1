@@ -5,34 +5,48 @@ param(
     [Parameter(Mandatory=$true)][string]$Inner,
     [Parameter(Mandatory=$true)][int]$WaitPid,
     [Parameter(Mandatory=$true)][string]$RunningFile,
-    [Parameter(Mandatory=$true)][string]$LogFile
+    [Parameter(Mandatory=$true)][string]$LogFile,
+    [Parameter(Mandatory=$false)][string]$DataLogFile = ""
 )
 $ErrorActionPreference = "Continue"
 $Log = $LogFile
 $Running = $RunningFile
+$FailMarker = Join-Path $Install "data\update_failed.txt"
+
 function Write-Log([string]$Message) {
+    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+    foreach ($target in @($Log, $DataLogFile)) {
+        if (-not $target) { continue }
+        try {
+            $parent = Split-Path -Parent $target
+            if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            }
+            Add-Content -LiteralPath $target -Value $line -Encoding UTF8
+        } catch {}
+    }
+}
+
+function Clear-FailMarker {
+    if ($FailMarker -and (Test-Path -LiteralPath $FailMarker)) {
+        Remove-Item -LiteralPath $FailMarker -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Set-FailMarker([string]$Reason) {
     try {
-        Add-Content -LiteralPath $Log -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message) -Encoding UTF8
+        $parent = Split-Path -Parent $FailMarker
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        Set-Content -LiteralPath $FailMarker -Value $Reason -Encoding UTF8
     } catch {}
 }
 
 try { Set-Content -LiteralPath $Running -Value $PID -Encoding ASCII } catch {
     Write-Log ("handshake write failed: " + $_)
 }
-$Lock = $Running + ".lock"
-if (Test-Path -LiteralPath $Lock) {
-    $oldPid = 0
-    try { $oldPid = [int]((Get-Content -LiteralPath $Lock -ErrorAction SilentlyContinue | Select-Object -First 1)) } catch {}
-    if ($oldPid -gt 0 -and $oldPid -ne $PID -and (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) {
-        $oldName = ""
-        try { $oldName = [string](Get-Process -Id $oldPid -ErrorAction SilentlyContinue).ProcessName } catch {}
-        if ($oldName -match "powershell|pwsh") {
-            Write-Log "another updater pid=$oldPid already running - exit"
-            exit 0
-        }
-    }
-}
-try { Set-Content -LiteralPath $Lock -Value $PID -Encoding ASCII } catch {}
+
 Write-Log "update start pid=$PID"
 Write-Log "Staging=$Staging"
 Write-Log "Install=$Install"
@@ -40,11 +54,13 @@ Write-Log "Exe=$Exe"
 Write-Log "Inner=$Inner"
 Write-Log "WaitPid=$WaitPid"
 Write-Log "RunningFile=$Running"
+Write-Log "LogFile=$Log"
+Write-Log "DataLogFile=$DataLogFile"
 
 $exeName = [IO.Path]::GetFileName($Exe)
 $procName = [IO.Path]::GetFileNameWithoutExtension($Exe)
 
-$deadline = (Get-Date).AddSeconds(90)
+$deadline = (Get-Date).AddSeconds(120)
 while ((Get-Date) -lt $deadline) {
     if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) { break }
     Start-Sleep -Seconds 1
@@ -79,7 +95,7 @@ function Stop-ProcessesUnderInstall {
 }
 
 Stop-ProcessesUnderInstall -Root $Install
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 5
 Write-Log "process wait done"
 
 $src = Join-Path $Staging $Inner
@@ -90,7 +106,11 @@ if (-not (Test-Path -LiteralPath $src)) {
         $src = $hit.Directory.FullName
         Write-Log "found exe under $src"
     } else {
-        $src = $Staging
+        $msg = "FATAL: $exeName not found in staging zip"
+        Write-Log $msg
+        Set-FailMarker $msg
+        Remove-Item -LiteralPath $Running -Force -ErrorAction SilentlyContinue
+        exit 1
     }
 } elseif (-not (Test-Path -LiteralPath (Join-Path $src $exeName))) {
     $hit = Get-ChildItem -LiteralPath $Staging -Recurse -Filter $exeName -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -100,13 +120,54 @@ if (-not (Test-Path -LiteralPath $src)) {
     }
 }
 
-Write-Log "robocopy `"$src`" -> `"$Install`" (data excluded)"
-& robocopy $src $Install /E /IS /IT /XD data /R:15 /W:2 /NFL /NDL /NJH /NJS | Out-Null
-$rc = $LASTEXITCODE
-Write-Log "robocopy exit=$rc"
-if ($rc -ge 8) {
-    Write-Log "robocopy failed code $rc - still attempting restart"
+$srcExe = Join-Path $src $exeName
+$srcSize = 0
+try { if (Test-Path -LiteralPath $srcExe) { $srcSize = (Get-Item -LiteralPath $srcExe).Length } } catch {}
+Write-Log "source exe size=$srcSize path=$srcExe"
+
+$robocopyOk = $false
+for ($attempt = 1; $attempt -le 6; $attempt++) {
+    Write-Log "robocopy attempt $attempt `"$src`" -> `"$Install`" (data excluded)"
+    & robocopy $src $Install /E /IS /IT /XD data /R:5 /W:3 /NFL /NDL /NJH /NJS | Out-Null
+    $rc = $LASTEXITCODE
+    Write-Log "robocopy exit=$rc"
+    if ($rc -ge 8) {
+        Write-Log "robocopy failed attempt $attempt - wait and retry"
+        Stop-ProcessesUnderInstall -Root $Install
+        Start-Sleep -Seconds 4
+        continue
+    }
+    $destExe = Join-Path $Install $exeName
+    if (-not (Test-Path -LiteralPath $destExe)) {
+        Write-Log "dest exe missing after robocopy attempt $attempt"
+        Start-Sleep -Seconds 3
+        continue
+    }
+    $destSize = 0
+    try { $destSize = (Get-Item -LiteralPath $destExe).Length } catch {}
+    if ($srcSize -gt 0 -and $destSize -gt 0 -and $destSize -eq $srcSize) {
+        $robocopyOk = $true
+        Write-Log "copy verified size=$destSize"
+        break
+    }
+    if ($srcSize -le 0 -and $destSize -gt 0) {
+        $robocopyOk = $true
+        Write-Log "copy verified dest size=$destSize (source size unknown)"
+        break
+    }
+    Write-Log "size mismatch src=$srcSize dest=$destSize attempt $attempt"
+    Start-Sleep -Seconds 3
 }
+
+if (-not $robocopyOk) {
+    $msg = "robocopy failed after retries. Install folder may be read-only (Program Files) or files are locked."
+    Write-Log $msg
+    Set-FailMarker $msg
+    Remove-Item -LiteralPath $Running -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+
+Clear-FailMarker
 
 Start-Sleep -Seconds 2
 $workDir = Split-Path -Parent $Exe
@@ -117,7 +178,9 @@ if (-not (Test-Path -LiteralPath $Exe)) {
         $Exe = $fallback
         $workDir = Split-Path -Parent $fallback
     } else {
-        Write-Log "FATAL: cannot find exe to restart"
+        $msg = "FATAL: cannot find exe to restart"
+        Write-Log $msg
+        Set-FailMarker $msg
         Remove-Item -LiteralPath $Running -Force -ErrorAction SilentlyContinue
         exit 1
     }
@@ -129,7 +192,7 @@ function Start-App {
     try {
         $p = Start-Process -FilePath $Target -WorkingDirectory $Dir -PassThru -WindowStyle Normal
         Write-Log ("Start-Process pid=" + $p.Id)
-        return
+        return $true
     } catch {
         Write-Log ("Start-Process failed: " + $_)
     }
@@ -142,7 +205,7 @@ function Start-App {
         [System.IO.File]::WriteAllText($vbs, $vbsBody, [System.Text.Encoding]::Unicode)
         $wp = Start-Process -FilePath "wscript.exe" -ArgumentList $vbs -PassThru -WindowStyle Hidden
         Write-Log ("wscript pid=" + $wp.Id)
-        return
+        return $true
     } catch {
         Write-Log ("wscript failed: " + $_)
     }
@@ -150,16 +213,18 @@ function Start-App {
     try {
         Start-Process -FilePath "cmd.exe" -ArgumentList $arg
         Write-Log "cmd start issued"
+        return $true
     } catch {
         Write-Log ("cmd start failed: " + $_)
     }
+    return $false
 }
 
-Start-App -Target $Exe -Dir $workDir
+$started = Start-App -Target $Exe -Dir $workDir
 Start-Sleep -Seconds 5
 if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
     Write-Log "process not up - retry Start-Process"
-    try { Start-Process -FilePath $Exe -WorkingDirectory $workDir } catch { Write-Log ("retry failed: " + $_) }
+    try { Start-Process -FilePath $Exe -WorkingDirectory $workDir; $started = $true } catch { Write-Log ("retry failed: " + $_) }
     Start-Sleep -Seconds 4
 }
 if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
@@ -170,11 +235,12 @@ if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
 if (Get-Process -Name $procName -ErrorAction SilentlyContinue) {
     Write-Log "update success - app running"
 } else {
-    Write-Log "WARNING: app still not running after restart attempts"
+    $msg = "WARNING: app still not running after restart attempts"
+    Write-Log $msg
+    Set-FailMarker ($msg + " Files were updated. Please start WeigouManager.exe manually.")
 }
 
 Remove-Item -LiteralPath $Running -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $Lock -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $workDir "weigou_relaunch.vbs") -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue

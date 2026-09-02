@@ -151,6 +151,7 @@ from product_store import (
 )
 from style_publish import publish_style_look
 from update_ui import schedule_update_check
+from updater import read_update_failure_notice
 from url_thumbs import fetch_thumb_file, prune_thumb_cache
 from desktop_notify import alert as desktop_alert
 
@@ -574,6 +575,19 @@ class ManagerApp(tk.Tk):
                 log_callback=lambda m: self._put_log(m, channel=LOG_OTHER),
             ),
         )
+        self.after(900, self._show_update_failure_notice)
+
+    def _show_update_failure_notice(self) -> None:
+        try:
+            notice = read_update_failure_notice()
+        except Exception:
+            return
+        if not notice:
+            return
+        try:
+            messagebox.showwarning("업데이트 실패", notice, parent=self)
+        except Exception:
+            pass
 
     def _on_sku_typed(self, _event=None) -> None:
         if self._form_loading or self._ime_composing:
